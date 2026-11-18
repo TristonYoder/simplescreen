@@ -8,19 +8,44 @@ use axum::{
 };
 use serde_json::json;
 
+use serde::Deserialize;
+
 use crate::{
     auth::Principal,
-    error::{ApiError, ApiResult},
-    models::{ItemKind, Media, MEDIA_COLUMNS},
+    error::{ApiError, ApiJson, ApiResult},
+    models::{ItemKind, Media, ScreenRow, MEDIA_COLUMNS},
     state::AppState,
 };
 
+async fn device_screen(s: &AppState, p: &Principal) -> ApiResult<ScreenRow> {
+    match (&p.screen_id, p.is_device()) {
+        (Some(id), true) => super::screens::fetch_row(s, id).await.map_err(|_| ApiError::unauthorized()),
+        _ => Err(ApiError::unauthorized()),
+    }
+}
+
+pub async fn playlists(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Vec<super::playlists::Summary>>> {
+    let screen = device_screen(&s, &p).await?;
+    Ok(Json(super::playlists::summaries(&s, Some(&screen.group_id)).await?))
+}
+
+#[derive(Deserialize)]
+pub struct Selection {
+    playlist_id: Option<String>,
+}
+
+pub async fn select_playlist(
+    State(s): State<AppState>,
+    p: Principal,
+    ApiJson(selection): ApiJson<Selection>,
+) -> ApiResult<StatusCode> {
+    let screen = device_screen(&s, &p).await?;
+    super::screens::assign_playlist(&s, &screen, selection.playlist_id.as_deref()).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMap) -> ApiResult<Response> {
-    let screen_id = match (&p.screen_id, p.is_device()) {
-        (Some(id), true) => id.clone(),
-        _ => return Err(ApiError::unauthorized()),
-    };
-    let screen = super::screens::fetch_row(&s, &screen_id).await.map_err(|_| ApiError::unauthorized())?;
+    let screen = device_screen(&s, &p).await?;
 
     let playlist = match &screen.playlist_id {
         Some(id) => Some(super::playlists::fetch(&s, id).await?),

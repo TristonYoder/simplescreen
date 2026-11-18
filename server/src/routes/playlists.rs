@@ -40,6 +40,11 @@ pub async fn list(
     p: Principal,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Summary>>> {
+    let all = summaries(&s, q.group_id.as_deref()).await?;
+    Ok(Json(all.into_iter().filter(|r| p.can_view(&r.group_id)).collect()))
+}
+
+pub async fn summaries(s: &AppState, group_id: Option<&str>) -> ApiResult<Vec<Summary>> {
     let rows: Vec<(String, String, String, i64, i64, i64, String)> = sqlx::query_as(
         "SELECT p.id, p.group_id, p.name, p.version, json_array_length(p.items),
                 COALESCE((SELECT SUM(m.size) FROM playlist_media pm JOIN media m ON m.id = pm.media_id
@@ -47,23 +52,21 @@ pub async fn list(
                 p.updated_at
          FROM playlists p WHERE (?1 IS NULL OR p.group_id = ?1) ORDER BY p.name",
     )
-    .bind(&q.group_id)
+    .bind(group_id)
     .fetch_all(&s.db)
     .await?;
-    Ok(Json(
-        rows.into_iter()
-            .filter(|r| p.can_view(&r.1))
-            .map(|(id, group_id, name, version, item_count, total_bytes, updated_at)| Summary {
-                id,
-                group_id,
-                name,
-                version,
-                item_count,
-                total_bytes,
-                updated_at,
-            })
-            .collect(),
-    ))
+    Ok(rows
+        .into_iter()
+        .map(|(id, group_id, name, version, item_count, total_bytes, updated_at)| Summary {
+            id,
+            group_id,
+            name,
+            version,
+            item_count,
+            total_bytes,
+            updated_at,
+        })
+        .collect())
 }
 
 pub async fn fetch(s: &AppState, id: &str) -> ApiResult<Playlist> {

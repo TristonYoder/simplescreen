@@ -80,26 +80,36 @@ pub async fn patch(
         sqlx::query("UPDATE screens SET name = ? WHERE id = ?").bind(name.trim()).bind(&id).execute(&s.db).await?;
     }
     if let Some(playlist) = &patch.playlist_id {
-        let version = match playlist {
-            None => 0,
-            Some(pid) => {
-                let found: Option<(i64,)> =
-                    sqlx::query_as("SELECT version FROM playlists WHERE id = ? AND group_id = ?")
-                        .bind(pid)
-                        .bind(&row.group_id)
-                        .fetch_optional(&s.db)
-                        .await?;
-                found
-                    .ok_or_else(|| {
-                        ApiError::unprocessable("invalid_playlist", "playlist does not exist in the screen's group")
-                    })?
-                    .0
-            }
-        };
-        sqlx::query("UPDATE screens SET playlist_id = ? WHERE id = ?").bind(playlist).bind(&id).execute(&s.db).await?;
-        s.notify_manifest(&id, version);
+        assign_playlist(&s, &row, playlist.as_deref()).await?;
+    } else if patch.name.is_some() {
+        broadcast_updated(&s, &row);
     }
     Ok(Json(to_screen(&s, fetch_row(&s, &id).await?)))
+}
+
+/// Assigns (or with `None` unassigns) a playlist from the screen's own group and notifies the device and group users.
+pub async fn assign_playlist(s: &AppState, row: &ScreenRow, playlist: Option<&str>) -> ApiResult<()> {
+    let version = match playlist {
+        None => 0,
+        Some(pid) => {
+            let found: Option<(i64,)> = sqlx::query_as("SELECT version FROM playlists WHERE id = ? AND group_id = ?")
+                .bind(pid)
+                .bind(&row.group_id)
+                .fetch_optional(&s.db)
+                .await?;
+            found
+                .ok_or_else(|| ApiError::unprocessable("invalid_playlist", "playlist does not exist in the screen's group"))?
+                .0
+        }
+    };
+    sqlx::query("UPDATE screens SET playlist_id = ? WHERE id = ?").bind(playlist).bind(&row.id).execute(&s.db).await?;
+    s.notify_manifest(&row.id, version);
+    broadcast_updated(s, row);
+    Ok(())
+}
+
+fn broadcast_updated(s: &AppState, row: &ScreenRow) {
+    s.hub.broadcast_group(&row.group_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {

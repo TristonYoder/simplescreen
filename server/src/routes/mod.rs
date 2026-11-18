@@ -11,7 +11,7 @@ mod ws;
 use axum::{
     extract::DefaultBodyLimit,
     http::Request,
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use tower_http::trace::TraceLayer;
@@ -43,6 +43,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/pairing/claim", post(pairing::claim))
         .route("/v1/pairing/{id}", get(pairing::poll))
         .route("/v1/device/manifest", get(device::manifest))
+        .route("/v1/device/playlists", get(device::playlists))
+        .route("/v1/device/playlist", put(device::select_playlist))
         .route("/v1/ws", get(ws::upgrade))
         .fallback(|| async { ApiError::not_found() })
         .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {

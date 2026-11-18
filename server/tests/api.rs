@@ -409,3 +409,50 @@ async fn pairing_and_manifest() {
     let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn device_selects_playlist() {
+    let app = App::new().await;
+    let g = app.group().await;
+    let other = app.group().await;
+    let (img, _) = app.media(&g, "image", "image/png", b"img").await;
+    let mk = |group: &str, name: &str| json!({ "group_id": group, "name": name, "items": [{ "kind": "image", "media_id": img }] });
+    let a = app.call("POST", "/v1/playlists", Some(mk(&g, "A"))).await.json()["id"].as_str().unwrap().to_string();
+    let b = app.call("POST", "/v1/playlists", Some(json!({ "group_id": g, "name": "B", "items": [] }))).await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let foreign = app.call("POST", "/v1/playlists", Some(json!({ "group_id": other, "name": "X", "items": [] }))).await.json()
+        ["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (screen_id, token) = pair(&app, &g, "Hall", None).await;
+
+    let r = app.call_as(&token, "GET", "/v1/device/playlists", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let list = r.json();
+    let names: Vec<&str> = list.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["A", "B"]);
+
+    let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": a }))).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{:?}", r.body);
+    let r = app.call("GET", &format!("/v1/screens/{screen_id}"), None).await;
+    assert_eq!(r.json()["playlist_id"], a);
+    let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
+    assert_eq!(r.json()["playlist"]["id"], a);
+
+    let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": foreign }))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": b }))).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": null }))).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call("GET", &format!("/v1/screens/{screen_id}"), None).await;
+    assert!(r.json().get("playlist_id").is_none());
+
+    let r = app.call("GET", "/v1/device/playlists", None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    let r = app.call("PUT", "/v1/device/playlist", Some(json!({ "playlist_id": a }))).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}

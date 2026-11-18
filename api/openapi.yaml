@@ -402,7 +402,7 @@ paths:
     patch:
       operationId: updateScreen
       tags: [screens]
-      description: Rename or assign a playlist (same group). Assigning notifies the device.
+      description: Rename or assign a playlist (same group). Assigning notifies the device; user sockets in the group get `screen_updated`.
       requestBody:
         required: true
         content:
@@ -524,6 +524,39 @@ paths:
               schema: { $ref: '#/components/schemas/Manifest' }
         '304': { description: Not modified }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/device/playlists:
+    get:
+      operationId: listDevicePlaylists
+      tags: [device]
+      description: Device token only. Playlists in the screen's group, for choosing on the device.
+      responses:
+        '200':
+          description: Playlist summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PlaylistSummary' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/device/playlist:
+    put:
+      operationId: selectDevicePlaylist
+      tags: [device]
+      description: |
+        Device token only. Assigns a playlist from the screen's group to this screen (null unassigns).
+        Same effect as `updateScreen` with `playlist_id`: the device gets `manifest_changed`,
+        user sockets in the group get `screen_updated`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DevicePlaylistSelection' }
+      responses:
+        '204': { description: Assigned }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
   /v1/ws:
     get:
@@ -964,6 +997,15 @@ components:
           format: uuid
           description: null unassigns
 
+    DevicePlaylistSelection:
+      type: object
+      required: [playlist_id]
+      properties:
+        playlist_id:
+          type: [string, 'null']
+          format: uuid
+          description: null unassigns
+
     CommandName:
       type: string
       enum: [go, next, prev, blackout, reload, identify]
@@ -1040,7 +1082,7 @@ components:
 
     WsServerMessageType:
       type: string
-      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, unpaired]
+      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, unpaired]
 
     WsServerMessage:
       type: object
@@ -1051,7 +1093,7 @@ components:
         server_id: { type: string, format: uuid, description: hello }
         version: { type: integer, format: int64, description: manifest_changed }
         command: { $ref: '#/components/schemas/ScreenCommand' }
-        screen_id: { type: string, format: uuid, description: screen_status / online / offline }
+        screen_id: { type: string, format: uuid, description: screen_status / online / offline / updated }
         status: { $ref: '#/components/schemas/ScreenStatus' }
 
     WsClientMessageType:
