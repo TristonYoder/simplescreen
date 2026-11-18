@@ -11,6 +11,7 @@ let
     "${prefix}_OIDC_GROUPS_CLAIM" = cfg.oidc.groupsClaim;
     "${prefix}_OIDC_TOKEN_TYPE" = cfg.oidc.tokenType;
   }
+  // lib.optionalAttrs (cfg.timezone != null) { "${prefix}_TIMEZONE" = cfg.timezone; }
   // lib.optionalAttrs (cfg.oidc.issuer != null) { "${prefix}_OIDC_ISSUER" = cfg.oidc.issuer; }
   // lib.optionalAttrs (cfg.oidc.clientId != null) { "${prefix}_OIDC_CLIENT_ID" = cfg.oidc.clientId; }
   // lib.optionalAttrs (cfg.oidc.audience != null) { "${prefix}_OIDC_AUDIENCE" = cfg.oidc.audience; }
@@ -35,6 +36,12 @@ in
     dataDir = lib.mkOption { type = lib.types.str; default = "/var/lib/${slug}"; };
     openFirewall = lib.mkOption { type = lib.types.bool; default = false; };
     bonjour = lib.mkOption { type = lib.types.bool; default = true; };
+    timezone = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = config.time.timeZone;
+      defaultText = lib.literalExpression "config.time.timeZone";
+      description = "Default IANA zone for group schedules (groups can override it). null uses the host zone, else UTC.";
+    };
     bootstrapTokenFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
