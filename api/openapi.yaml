@@ -8,6 +8,8 @@ info:
 
     Conventions:
     - IDs are UUID strings. Timestamps are RFC 3339 strings (UTC).
+    - Schedules use wall-clock times in the group's IANA `timezone` (`HH:MM`, `YYYY-MM-DDTHH:MM`).
+      Resolved segments are UTC timestamps.
     - Media blobs are content-addressed by lowercase hex SHA-256 and immutable.
     - Errors always use the `Error` schema.
     - Auth: `Authorization: Bearer <token>`. Token is an OIDC JWT (users), the
@@ -31,6 +33,7 @@ tags:
   - name: screens
   - name: pairing
   - name: device
+  - name: schedule
 
 paths:
   /v1/info:
@@ -444,6 +447,139 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /v1/screens/{screenId}/override:
+    parameters:
+      - { $ref: '#/components/parameters/ScreenId' }
+    put:
+      operationId: setScreenOverride
+      tags: [screens]
+      description: |
+        Editor role. Plays a playlist (null = nothing) on this screen above every schedule entry
+        until `until`, the next scheduled change (`until_next_change`), or until cleared.
+        The device gets `manifest_changed`; user sockets in the group get `screen_updated`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScreenOverrideInput' }
+      responses:
+        '200':
+          description: Updated screen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Screen' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      operationId: clearScreenOverride
+      tags: [screens]
+      description: Editor role. Returns the screen to its schedule.
+      responses:
+        '200':
+          description: Updated screen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Screen' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/schedule:
+    get:
+      operationId: listSchedule
+      tags: [schedule]
+      description: Viewer role. Every schedule entry in a group, plus the group's timezone.
+      parameters:
+        - name: group_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Entries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleList' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      operationId: createScheduleEntry
+      tags: [schedule]
+      description: Editor role. Affected devices get `manifest_changed`; user sockets get `schedule_changed`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleEntryInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/schedule/{entryId}:
+    parameters:
+      - { $ref: '#/components/parameters/EntryId' }
+    put:
+      operationId: updateScheduleEntry
+      tags: [schedule]
+      description: Editor role. Replaces the entry (`group_id` must not change).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScheduleEntryInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleEntry' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      operationId: deleteScheduleEntry
+      tags: [schedule]
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/schedule/timeline:
+    get:
+      operationId: getScheduleTimeline
+      tags: [schedule]
+      description: |
+        Viewer role. What each screen in the group plays between `from` and `to` (at most 14 days),
+        with overrides, one-off events, weekly entries and default playlists resolved.
+        Segments are contiguous and cover the whole range.
+      parameters:
+        - name: group_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: Timeline
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleTimeline' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /v1/pairing:
     post:
       operationId: startPairing
@@ -509,8 +645,10 @@ paths:
       operationId: getDeviceManifest
       tags: [device]
       description: |
-        Device token only. `ETag: "<playlist_version>"` (or `"none"` when unassigned);
-        honors `If-None-Match` with 304.
+        Device token only. Covers the next 48 hours: `timeline` says what to play when, `playlists`
+        holds every playlist it references, and `media`/`assets` cover all of them so the device can
+        switch on schedule while offline. The ETag changes when the active playlist, a scheduled
+        boundary, or a referenced playlist version changes; honors `If-None-Match` with 304.
       parameters:
         - name: If-None-Match
           in: header
@@ -545,9 +683,10 @@ paths:
       operationId: selectDevicePlaylist
       tags: [device]
       description: |
-        Device token only. Assigns a playlist from the screen's group to this screen (null unassigns).
-        Same effect as `updateScreen` with `playlist_id`: the device gets `manifest_changed`,
-        user sockets in the group get `screen_updated`.
+        Device token only. Picks a playlist from the screen's group (null = nothing).
+        If the screen has a schedule in the next 14 days this is an override until the next scheduled
+        change; otherwise it sets the screen's default playlist like `updateScreen`.
+        The device gets `manifest_changed`; user sockets in the group get `screen_updated`.
       requestBody:
         required: true
         content:
@@ -591,6 +730,11 @@ components:
       schema: { type: string, format: uuid }
     PlaylistId:
       name: playlistId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    EntryId:
+      name: entryId
       in: path
       required: true
       schema: { type: string, format: uuid }
@@ -722,16 +866,20 @@ components:
       required: [name]
       properties:
         name: { type: string, minLength: 1 }
+        timezone:
+          type: [string, 'null']
+          description: IANA zone for schedules; null or absent uses the server default.
         oidc_bindings:
           type: array
           items: { $ref: '#/components/schemas/OidcBinding' }
 
     Group:
       type: object
-      required: [id, name, oidc_bindings, created_at]
+      required: [id, name, oidc_bindings, timezone, created_at]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
+        timezone: { type: string, description: Effective IANA zone (group setting or server default) }
         oidc_bindings:
           type: array
           items: { $ref: '#/components/schemas/OidcBinding' }
@@ -982,7 +1130,8 @@ components:
         id: { type: string, format: uuid }
         group_id: { type: string, format: uuid }
         name: { type: string }
-        playlist_id: { type: string, format: uuid }
+        playlist_id: { type: string, format: uuid, description: Default playlist (plays when nothing is scheduled) }
+        override: { $ref: '#/components/schemas/ScreenOverride' }
         online: { type: boolean }
         status: { $ref: '#/components/schemas/ScreenStatus' }
         last_seen_at: { type: string, format: date-time }
@@ -1005,6 +1154,109 @@ components:
           type: [string, 'null']
           format: uuid
           description: null unassigns
+
+    ScreenOverride:
+      type: object
+      required: [set_at]
+      properties:
+        playlist_id: { type: [string, 'null'], format: uuid, description: null = show nothing }
+        until: { type: string, format: date-time, description: Absent = until cleared }
+        set_at: { type: string, format: date-time }
+
+    ScreenOverrideInput:
+      type: object
+      required: [playlist_id]
+      properties:
+        playlist_id: { type: [string, 'null'], format: uuid }
+        until: { type: [string, 'null'], format: date-time }
+        until_next_change:
+          type: boolean
+          description: Expire at the next scheduled change (ignored when `until` is set; until cleared if there is none).
+
+    ScheduleEntryKind:
+      type: string
+      enum: [weekly, once]
+
+    ScheduleEntryInput:
+      type: object
+      required: [group_id, playlist_id, kind]
+      description: |
+        `weekly`: `days` + `start_time`/`end_time`; an end at or before the start runs past midnight
+        (equal = 24 h). Optional `starts_on`/`ends_on` (inclusive) bound the recurrence.
+        `once`: `starts_at`/`ends_at`, end after start.
+        Precedence: override > once > weekly > default playlist. Within a tier, entries naming
+        screens beat group-wide ones, then the newest entry wins.
+      properties:
+        group_id: { type: string, format: uuid }
+        playlist_id: { type: [string, 'null'], format: uuid, description: null = show nothing }
+        title: { type: string }
+        screen_ids:
+          type: array
+          description: Empty or absent = every screen in the group
+          items: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/ScheduleEntryKind' }
+        enabled: { type: boolean, default: true }
+        days:
+          type: array
+          description: ISO weekdays, 1 = Monday
+          items: { type: integer, minimum: 1, maximum: 7 }
+        start_time: { type: string, pattern: '^[0-9]{2}:[0-9]{2}$' }
+        end_time: { type: string, pattern: '^[0-9]{2}:[0-9]{2}$' }
+        starts_on: { type: string, format: date }
+        ends_on: { type: string, format: date }
+        starts_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$', description: Local wall clock }
+        ends_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$', description: Local wall clock }
+
+    ScheduleEntry:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleEntryInput'
+        - type: object
+          required: [id, screen_ids, enabled, created_at, updated_at]
+          properties:
+            id: { type: string, format: uuid }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    ScheduleList:
+      type: object
+      required: [timezone, entries]
+      properties:
+        timezone: { type: string }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleEntry' }
+
+    SegmentSource:
+      type: string
+      enum: [override, once, weekly, default]
+
+    ScheduleSegment:
+      type: object
+      required: [starts_at, ends_at, source]
+      properties:
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+        playlist_id: { type: [string, 'null'], format: uuid, description: Absent or null = nothing plays }
+        source: { $ref: '#/components/schemas/SegmentSource' }
+        entry_id: { type: string, format: uuid, description: Schedule entry for once/weekly }
+
+    ScreenTimeline:
+      type: object
+      required: [screen_id, segments]
+      properties:
+        screen_id: { type: string, format: uuid }
+        segments:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleSegment' }
+
+    ScheduleTimeline:
+      type: object
+      required: [timezone, screens]
+      properties:
+        timezone: { type: string }
+        screens:
+          type: array
+          items: { $ref: '#/components/schemas/ScreenTimeline' }
 
     CommandName:
       type: string
@@ -1070,19 +1322,27 @@ components:
         screen_name: { type: string }
         playlist:
           $ref: '#/components/schemas/Playlist'
-          description: Absent when unassigned
+          description: What plays now; absent when nothing does
+        timeline:
+          type: array
+          description: Contiguous segments from now for the next 48 hours
+          items: { $ref: '#/components/schemas/ScheduleSegment' }
+        playlists:
+          type: array
+          description: Every playlist the timeline references
+          items: { $ref: '#/components/schemas/Playlist' }
         media:
           type: array
-          description: Every media record referenced by the playlist
+          description: Every media record referenced by those playlists
           items: { $ref: '#/components/schemas/Media' }
         assets:
           type: array
-          description: Unique blobs in download-priority order (first use; bed tracks needed by item N ordered with item N)
+          description: Unique blobs in download-priority order (the active playlist first, then later ones by start time; within a playlist by first use, bed tracks with their start item)
           items: { $ref: '#/components/schemas/ManifestAsset' }
 
     WsServerMessageType:
       type: string
-      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, unpaired]
+      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, schedule_changed, unpaired]
 
     WsServerMessage:
       type: object
@@ -1091,7 +1351,8 @@ components:
       properties:
         type: { $ref: '#/components/schemas/WsServerMessageType' }
         server_id: { type: string, format: uuid, description: hello }
-        version: { type: integer, format: int64, description: manifest_changed }
+        version: { type: integer, format: int64, description: manifest_changed (informational; devices refetch with If-None-Match) }
+        group_id: { type: string, format: uuid, description: schedule_changed }
         command: { $ref: '#/components/schemas/ScreenCommand' }
         screen_id: { type: string, format: uuid, description: screen_status / online / offline / updated }
         status: { $ref: '#/components/schemas/ScreenStatus' }
