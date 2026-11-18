@@ -1,0 +1,1066 @@
+openapi: 3.1.0
+info:
+  title: Simple Screen API
+  version: 1.0.0
+  description: |
+    Contract for the Simple Screen server (product name configurable via branding.toml).
+    Spec-first: the Rust server and Swift clients conform to this file.
+
+    Conventions:
+    - IDs are UUID strings. Timestamps are RFC 3339 strings (UTC).
+    - Media blobs are content-addressed by lowercase hex SHA-256 and immutable.
+    - Errors always use the `Error` schema.
+    - Auth: `Authorization: Bearer <token>`. Token is an OIDC JWT (users), the
+      bootstrap token (server admin), or a device token (paired screens).
+      Blob GET and the WebSocket also accept `?token=` for clients that cannot set headers.
+    - WebSocket message schemas are `WsServerMessage` / `WsClientMessage` (JSON text frames).
+  license:
+    name: AGPL-3.0-only
+    identifier: AGPL-3.0-only
+servers:
+  - url: http://localhost:8420
+security:
+  - bearer: []
+tags:
+  - name: system
+  - name: auth
+  - name: groups
+  - name: media
+  - name: blobs
+  - name: playlists
+  - name: screens
+  - name: pairing
+  - name: device
+
+paths:
+  /v1/info:
+    get:
+      operationId: getInfo
+      tags: [system]
+      security: []
+      responses:
+        '200':
+          description: Server identity
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServerInfo' }
+
+  /v1/auth/config:
+    get:
+      operationId: getAuthConfig
+      tags: [auth]
+      security: []
+      responses:
+        '200':
+          description: OIDC parameters clients need to sign in
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthConfig' }
+
+  /v1/me:
+    get:
+      operationId: getMe
+      tags: [auth]
+      responses:
+        '200':
+          description: Current principal
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/groups:
+    get:
+      operationId: listGroups
+      tags: [groups]
+      description: Groups the caller can see (all, for server admins).
+      responses:
+        '200':
+          description: Groups
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Group' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createGroup
+      tags: [groups]
+      description: Server admin only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GroupInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/groups/{groupId}:
+    parameters:
+      - { $ref: '#/components/parameters/GroupId' }
+    get:
+      operationId: getGroup
+      tags: [groups]
+      responses:
+        '200':
+          description: Group
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: updateGroup
+      tags: [groups]
+      description: Server admin or group admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GroupInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Group' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteGroup
+      tags: [groups]
+      description: Server admin only. Fails with 409 if the group still owns resources.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/blobs/{sha256}:
+    parameters:
+      - { $ref: '#/components/parameters/Sha256' }
+      - { $ref: '#/components/parameters/TokenQuery' }
+    head:
+      operationId: headBlob
+      tags: [blobs]
+      description: 200 if the blob exists (dedupe check before upload), else 404.
+      responses:
+        '200':
+          description: Exists
+          headers:
+            Content-Length: { schema: { type: integer } }
+        '404': { description: Missing }
+    get:
+      operationId: getBlob
+      tags: [blobs]
+      description: |
+        Immutable bytes. Supports `Range` (206), `If-None-Match` (304).
+        Response headers: `ETag: "<sha256>"`, `Cache-Control: public, max-age=31536000, immutable`,
+        `Accept-Ranges: bytes`, `Content-Type` from the media record (or application/octet-stream).
+      parameters:
+        - name: Range
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Full content
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '206':
+          description: Partial content
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '304': { description: Not modified }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '416': { description: Range not satisfiable }
+    put:
+      operationId: putBlob
+      tags: [blobs]
+      description: |
+        Upload raw bytes. Requires editor role in at least one group.
+        Server streams to disk while hashing; rejects with 422 if the hash doesn't match the path.
+        Idempotent: returns 200 if the blob already exists, 201 if newly stored.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Already present
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlobInfo' }
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlobInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/media:
+    get:
+      operationId: listMedia
+      tags: [media]
+      parameters:
+        - name: group_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: kind
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/MediaKind' }
+      responses:
+        '200':
+          description: Media visible to the caller
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Media' }
+    post:
+      operationId: createMedia
+      tags: [media]
+      description: Register metadata for an uploaded blob. Blob must already exist (else 422). Editor role in group.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Media' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/media/{mediaId}:
+    parameters:
+      - { $ref: '#/components/parameters/MediaId' }
+    get:
+      operationId: getMedia
+      tags: [media]
+      responses:
+        '200':
+          description: Media
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Media' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateMedia
+      tags: [media]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Media' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteMedia
+      tags: [media]
+      description: 409 if referenced by a playlist. Blob bytes are garbage-collected when unreferenced.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/playlists:
+    get:
+      operationId: listPlaylists
+      tags: [playlists]
+      parameters:
+        - name: group_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Playlist summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PlaylistSummary' }
+    post:
+      operationId: createPlaylist
+      tags: [playlists]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaylistInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Playlist' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/playlists/{playlistId}:
+    parameters:
+      - { $ref: '#/components/parameters/PlaylistId' }
+    get:
+      operationId: getPlaylist
+      tags: [playlists]
+      responses:
+        '200':
+          description: Full playlist
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Playlist' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: updatePlaylist
+      tags: [playlists]
+      description: |
+        Replace the playlist. `base_version` must equal the current version, else 409 with the
+        current playlist in `Error.current`. On success version increments and assigned screens get
+        `manifest_changed`. Item/bed IDs supplied by the client are preserved; missing IDs are generated.
+        422 if media references are invalid, bed ranges overlap, or a bed references unknown items.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaylistUpdate' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Playlist' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      operationId: deletePlaylist
+      tags: [playlists]
+      description: Screens assigned to it are unassigned (and notified).
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/screens:
+    get:
+      operationId: listScreens
+      tags: [screens]
+      parameters:
+        - name: group_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Screens with live status
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Screen' }
+
+  /v1/screens/{screenId}:
+    parameters:
+      - { $ref: '#/components/parameters/ScreenId' }
+    get:
+      operationId: getScreen
+      tags: [screens]
+      responses:
+        '200':
+          description: Screen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Screen' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateScreen
+      tags: [screens]
+      description: Rename or assign a playlist (same group). Assigning notifies the device.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScreenPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Screen' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      operationId: deleteScreen
+      tags: [screens]
+      description: Unpairs; the device token is revoked and its socket closed.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/screens/{screenId}/command:
+    parameters:
+      - { $ref: '#/components/parameters/ScreenId' }
+    post:
+      operationId: sendScreenCommand
+      tags: [screens]
+      description: Remote-control a screen (editor role). 409 if the screen is offline.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScreenCommand' }
+      responses:
+        '202': { description: Delivered to the device socket }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/pairing:
+    post:
+      operationId: startPairing
+      tags: [pairing]
+      security: []
+      description: Called by an unpaired device. Code expires after 10 minutes.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PairingStartInput' }
+      responses:
+        '201':
+          description: Pairing session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PairingSession' }
+
+  /v1/pairing/claim:
+    post:
+      operationId: claimPairing
+      tags: [pairing]
+      description: Editor role in target group. Creates the Screen.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PairingClaim' }
+      responses:
+        '201':
+          description: Screen created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Screen' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/pairing/{pairingId}:
+    parameters:
+      - name: pairingId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: secret
+        in: query
+        required: true
+        schema: { type: string }
+    get:
+      operationId: pollPairing
+      tags: [pairing]
+      security: []
+      description: Device polls (~2 s). `device_token` is returned once, on the first poll after claim.
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PairingStatus' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/device/manifest:
+    get:
+      operationId: getDeviceManifest
+      tags: [device]
+      description: |
+        Device token only. `ETag: "<playlist_version>"` (or `"none"` when unassigned);
+        honors `If-None-Match` with 304.
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Manifest
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Manifest' }
+        '304': { description: Not modified }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/ws:
+    get:
+      operationId: openSocket
+      tags: [device]
+      description: |
+        WebSocket upgrade. Devices and users. Text frames carry `WsServerMessage` (server→client) and
+        `WsClientMessage` (client→server). Server pings every 20 s; clients reconnect with backoff
+        (1 s doubling, max 30 s) and refetch the manifest on reconnect.
+      parameters:
+        - { $ref: '#/components/parameters/TokenQuery' }
+      responses:
+        '101': { description: Switching protocols }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+
+  parameters:
+    GroupId:
+      name: groupId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MediaId:
+      name: mediaId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PlaylistId:
+      name: playlistId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ScreenId:
+      name: screenId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Sha256:
+      name: sha256
+      in: path
+      required: true
+      schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+    TokenQuery:
+      name: token
+      in: query
+      required: false
+      description: Alternative to the Authorization header.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Insufficient role
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found (or not visible to caller)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Version or state conflict
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Semantically invalid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine code, e.g. `not_found`, `version_conflict`, `hash_mismatch`.
+        message: { type: string }
+        current:
+          $ref: '#/components/schemas/Playlist'
+          description: Present on playlist version_conflict.
+
+    ServerInfo:
+      type: object
+      required: [name, slug, version, api_version, server_id]
+      properties:
+        name: { type: string, description: Product display name from branding }
+        slug: { type: string }
+        version: { type: string }
+        api_version: { type: integer, description: Major API version (1) }
+        server_id: { type: string, format: uuid, description: Stable per-installation ID }
+        oidc_enabled: { type: boolean }
+
+    AuthConfig:
+      type: object
+      required: [oidc_enabled]
+      properties:
+        oidc_enabled: { type: boolean }
+        issuer: { type: string }
+        client_id: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        token_type:
+          type: string
+          enum: [access_token, id_token]
+          description: Which token the client must send as Bearer.
+
+    Role:
+      type: string
+      enum: [viewer, editor, admin]
+
+    Me:
+      type: object
+      required: [kind, subject, server_admin, memberships]
+      properties:
+        kind:
+          type: string
+          enum: [user, bootstrap, device]
+        subject: { type: string }
+        display_name: { type: string }
+        email: { type: string }
+        server_admin: { type: boolean }
+        memberships:
+          type: array
+          items: { $ref: '#/components/schemas/Membership' }
+        screen_id: { type: string, format: uuid, description: Set for device principals }
+
+    Membership:
+      type: object
+      required: [group_id, role]
+      properties:
+        group_id: { type: string, format: uuid }
+        group_name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+
+    OidcBinding:
+      type: object
+      required: [claim_value, role]
+      properties:
+        claim_value: { type: string, description: Value that must appear in the IdP groups claim }
+        role: { $ref: '#/components/schemas/Role' }
+
+    GroupInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1 }
+        oidc_bindings:
+          type: array
+          items: { $ref: '#/components/schemas/OidcBinding' }
+
+    Group:
+      type: object
+      required: [id, name, oidc_bindings, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        oidc_bindings:
+          type: array
+          items: { $ref: '#/components/schemas/OidcBinding' }
+        created_at: { type: string, format: date-time }
+
+    BlobInfo:
+      type: object
+      required: [sha256, size]
+      properties:
+        sha256: { type: string }
+        size: { type: integer, format: int64 }
+
+    MediaKind:
+      type: string
+      enum: [video, image, audio]
+
+    MediaInput:
+      type: object
+      required: [group_id, kind, sha256, mime, title]
+      properties:
+        group_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/MediaKind' }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        mime: { type: string, examples: [video/mp4, video/quicktime, image/jpeg, image/png, image/heic, audio/mp4] }
+        title: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+        duration_ms: { type: integer, format: int64, description: Video/audio only }
+        codec: { type: string, description: e.g. hvc1, avc1, aac, alac }
+        hdr: { type: boolean }
+        frame_rate: { type: number }
+        source_filename: { type: string }
+        thumbnail_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Optional uploaded JPEG thumbnail blob
+
+    MediaPatch:
+      type: object
+      properties:
+        title: { type: string }
+
+    Media:
+      allOf:
+        - $ref: '#/components/schemas/MediaInput'
+        - type: object
+          required: [id, size, created_at]
+          properties:
+            id: { type: string, format: uuid }
+            size: { type: integer, format: int64 }
+            created_by: { type: string }
+            created_at: { type: string, format: date-time }
+
+    AdvanceMode:
+      type: string
+      description: What happens when an item finishes. `inherit` uses playlist defaults.
+      enum: [inherit, auto, hold]
+
+    WaitingDisplay:
+      type: string
+      enum: [inherit, hold_last_frame, loop, black]
+
+    TransitionType:
+      type: string
+      enum: [cut, dissolve, push]
+
+    Transition:
+      type: object
+      required: [type, duration_ms]
+      properties:
+        type: { $ref: '#/components/schemas/TransitionType' }
+        duration_ms: { type: integer, minimum: 0, maximum: 10000 }
+
+    ClipAudio:
+      type: string
+      description: How a video's own audio interacts with an active bed.
+      enum: [inherit, mute, play, duck_bed, pause_bed]
+
+    PlaylistDefaults:
+      type: object
+      required: [then, while_waiting, transition, image_duration_ms, clip_audio]
+      properties:
+        then:
+          type: string
+          enum: [auto, hold]
+        while_waiting:
+          type: string
+          enum: [hold_last_frame, loop, black]
+        transition: { $ref: '#/components/schemas/Transition' }
+        image_duration_ms:
+          type: integer
+          minimum: 0
+          description: 0 = until remote
+        clip_audio:
+          type: string
+          enum: [mute, play, duck_bed, pause_bed]
+
+    ItemKind:
+      type: string
+      enum: [video, image, sequence]
+
+    PlaylistItem:
+      type: object
+      required: [kind]
+      properties:
+        id: { type: string, format: uuid, description: Server assigns if absent }
+        kind: { $ref: '#/components/schemas/ItemKind' }
+        media_id:
+          type: string
+          format: uuid
+          description: Required for video/image
+        pages:
+          type: array
+          description: Required for sequence (ordered image media IDs, e.g. rasterized PDF pages)
+          items: { type: string, format: uuid }
+        label: { type: string, description: Optional display name override }
+        play_count:
+          type: integer
+          minimum: 0
+          description: Video only. Absent = 1. 0 = loop forever (until remote/next).
+        duration_ms:
+          type: integer
+          minimum: 0
+          description: Image, or per page for sequence. Absent = playlist default. 0 = until remote.
+        then: { $ref: '#/components/schemas/AdvanceMode' }
+        while_waiting: { $ref: '#/components/schemas/WaitingDisplay' }
+        transition:
+          $ref: '#/components/schemas/Transition'
+          description: Transition into the next item. Absent = playlist default.
+        clip_audio: { $ref: '#/components/schemas/ClipAudio' }
+        volume:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: Clip audio volume. Absent = 1.
+
+    Bed:
+      type: object
+      required: [start_item_id, end_item_id, tracks]
+      properties:
+        id: { type: string, format: uuid }
+        label: { type: string }
+        start_item_id: { type: string, format: uuid }
+        end_item_id: { type: string, format: uuid, description: Inclusive. May equal start_item_id. }
+        tracks:
+          type: array
+          minItems: 1
+          items: { type: string, format: uuid, description: Audio media ID }
+        shuffle: { type: boolean, default: false }
+        volume: { type: number, minimum: 0, maximum: 1, default: 0.8 }
+        duck_volume: { type: number, minimum: 0, maximum: 1, default: 0.2 }
+        fade_ms: { type: integer, minimum: 0, default: 1500 }
+
+    PlaylistInput:
+      type: object
+      required: [group_id, name]
+      properties:
+        group_id: { type: string, format: uuid }
+        name: { type: string, minLength: 1 }
+        loop: { type: boolean, default: true, description: Restart at item 1 after the last item }
+        defaults: { $ref: '#/components/schemas/PlaylistDefaults' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PlaylistItem' }
+        beds:
+          type: array
+          items: { $ref: '#/components/schemas/Bed' }
+
+    PlaylistUpdate:
+      type: object
+      required: [base_version, name, loop, defaults, items, beds]
+      properties:
+        base_version: { type: integer, format: int64 }
+        name: { type: string, minLength: 1 }
+        loop: { type: boolean }
+        defaults: { $ref: '#/components/schemas/PlaylistDefaults' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PlaylistItem' }
+        beds:
+          type: array
+          items: { $ref: '#/components/schemas/Bed' }
+
+    PlaylistSummary:
+      type: object
+      required: [id, group_id, name, version, item_count, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: integer, format: int64 }
+        item_count: { type: integer }
+        total_bytes: { type: integer, format: int64 }
+        updated_at: { type: string, format: date-time }
+
+    Playlist:
+      type: object
+      required: [id, group_id, name, version, loop, defaults, items, beds, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: integer, format: int64 }
+        loop: { type: boolean }
+        defaults: { $ref: '#/components/schemas/PlaylistDefaults' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PlaylistItem' }
+        beds:
+          type: array
+          items: { $ref: '#/components/schemas/Bed' }
+        updated_at: { type: string, format: date-time }
+        updated_by: { type: string }
+
+    ScreenState:
+      type: string
+      enum: [offline, idle, caching, playing, holding, blackout, error]
+
+    CacheProgress:
+      type: object
+      required: [ready, total, bytes_ready, bytes_total]
+      properties:
+        ready: { type: integer }
+        total: { type: integer }
+        bytes_ready: { type: integer, format: int64 }
+        bytes_total: { type: integer, format: int64 }
+
+    ScreenStatus:
+      type: object
+      required: [state]
+      properties:
+        state: { $ref: '#/components/schemas/ScreenState' }
+        playlist_version: { type: integer, format: int64 }
+        item_id: { type: string, format: uuid }
+        item_index: { type: integer }
+        holding: { type: boolean }
+        cache: { $ref: '#/components/schemas/CacheProgress' }
+        app_version: { type: string }
+        os_version: { type: string }
+        model: { type: string }
+        message: { type: string, description: Human-readable error/detail }
+        updated_at: { type: string, format: date-time }
+
+    Screen:
+      type: object
+      required: [id, group_id, name, online, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        group_id: { type: string, format: uuid }
+        name: { type: string }
+        playlist_id: { type: string, format: uuid }
+        online: { type: boolean }
+        status: { $ref: '#/components/schemas/ScreenStatus' }
+        last_seen_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    ScreenPatch:
+      type: object
+      properties:
+        name: { type: string }
+        playlist_id:
+          type: [string, 'null']
+          format: uuid
+          description: null unassigns
+
+    CommandName:
+      type: string
+      enum: [go, next, prev, blackout, reload, identify]
+
+    ScreenCommand:
+      type: object
+      required: [name]
+      properties:
+        name: { $ref: '#/components/schemas/CommandName' }
+        item_index: { type: integer, description: Optional jump target (with name=go) }
+
+    PairingStartInput:
+      type: object
+      properties:
+        model: { type: string }
+        os_version: { type: string }
+        app_version: { type: string }
+
+    PairingSession:
+      type: object
+      required: [pairing_id, code, secret, expires_at]
+      properties:
+        pairing_id: { type: string, format: uuid }
+        code: { type: string, description: 6 chars from an unambiguous alphabet (no 0/O/1/I) }
+        secret: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    PairingClaim:
+      type: object
+      required: [code, name, group_id]
+      properties:
+        code: { type: string }
+        name: { type: string }
+        group_id: { type: string, format: uuid }
+        playlist_id: { type: string, format: uuid }
+
+    PairingStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [pending, claimed, expired]
+        screen_id: { type: string, format: uuid }
+        device_token: { type: string, description: Returned once }
+
+    ManifestAsset:
+      type: object
+      required: [sha256, size, mime, path]
+      properties:
+        sha256: { type: string }
+        size: { type: integer, format: int64 }
+        mime: { type: string }
+        path: { type: string, description: 'Relative URL, e.g. /v1/blobs/<sha256>' }
+        first_use_index: { type: integer, description: Index of the first item that needs it }
+
+    Manifest:
+      type: object
+      required: [screen_id, screen_name, assets, media]
+      properties:
+        screen_id: { type: string, format: uuid }
+        screen_name: { type: string }
+        playlist:
+          $ref: '#/components/schemas/Playlist'
+          description: Absent when unassigned
+        media:
+          type: array
+          description: Every media record referenced by the playlist
+          items: { $ref: '#/components/schemas/Media' }
+        assets:
+          type: array
+          description: Unique blobs in download-priority order (first use; bed tracks needed by item N ordered with item N)
+          items: { $ref: '#/components/schemas/ManifestAsset' }
+
+    WsServerMessageType:
+      type: string
+      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, unpaired]
+
+    WsServerMessage:
+      type: object
+      required: [type]
+      description: Flat envelope; fields present depend on `type`.
+      properties:
+        type: { $ref: '#/components/schemas/WsServerMessageType' }
+        server_id: { type: string, format: uuid, description: hello }
+        version: { type: integer, format: int64, description: manifest_changed }
+        command: { $ref: '#/components/schemas/ScreenCommand' }
+        screen_id: { type: string, format: uuid, description: screen_status / online / offline }
+        status: { $ref: '#/components/schemas/ScreenStatus' }
+
+    WsClientMessageType:
+      type: string
+      enum: [status, ping]
+
+    WsClientMessage:
+      type: object
+      required: [type]
+      properties:
+        type: { $ref: '#/components/schemas/WsClientMessageType' }
+        status: { $ref: '#/components/schemas/ScreenStatus' }

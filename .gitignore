@@ -1,0 +1,16 @@
+# Rust / Nix
+/server/target/
+result
+result-*
+.direnv/
+# Xcode / SwiftPM
+apple/*.xcodeproj/
+apple/branding.yml
+.build/
+.swiftpm/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+# Local data
+/data/
+.DS_Store
