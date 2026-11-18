@@ -1,0 +1,421 @@
+use serde::{Deserialize, Deserializer, Serialize};
+use sqlx::FromRow;
+use uuid::Uuid;
+
+use crate::auth::Role;
+
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OidcBinding {
+    pub claim_value: String,
+    pub role: Role,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaKind {
+    Video,
+    Image,
+    Audio,
+}
+
+impl MediaKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Video => "video",
+            Self::Image => "image",
+            Self::Audio => "audio",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MediaInput {
+    pub group_id: String,
+    pub kind: MediaKind,
+    pub sha256: String,
+    pub mime: String,
+    pub title: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub codec: Option<String>,
+    pub hdr: Option<bool>,
+    pub frame_rate: Option<f64>,
+    pub source_filename: Option<String>,
+    pub thumbnail_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct MediaPatch {
+    pub title: Option<String>,
+}
+
+#[derive(Serialize, FromRow, Clone, Debug)]
+pub struct Media {
+    pub id: String,
+    pub group_id: String,
+    pub kind: String,
+    pub sha256: String,
+    pub mime: String,
+    pub title: String,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub codec: Option<String>,
+    pub hdr: Option<bool>,
+    pub frame_rate: Option<f64>,
+    pub source_filename: Option<String>,
+    pub thumbnail_sha256: Option<String>,
+    pub size: i64,
+    pub created_by: Option<String>,
+    pub created_at: String,
+}
+
+pub const MEDIA_COLUMNS: &str = "id, group_id, kind, sha256, mime, title, width, height, duration_ms, codec, hdr, frame_rate, source_filename, thumbnail_sha256, size, created_by, created_at";
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionType {
+    Cut,
+    Dissolve,
+    Push,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Transition {
+    #[serde(rename = "type")]
+    pub kind: TransitionType,
+    pub duration_ms: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultThen {
+    Auto,
+    Hold,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultWaiting {
+    HoldLastFrame,
+    Loop,
+    Black,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultClipAudio {
+    Mute,
+    Play,
+    DuckBed,
+    PauseBed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct PlaylistDefaults {
+    pub then: DefaultThen,
+    pub while_waiting: DefaultWaiting,
+    pub transition: Transition,
+    pub image_duration_ms: u64,
+    pub clip_audio: DefaultClipAudio,
+}
+
+impl Default for PlaylistDefaults {
+    fn default() -> Self {
+        Self {
+            then: DefaultThen::Auto,
+            while_waiting: DefaultWaiting::HoldLastFrame,
+            transition: Transition { kind: TransitionType::Dissolve, duration_ms: 1000 },
+            image_duration_ms: 10000,
+            clip_audio: DefaultClipAudio::DuckBed,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKind {
+    Video,
+    Image,
+    Sequence,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvanceMode {
+    Inherit,
+    Auto,
+    Hold,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitingDisplay {
+    Inherit,
+    HoldLastFrame,
+    Loop,
+    Black,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipAudio {
+    Inherit,
+    Mute,
+    Play,
+    DuckBed,
+    PauseBed,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PlaylistItem {
+    pub id: Option<Uuid>,
+    pub kind: ItemKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Vec<Uuid>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub play_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub then: Option<AdvanceMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub while_waiting: Option<WaitingDisplay>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition: Option<Transition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_audio: Option<ClipAudio>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f64>,
+}
+
+fn d_volume() -> f64 {
+    0.8
+}
+fn d_duck() -> f64 {
+    0.2
+}
+fn d_fade() -> u64 {
+    1500
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Bed {
+    pub id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub start_item_id: Uuid,
+    pub end_item_id: Uuid,
+    pub tracks: Vec<Uuid>,
+    #[serde(default)]
+    pub shuffle: bool,
+    #[serde(default = "d_volume")]
+    pub volume: f64,
+    #[serde(default = "d_duck")]
+    pub duck_volume: f64,
+    #[serde(default = "d_fade")]
+    pub fade_ms: u64,
+}
+
+#[derive(Deserialize)]
+pub struct PlaylistInput {
+    pub group_id: String,
+    pub name: String,
+    #[serde(rename = "loop")]
+    pub looping: Option<bool>,
+    pub defaults: Option<PlaylistDefaults>,
+    #[serde(default)]
+    pub items: Vec<PlaylistItem>,
+    #[serde(default)]
+    pub beds: Vec<Bed>,
+}
+
+#[derive(Deserialize)]
+pub struct PlaylistUpdate {
+    pub base_version: i64,
+    pub name: String,
+    #[serde(rename = "loop")]
+    pub looping: bool,
+    pub defaults: PlaylistDefaults,
+    pub items: Vec<PlaylistItem>,
+    pub beds: Vec<Bed>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct Playlist {
+    pub id: String,
+    pub group_id: String,
+    pub name: String,
+    pub version: i64,
+    #[serde(rename = "loop")]
+    pub looping: bool,
+    pub defaults: PlaylistDefaults,
+    pub items: Vec<PlaylistItem>,
+    pub beds: Vec<Bed>,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+}
+
+#[derive(FromRow)]
+pub struct PlaylistRow {
+    pub id: String,
+    pub group_id: String,
+    pub name: String,
+    pub version: i64,
+    #[sqlx(rename = "loop")]
+    pub looping: bool,
+    pub defaults: String,
+    pub items: String,
+    pub beds: String,
+    pub updated_at: String,
+    pub updated_by: Option<String>,
+}
+
+pub const PLAYLIST_COLUMNS: &str =
+    "id, group_id, name, version, loop, defaults, items, beds, updated_at, updated_by";
+
+impl PlaylistRow {
+    pub fn into_playlist(self) -> Result<Playlist, serde_json::Error> {
+        Ok(Playlist {
+            id: self.id,
+            group_id: self.group_id,
+            name: self.name,
+            version: self.version,
+            looping: self.looping,
+            defaults: serde_json::from_str(&self.defaults)?,
+            items: serde_json::from_str(&self.items)?,
+            beds: serde_json::from_str(&self.beds)?,
+            updated_at: self.updated_at,
+            updated_by: self.updated_by,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenState {
+    Offline,
+    Idle,
+    Caching,
+    Playing,
+    Holding,
+    Blackout,
+    Error,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CacheProgress {
+    pub ready: i64,
+    pub total: i64,
+    pub bytes_ready: i64,
+    pub bytes_total: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScreenStatus {
+    pub state: ScreenState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub playlist_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holding: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+impl ScreenStatus {
+    pub fn simple(state: ScreenState) -> Self {
+        Self {
+            state,
+            playlist_version: None,
+            item_id: None,
+            item_index: None,
+            holding: None,
+            cache: None,
+            app_version: None,
+            os_version: None,
+            model: None,
+            message: None,
+            updated_at: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct Screen {
+    pub id: String,
+    pub group_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playlist_id: Option<String>,
+    pub online: bool,
+    pub status: ScreenStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(FromRow)]
+pub struct ScreenRow {
+    pub id: String,
+    pub group_id: String,
+    pub name: String,
+    pub playlist_id: Option<String>,
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
+}
+
+pub const SCREEN_COLUMNS: &str = "id, group_id, name, playlist_id, last_seen_at, created_at";
+
+#[derive(Deserialize)]
+pub struct ScreenPatch {
+    pub name: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub playlist_id: Option<Option<String>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandName {
+    Go,
+    Next,
+    Prev,
+    Blackout,
+    Reload,
+    Identify,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScreenCommand {
+    pub name: CommandName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<i64>,
+}
