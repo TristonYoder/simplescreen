@@ -6,15 +6,17 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
-
+use chrono::Utc;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
     auth::Principal,
     error::{ApiError, ApiJson, ApiResult},
-    models::{ItemKind, Media, ScreenRow, MEDIA_COLUMNS},
+    models::{ItemKind, Media, Playlist, ScreenRow, MEDIA_COLUMNS},
+    schedule,
     state::AppState,
+    util::sha256_hex,
 };
 
 async fn device_screen(s: &AppState, p: &Principal) -> ApiResult<ScreenRow> {
@@ -40,21 +42,44 @@ pub async fn select_playlist(
     ApiJson(selection): ApiJson<Selection>,
 ) -> ApiResult<StatusCode> {
     let screen = device_screen(&s, &p).await?;
-    super::screens::assign_playlist(&s, &screen, selection.playlist_id.as_deref()).await?;
+    let base = schedule::base_timeline(&s, &screen, Utc::now()).await?;
+    let scheduled = base.len() > 1 || base.first().is_some_and(|g| g.source != schedule::Source::Default);
+    if scheduled {
+        super::screens::set_override_row(&s, &screen, selection.playlist_id.as_deref(), schedule::next_change(&base)).await?;
+    } else {
+        super::screens::assign_playlist(&s, &screen, selection.playlist_id.as_deref()).await?;
+        if screen.override_set {
+            super::screens::clear_override_row(&s, &screen).await?;
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMap) -> ApiResult<Response> {
     let screen = device_screen(&s, &p).await?;
+    let now = Utc::now();
+    let timeline = schedule::screen_timeline(&s, &screen, now, now + schedule::DEVICE_HORIZON).await?;
 
-    let playlist = match &screen.playlist_id {
-        Some(id) => Some(super::playlists::fetch(&s, id).await?),
-        None => None,
-    };
-    let etag = match &playlist {
-        Some(pl) => format!("\"{}\"", pl.version),
-        None => "\"none\"".to_string(),
-    };
+    let mut playlists: Vec<Playlist> = vec![];
+    for seg in &timeline {
+        if let Some(id) = &seg.playlist_id {
+            if !playlists.iter().any(|pl| &pl.id == id) {
+                if let Ok(pl) = super::playlists::fetch(&s, id).await {
+                    playlists.push(pl);
+                }
+            }
+        }
+    }
+    let active = timeline.first().and_then(|g| g.playlist_id.as_ref()).and_then(|id| playlists.iter().find(|pl| &pl.id == id));
+
+    let fingerprint = json!({
+        "segments": timeline.iter().enumerate().map(|(i, g)| json!([
+            g.playlist_id, g.source, g.entry_id, (i + 1 < timeline.len()).then_some(g.ends_at),
+        ])).collect::<Vec<_>>(),
+        "playlists": playlists.iter().map(|pl| json!([pl.id, pl.version])).collect::<Vec<_>>(),
+        "name": screen.name,
+    });
+    let etag = format!("\"{}\"", &sha256_hex(fingerprint.to_string().as_bytes())[..20]);
     let not_modified = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -66,9 +91,9 @@ pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMa
 
     let mut media: Vec<Media> = vec![];
     let mut assets = vec![];
-    if let Some(pl) = &playlist {
+    if !playlists.is_empty() {
         let all: Vec<Media> = sqlx::query_as(&format!("SELECT {MEDIA_COLUMNS} FROM media WHERE group_id = ?"))
-            .bind(&pl.group_id)
+            .bind(&screen.group_id)
             .fetch_all(&s.db)
             .await?;
         let by_id: HashMap<String, Media> = all.into_iter().map(|m| (m.id.clone(), m)).collect();
@@ -89,22 +114,24 @@ pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMa
                 }));
             }
         };
-        for (index, item) in pl.items.iter().enumerate() {
-            match item.kind {
-                ItemKind::Video | ItemKind::Image => {
-                    if let Some(m) = &item.media_id {
-                        add(&m.to_string(), index, &mut media, &mut assets);
+        for pl in &playlists {
+            for (index, item) in pl.items.iter().enumerate() {
+                match item.kind {
+                    ItemKind::Video | ItemKind::Image => {
+                        if let Some(m) = &item.media_id {
+                            add(&m.to_string(), index, &mut media, &mut assets);
+                        }
+                    }
+                    ItemKind::Sequence => {
+                        for m in item.pages.iter().flatten() {
+                            add(&m.to_string(), index, &mut media, &mut assets);
+                        }
                     }
                 }
-                ItemKind::Sequence => {
-                    for m in item.pages.iter().flatten() {
-                        add(&m.to_string(), index, &mut media, &mut assets);
+                for bed in pl.beds.iter().filter(|b| b.start_item_id == item.id.unwrap_or_default()) {
+                    for t in &bed.tracks {
+                        add(&t.to_string(), index, &mut media, &mut assets);
                     }
-                }
-            }
-            for bed in pl.beds.iter().filter(|b| b.start_item_id == item.id.unwrap_or_default()) {
-                for t in &bed.tracks {
-                    add(&t.to_string(), index, &mut media, &mut assets);
                 }
             }
         }
@@ -113,10 +140,12 @@ pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMa
     let mut body = json!({
         "screen_id": screen.id,
         "screen_name": screen.name,
+        "timeline": timeline,
+        "playlists": playlists,
         "media": media,
         "assets": assets,
     });
-    if let Some(pl) = &playlist {
+    if let Some(pl) = active {
         body["playlist"] = serde_json::to_value(pl)?;
     }
     Ok(([(header::ETAG, etag_value)], Json(body)).into_response())

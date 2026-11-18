@@ -14,6 +14,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("{BRAND_SLUG} server {} listening on {}:{port}", env!("CARGO_PKG_VERSION"), cfg.bind);
     tracing::info!("data dir {}", cfg.data_dir.display());
 
+    tokio::spawn(screen_server::schedule::run(state.clone()));
     let daemon = if cfg.bonjour { bonjour::advertise(port, &state.server_id) } else { None };
 
     let shutdown_tx = state.shutdown.clone();

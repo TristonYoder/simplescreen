@@ -15,6 +15,7 @@ pub struct Config {
     pub oidc_admin_groups: Vec<String>,
     pub oidc_token_type: String,
     pub bonjour: bool,
+    pub timezone: String,
 }
 
 impl Config {
@@ -31,6 +32,7 @@ impl Config {
             oidc_admin_groups: vec![],
             oidc_token_type: "access_token".into(),
             bonjour: true,
+            timezone: iana_time_zone::get_timezone().ok().filter(|t| t.parse::<chrono_tz::Tz>().is_ok()).unwrap_or_else(|| "UTC".into()),
         }
     }
 
@@ -88,6 +90,10 @@ impl Config {
         }
         if let Some(b) = get("bonjour") {
             cfg.bonjour = matches!(b.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Some(t) = get("timezone") {
+            anyhow::ensure!(t.parse::<chrono_tz::Tz>().is_ok(), "invalid timezone {t}");
+            cfg.timezone = t;
         }
         Ok(cfg)
     }

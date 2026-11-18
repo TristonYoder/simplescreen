@@ -376,6 +376,8 @@ pub struct Screen {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist_id: Option<String>,
+    #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
+    pub override_: Option<ScreenOverride>,
     pub online: bool,
     pub status: ScreenStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -391,9 +393,31 @@ pub struct ScreenRow {
     pub playlist_id: Option<String>,
     pub last_seen_at: Option<String>,
     pub created_at: String,
+    pub override_set: bool,
+    pub override_playlist_id: Option<String>,
+    pub override_until: Option<String>,
+    pub override_set_at: Option<String>,
 }
 
-pub const SCREEN_COLUMNS: &str = "id, group_id, name, playlist_id, last_seen_at, created_at";
+pub const SCREEN_COLUMNS: &str = "id, group_id, name, playlist_id, last_seen_at, created_at, \
+     override_set, override_playlist_id, override_until, override_set_at";
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ScreenOverride {
+    pub playlist_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    pub set_at: String,
+}
+
+#[derive(Deserialize)]
+pub struct ScreenOverrideInput {
+    pub playlist_id: Option<String>,
+    #[serde(default)]
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub until_next_change: bool,
+}
 
 #[derive(Deserialize)]
 pub struct ScreenPatch {

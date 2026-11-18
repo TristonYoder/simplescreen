@@ -269,18 +269,22 @@ pub async fn update(
     }
     tx.commit().await?;
     let updated = fetch(&s, &id).await?;
-    s.notify_screens_for_playlist(&id, updated.version).await;
+    s.notify_screens_for_playlist(&updated.group_id, updated.version).await;
     Ok(Json(updated))
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let current = fetch(&s, &id).await?;
     p.require(&current.group_id, Role::Editor)?;
-    let screens: Vec<(String,)> =
-        sqlx::query_as("SELECT id FROM screens WHERE playlist_id = ?").bind(&id).fetch_all(&s.db).await?;
+    sqlx::query(
+        "UPDATE screens SET override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL \
+         WHERE override_playlist_id = ?",
+    )
+    .bind(&id)
+    .execute(&s.db)
+    .await?;
     sqlx::query("DELETE FROM playlists WHERE id = ?").bind(&id).execute(&s.db).await?;
-    for (screen_id,) in screens {
-        s.notify_manifest(&screen_id, 0);
-    }
+    crate::schedule::notify_group(&s, &current.group_id).await;
+    crate::schedule::broadcast_changed(&s, &current.group_id);
     Ok(StatusCode::NO_CONTENT)
 }

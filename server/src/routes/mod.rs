@@ -4,6 +4,7 @@ mod groups;
 mod media;
 mod pairing;
 mod playlists;
+mod schedule;
 mod screens;
 mod system;
 mod ws;
@@ -39,6 +40,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/screens", get(screens::list))
         .route("/v1/screens/{id}", get(screens::get).patch(screens::patch).delete(screens::delete))
         .route("/v1/screens/{id}/command", post(screens::command))
+        .route("/v1/screens/{id}/override", put(screens::set_override).delete(screens::clear_override))
+        .route("/v1/schedule", get(schedule::list).post(schedule::create))
+        .route("/v1/schedule/timeline", get(schedule::timeline))
+        .route("/v1/schedule/{id}", put(schedule::update).delete(schedule::delete))
         .route("/v1/pairing", post(pairing::start))
         .route("/v1/pairing/claim", post(pairing::claim))
         .route("/v1/pairing/{id}", get(pairing::poll))

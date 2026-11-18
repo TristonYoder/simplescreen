@@ -5,7 +5,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
     SqlitePool,
 };
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 use crate::{
     auth::{DeviceInfo, Oidc, Principal, Role},
@@ -27,6 +27,7 @@ pub struct Inner {
     pub touched: Mutex<HashMap<String, std::time::Instant>>,
     pub statuses: Mutex<HashMap<String, ScreenStatus>>,
     pub shutdown: watch::Sender<bool>,
+    pub schedule_wake: Notify,
 }
 
 #[derive(Clone)]
@@ -59,9 +60,10 @@ impl AppState {
         self.devices.lock().retain(|_, d| d.screen_id != screen_id);
     }
 
-    pub async fn notify_screens_for_playlist(&self, playlist_id: &str, version: i64) {
-        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE playlist_id = ?")
-            .bind(playlist_id)
+    /// Any screen in the group may have the playlist scheduled; devices refetch with If-None-Match.
+    pub async fn notify_screens_for_playlist(&self, group_id: &str, version: i64) {
+        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE group_id = ?")
+            .bind(group_id)
             .fetch_all(&self.db)
             .await
             .unwrap_or_default();
@@ -138,6 +140,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         touched: Mutex::default(),
         statuses: Mutex::default(),
         shutdown,
+        schedule_wake: Notify::new(),
     })))
 }
 
@@ -156,7 +159,7 @@ fn load_or_create_bootstrap(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql"), include_str!("../migrations/0002_schedule.sql")];
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     let (current,): (i64,) = sqlx::query_as("PRAGMA user_version").fetch_one(db).await?;

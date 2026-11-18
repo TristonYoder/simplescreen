@@ -9,7 +9,12 @@ use serde_json::json;
 use crate::{
     auth::{Principal, Role},
     error::{ApiError, ApiJson, ApiResult},
-    models::{Screen, ScreenCommand, ScreenPatch, ScreenRow, ScreenState, ScreenStatus, SCREEN_COLUMNS},
+    models::{
+        Screen, ScreenCommand, ScreenOverride, ScreenOverrideInput, ScreenPatch, ScreenRow, ScreenState, ScreenStatus,
+        SCREEN_COLUMNS,
+    },
+    schedule,
+    util::now,
     state::AppState,
 };
 
@@ -20,11 +25,17 @@ pub fn to_screen(s: &AppState, row: ScreenRow) -> Screen {
     } else {
         ScreenStatus::simple(ScreenState::Offline)
     };
+    let override_ = row.override_set.then(|| ScreenOverride {
+        playlist_id: row.override_playlist_id.clone(),
+        until: row.override_until.clone(),
+        set_at: row.override_set_at.clone().unwrap_or_default(),
+    });
     Screen {
         id: row.id,
         group_id: row.group_id,
         name: row.name,
         playlist_id: row.playlist_id,
+        override_,
         online,
         status,
         last_seen_at: row.last_seen_at,
@@ -87,25 +98,82 @@ pub async fn patch(
     Ok(Json(to_screen(&s, fetch_row(&s, &id).await?)))
 }
 
-/// Assigns (or with `None` unassigns) a playlist from the screen's own group and notifies the device and group users.
+async fn check_playlist(s: &AppState, row: &ScreenRow, playlist: Option<&str>) -> ApiResult<i64> {
+    let Some(pid) = playlist else { return Ok(0) };
+    let found: Option<(i64,)> = sqlx::query_as("SELECT version FROM playlists WHERE id = ? AND group_id = ?")
+        .bind(pid)
+        .bind(&row.group_id)
+        .fetch_optional(&s.db)
+        .await?;
+    Ok(found.ok_or_else(|| ApiError::unprocessable("invalid_playlist", "playlist does not exist in the screen's group"))?.0)
+}
+
+/// Sets (or with `None` clears) the default playlist from the screen's own group and notifies the device and group users.
 pub async fn assign_playlist(s: &AppState, row: &ScreenRow, playlist: Option<&str>) -> ApiResult<()> {
-    let version = match playlist {
-        None => 0,
-        Some(pid) => {
-            let found: Option<(i64,)> = sqlx::query_as("SELECT version FROM playlists WHERE id = ? AND group_id = ?")
-                .bind(pid)
-                .bind(&row.group_id)
-                .fetch_optional(&s.db)
-                .await?;
-            found
-                .ok_or_else(|| ApiError::unprocessable("invalid_playlist", "playlist does not exist in the screen's group"))?
-                .0
-        }
-    };
+    let version = check_playlist(s, row, playlist).await?;
     sqlx::query("UPDATE screens SET playlist_id = ? WHERE id = ?").bind(playlist).bind(&row.id).execute(&s.db).await?;
-    s.notify_manifest(&row.id, version);
-    broadcast_updated(s, row);
+    changed(s, row, version);
     Ok(())
+}
+
+pub async fn set_override_row(
+    s: &AppState,
+    row: &ScreenRow,
+    playlist: Option<&str>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+) -> ApiResult<()> {
+    let version = check_playlist(s, row, playlist).await?;
+    if until.is_some_and(|u| u <= chrono::Utc::now()) {
+        return Err(ApiError::unprocessable("invalid_override", "until must be in the future"));
+    }
+    sqlx::query("UPDATE screens SET override_set = 1, override_playlist_id = ?, override_until = ?, override_set_at = ? WHERE id = ?")
+        .bind(playlist)
+        .bind(until.map(|u| u.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)))
+        .bind(now())
+        .bind(&row.id)
+        .execute(&s.db)
+        .await?;
+    changed(s, row, version);
+    Ok(())
+}
+
+pub async fn clear_override_row(s: &AppState, row: &ScreenRow) -> ApiResult<()> {
+    sqlx::query("UPDATE screens SET override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL WHERE id = ?")
+        .bind(&row.id)
+        .execute(&s.db)
+        .await?;
+    changed(s, row, 0);
+    Ok(())
+}
+
+fn changed(s: &AppState, row: &ScreenRow, version: i64) {
+    s.notify_manifest(&row.id, version);
+    s.schedule_wake.notify_one();
+    broadcast_updated(s, row);
+}
+
+pub async fn set_override(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<ScreenOverrideInput>,
+) -> ApiResult<Json<Screen>> {
+    let row = fetch_row(&s, &id).await?;
+    p.require(&row.group_id, Role::Editor)?;
+    let until = match (input.until, input.until_next_change) {
+        (Some(u), _) => Some(u),
+        (None, true) => schedule::next_change(&schedule::base_timeline(&s, &row, chrono::Utc::now()).await?),
+        (None, false) => None,
+    };
+    set_override_row(&s, &row, input.playlist_id.as_deref(), until).await?;
+    Ok(Json(to_screen(&s, fetch_row(&s, &id).await?)))
+}
+
+pub async fn clear_override(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Screen>> {
+    let row = fetch_row(&s, &id).await?;
+    p.require(&row.group_id, Role::Editor)?;
+    clear_override_row(&s, &row).await?;
+    Ok(Json(to_screen(&s, fetch_row(&s, &id).await?)))
 }
 
 fn broadcast_updated(s: &AppState, row: &ScreenRow) {

@@ -373,7 +373,7 @@ async fn pairing_and_manifest() {
 
     let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
     assert_eq!(r.status, StatusCode::OK);
-    assert_eq!(r.headers[header::ETAG], "\"2\"");
+    let etag = r.headers[header::ETAG].to_str().unwrap().to_string();
     let m = r.json();
     assert_eq!(m["screen_name"], "Lobby TV");
     assert_eq!(m["playlist"]["version"], 2);
@@ -385,7 +385,7 @@ async fn pairing_and_manifest() {
     assert_eq!(m["assets"][0]["mime"], "video/mp4");
     assert_eq!(m["media"].as_array().unwrap().len(), 6);
 
-    let r = app.send("GET", "/v1/device/manifest", Some(&token), &[("if-none-match", "\"2\"")], Body::empty(), false).await;
+    let r = app.send("GET", "/v1/device/manifest", Some(&token), &[("if-none-match", &etag)], Body::empty(), false).await;
     assert_eq!(r.status, StatusCode::NOT_MODIFIED);
 
     let r = app.call_as(&token, "GET", &format!("/v1/blobs/{sha_v1}"), None).await;
@@ -401,7 +401,7 @@ async fn pairing_and_manifest() {
     let r = app.call("PATCH", &format!("/v1/screens/{screen_id}"), Some(json!({ "playlist_id": null }))).await;
     assert!(r.json().get("playlist_id").is_none());
     let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
-    assert_eq!(r.headers[header::ETAG], "\"none\"");
+    assert_ne!(r.headers[header::ETAG].to_str().unwrap(), etag);
     assert!(r.json().get("playlist").is_none());
 
     let r = app.call("DELETE", &format!("/v1/screens/{screen_id}"), None).await;
@@ -455,4 +455,106 @@ async fn device_selects_playlist() {
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     let r = app.call("PUT", "/v1/device/playlist", Some(json!({ "playlist_id": a }))).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn schedule_resolves_events_weekly_and_overrides() {
+    use chrono::{DateTime, Duration, Timelike, Utc};
+    let app = App::new().await;
+    let g = app.group().await;
+    let r = app.call("PUT", &format!("/v1/groups/{g}"), Some(json!({ "name": "Lobby", "timezone": "Mars/Base" }))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let r = app.call("PUT", &format!("/v1/groups/{g}"), Some(json!({ "name": "Lobby", "timezone": "UTC" }))).await;
+    assert_eq!(r.json()["timezone"], "UTC");
+
+    let (img, _) = app.media(&g, "image", "image/png", b"one").await;
+    let (img2, sha2) = app.media(&g, "image", "image/png", b"two").await;
+    let mk = |name: &str, m: &str| json!({ "group_id": g, "name": name, "items": [{ "kind": "image", "media_id": m }] });
+    let id = |r: Resp| r.json()["id"].as_str().unwrap().to_string();
+    let a = id(app.call("POST", "/v1/playlists", Some(mk("A", &img))).await);
+    let b = id(app.call("POST", "/v1/playlists", Some(mk("B", &img))).await);
+    let c = id(app.call("POST", "/v1/playlists", Some(mk("C", &img2))).await);
+    let (screen, token) = pair(&app, &g, "Hall", Some(&a)).await;
+
+    let now = Utc::now().with_second(0).unwrap().with_nanosecond(0).unwrap();
+    let local = |d: DateTime<Utc>| d.format("%Y-%m-%dT%H:%M").to_string();
+    let clock = |d: DateTime<Utc>| d.format("%H:%M").to_string();
+
+    let bad = app
+        .call("POST", "/v1/schedule", Some(json!({ "group_id": g, "playlist_id": b, "kind": "once", "starts_at": local(now), "ends_at": local(now) })))
+        .await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let bad = app
+        .call("POST", "/v1/schedule", Some(json!({ "group_id": g, "playlist_id": b, "kind": "weekly", "days": [], "start_time": "07:00", "end_time": "08:00" })))
+        .await;
+    assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let event_end = now + Duration::hours(2);
+    let r = app
+        .call(
+            "POST",
+            "/v1/schedule",
+            Some(json!({ "group_id": g, "playlist_id": b, "kind": "once", "title": "Launch", "starts_at": local(now - Duration::hours(1)), "ends_at": local(event_end) })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let event = r.json()["id"].as_str().unwrap().to_string();
+    let r = app
+        .call(
+            "POST",
+            "/v1/schedule",
+            Some(json!({ "group_id": g, "playlist_id": c, "kind": "weekly", "days": [1,2,3,4,5,6,7], "screen_ids": [screen],
+                         "start_time": clock(now + Duration::hours(3)), "end_time": clock(now + Duration::hours(4)) })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+
+    let r = app.call("GET", &format!("/v1/schedule?group_id={g}"), None).await;
+    assert_eq!(r.json()["timezone"], "UTC");
+    assert_eq!(r.json()["entries"].as_array().unwrap().len(), 2);
+
+    let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
+    let m = r.json();
+    assert_eq!(m["playlist"]["id"], b);
+    assert_eq!(m["timeline"][0]["source"], "once");
+    assert_eq!(m["timeline"][0]["entry_id"], event);
+    let sources: Vec<&str> = m["timeline"].as_array().unwrap().iter().map(|s| s["source"].as_str().unwrap()).collect();
+    assert_eq!(&sources[..4], &["once", "default", "weekly", "default"]);
+    let ids: Vec<&str> = m["playlists"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![b.as_str(), a.as_str(), c.as_str()]);
+    assert!(m["assets"].as_array().unwrap().iter().any(|x| x["sha256"] == sha2.as_str()));
+    let etag = r.headers.get(header::ETAG).unwrap().to_str().unwrap().to_string();
+    let r = app.send("GET", "/v1/device/manifest", Some(&token), &[("If-None-Match", &etag)], Body::empty(), false).await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+
+    let from = Utc::now().to_rfc3339();
+    let to = (Utc::now() + Duration::hours(6)).to_rfc3339();
+    let r = app
+        .call("GET", &format!("/v1/schedule/timeline?group_id={g}&from={}&to={}", from.replace('+', "%2B"), to.replace('+', "%2B")), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["screens"][0]["segments"][0]["playlist_id"], b);
+
+    let r = app.call("PUT", &format!("/v1/screens/{screen}/override"), Some(json!({ "playlist_id": c, "until_next_change": true }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let until = DateTime::parse_from_rfc3339(r.json()["override"]["until"].as_str().unwrap()).unwrap();
+    assert_eq!(until, event_end);
+    let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
+    assert_eq!(r.json()["playlist"]["id"], c);
+    assert_eq!(r.json()["timeline"][0]["source"], "override");
+    let r = app.call("DELETE", &format!("/v1/screens/{screen}/override"), None).await;
+    assert!(r.json().get("override").is_none());
+
+    let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": a }))).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call("GET", &format!("/v1/screens/{screen}"), None).await;
+    assert_eq!(r.json()["override"]["playlist_id"], a);
+    assert_eq!(r.json()["playlist_id"], a);
+
+    let r = app.call("DELETE", &format!("/v1/schedule/{event}"), None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call("DELETE", &format!("/v1/playlists/{c}"), None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call("GET", &format!("/v1/schedule?group_id={g}"), None).await;
+    assert_eq!(r.json()["entries"].as_array().unwrap().len(), 0);
 }
