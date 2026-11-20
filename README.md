@@ -55,13 +55,22 @@ Data lives in `/var/lib/simplescreen`. Back up `db.sqlite` and `blobs/` together
 
 ## Docker
 
+CI publishes a multi-arch image (amd64, arm64) to GHCR on every push to `main` (`latest`) and on `v*` tags (the version without the `v`).
+
 ```sh
-nix build .#docker   # on a Linux builder
-docker load < result
-docker run -p 8420:8420 -v screen-data:/data simplescreen:<version>
+docker run -d --name simplescreen -p 8420:8420 \
+  -e SIMPLESCREEN_TIMEZONE=America/Chicago \
+  -v simplescreen-data:/data ghcr.io/tristonyoder/simplescreen:latest
+docker cp simplescreen:/data/bootstrap-token .   # first-run admin token
 ```
 
-Bonjour needs host networking (`--network host`) to reach the LAN.
+- Configuration is the same `SIMPLESCREEN_*` environment as above. Set `SIMPLESCREEN_TIMEZONE`, since the container has no local timezone and defaults to UTC.
+- The server runs as uid 1000. A named volume gets the right owner automatically. For a bind mount, `chown 1000:1000` the host directory first.
+- The image has no shell, so read files with `docker cp`, not `docker exec`.
+- For a token you provide, mount it and set `SIMPLESCREEN_BOOTSTRAP_TOKEN_FILE`.
+- Bonjour needs host networking (`--network host`) to reach the LAN. Otherwise set `SIMPLESCREEN_BONJOUR=false` and enter the URL in the apps.
+
+To build it yourself on a Linux builder: `nix build .#docker && docker load < result`.
 
 ## Troubleshooting
 
