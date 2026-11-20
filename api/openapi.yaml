@@ -8,7 +8,13 @@ info:
 
     Conventions:
     - IDs are UUID strings. Timestamps are RFC 3339 strings (UTC).
-    - Schedules use wall-clock times in the group's IANA `timezone` (`HH:MM`, `YYYY-MM-DDTHH:MM`).
+    - The server is exactly one organization. Its `id` is the server's `server_id`; its name and
+      IANA timezone are server settings (`GET`/`PATCH /v1/settings`, or env vars, which win).
+      Users belong to Teams; "admin" means a server admin (`admin_groups` or the bootstrap token).
+    - Org-scoped requests (user calls, including `GET /v1/ws`) may send `X-Organization: <id>`.
+      If present it must equal this server's org id, else `404 organization_not_found`.
+      Absent is accepted. Device tokens and unauthenticated endpoints ignore it.
+    - Schedules use wall-clock times in the org's IANA `timezone` (`HH:MM`, `YYYY-MM-DDTHH:MM`).
       Resolved segments are UTC timestamps.
     - Media blobs are content-addressed by lowercase hex SHA-256 and immutable.
     - Errors always use the `Error` schema.
@@ -26,7 +32,9 @@ security:
 tags:
   - name: system
   - name: auth
-  - name: groups
+  - name: organizations
+  - name: settings
+  - name: teams
   - name: media
   - name: blobs
   - name: playlists
@@ -62,6 +70,8 @@ paths:
               schema: { $ref: '#/components/schemas/AuthConfig' }
 
   /v1/me:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: getMe
       tags: [auth]
@@ -73,73 +83,171 @@ paths:
               schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
-  /v1/groups:
+  /v1/me/organizations:
     get:
-      operationId: listGroups
-      tags: [groups]
-      description: Groups the caller can see (all, for server admins).
+      operationId: listMyOrganizations
+      tags: [organizations]
+      description: |
+        Organizations the caller can open. A self-hosted server always returns exactly its own org,
+        `can_create: false` and no invites. A hosting gateway may return several orgs, invites and
+        `can_create: true`; clients must not assume either. Ignores `X-Organization`.
       responses:
         '200':
-          description: Groups
+          description: Organizations
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/Group' }
+              schema: { $ref: '#/components/schemas/OrganizationList' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/organizations:
     post:
-      operationId: createGroup
-      tags: [groups]
-      description: Server admin only.
+      operationId: createOrganization
+      tags: [organizations]
+      description: |
+        Start a new organization (hosted gateway only). A self-hosted server always answers
+        `403` with code `not_supported`.
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/GroupInput' }
+            schema: { $ref: '#/components/schemas/OrganizationInput' }
+      responses:
+        '201':
+          description: Created (gateway only)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/invites/{inviteId}/accept:
+    parameters:
+      - { $ref: '#/components/parameters/InviteId' }
+    post:
+      operationId: acceptInvite
+      tags: [organizations]
+      description: Join an organization from an invite (hosted gateway only). A self-hosted server has no invites and always answers `404`.
+      responses:
+        '200':
+          description: Joined (gateway only)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/settings:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: getSettings
+      tags: [settings]
+      description: Any signed-in user. The org's name and timezone.
+      responses:
+        '200':
+          description: Settings
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateSettings
+      tags: [settings]
+      description: |
+        Server admin. First-run setup writes the org name and timezone here. Fields set by env vars
+        are listed in `locked`; changing one fails with `409 setting_locked`. Changing the timezone
+        re-resolves every schedule (devices get `manifest_changed`, user sockets `schedule_changed`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SettingsPatch' }
+      responses:
+        '200':
+          description: Updated settings
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Settings' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/teams:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: listTeams
+      tags: [teams]
+      description: Teams the caller can see (all, for server admins).
+      responses:
+        '200':
+          description: Teams
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Team' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: createTeam
+      tags: [teams]
+      description: |
+        Server admin only. `oidc_bindings` may be sent with the create, so the first team and its
+        sign-in group → role mapping are set up in one call (Studio's "create first team" screen).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TeamInput' }
       responses:
         '201':
           description: Created
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Group' }
+              schema: { $ref: '#/components/schemas/Team' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
 
-  /v1/groups/{groupId}:
+  /v1/teams/{teamId}:
     parameters:
-      - { $ref: '#/components/parameters/GroupId' }
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/TeamId' }
     get:
-      operationId: getGroup
-      tags: [groups]
+      operationId: getTeam
+      tags: [teams]
       responses:
         '200':
-          description: Group
+          description: Team
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Group' }
+              schema: { $ref: '#/components/schemas/Team' }
         '404': { $ref: '#/components/responses/NotFound' }
     put:
-      operationId: updateGroup
-      tags: [groups]
-      description: Server admin or group admin.
+      operationId: updateTeam
+      tags: [teams]
+      description: Server admin or team admin.
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: '#/components/schemas/GroupInput' }
+            schema: { $ref: '#/components/schemas/TeamInput' }
       responses:
         '200':
           description: Updated
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Group' }
+              schema: { $ref: '#/components/schemas/Team' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
     delete:
-      operationId: deleteGroup
-      tags: [groups]
-      description: Server admin only. Fails with 409 if the group still owns resources.
+      operationId: deleteTeam
+      tags: [teams]
+      description: Server admin only. Fails with 409 if the team still owns resources.
       responses:
         '204': { description: Deleted }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -148,6 +256,7 @@ paths:
 
   /v1/blobs/{sha256}:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/Sha256' }
       - { $ref: '#/components/parameters/TokenQuery' }
     head:
@@ -190,7 +299,7 @@ paths:
       operationId: putBlob
       tags: [blobs]
       description: |
-        Upload raw bytes. Requires editor role in at least one group.
+        Upload raw bytes. Requires editor role in at least one team.
         Server streams to disk while hashing; rejects with 422 if the hash doesn't match the path.
         Idempotent: returns 200 if the blob already exists, 201 if newly stored.
       requestBody:
@@ -214,11 +323,13 @@ paths:
         '422': { $ref: '#/components/responses/Unprocessable' }
 
   /v1/media:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: listMedia
       tags: [media]
       parameters:
-        - name: group_id
+        - name: team_id
           in: query
           required: false
           schema: { type: string, format: uuid }
@@ -237,7 +348,7 @@ paths:
     post:
       operationId: createMedia
       tags: [media]
-      description: Register metadata for an uploaded blob. Blob must already exist (else 422). Editor role in group.
+      description: Register metadata for an uploaded blob. Blob must already exist (else 422). Editor role in team.
       requestBody:
         required: true
         content:
@@ -255,6 +366,7 @@ paths:
 
   /v1/media/{mediaId}:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/MediaId' }
     get:
       operationId: getMedia
@@ -293,11 +405,13 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
 
   /v1/playlists:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: listPlaylists
       tags: [playlists]
       parameters:
-        - name: group_id
+        - name: team_id
           in: query
           required: false
           schema: { type: string, format: uuid }
@@ -329,6 +443,7 @@ paths:
 
   /v1/playlists/{playlistId}:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/PlaylistId' }
     get:
       operationId: getPlaylist
@@ -373,11 +488,13 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/screens:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: listScreens
       tags: [screens]
       parameters:
-        - name: group_id
+        - name: team_id
           in: query
           required: false
           schema: { type: string, format: uuid }
@@ -392,6 +509,7 @@ paths:
 
   /v1/screens/{screenId}:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/ScreenId' }
     get:
       operationId: getScreen
@@ -406,7 +524,7 @@ paths:
     patch:
       operationId: updateScreen
       tags: [screens]
-      description: Rename, assign a playlist (same group), or place on a floor plan (same group). Assigning notifies the device; user sockets in the group get `screen_updated`.
+      description: Rename, assign a playlist (same team), or place on a floor plan (same team). Assigning notifies the device; user sockets in the team get `screen_updated`.
       requestBody:
         required: true
         content:
@@ -432,6 +550,7 @@ paths:
 
   /v1/screens/{screenId}/command:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/ScreenId' }
     post:
       operationId: sendScreenCommand
@@ -450,6 +569,7 @@ paths:
 
   /v1/screens/{screenId}/override:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/ScreenId' }
     put:
       operationId: setScreenOverride
@@ -457,7 +577,7 @@ paths:
       description: |
         Editor role. Plays a playlist (null = nothing) on this screen above every schedule entry
         until `until`, the next scheduled change (`until_next_change`), or until cleared.
-        The device gets `manifest_changed`; user sockets in the group get `screen_updated`.
+        The device gets `manifest_changed`; user sockets in the team get `screen_updated`.
       requestBody:
         required: true
         content:
@@ -486,12 +606,14 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/schedule:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: listSchedule
       tags: [schedule]
-      description: Viewer role. Every schedule entry in a group, plus the group's timezone.
+      description: Viewer role. Every schedule entry in a team, plus the org timezone.
       parameters:
-        - name: group_id
+        - name: team_id
           in: query
           required: true
           schema: { type: string, format: uuid }
@@ -523,11 +645,12 @@ paths:
 
   /v1/schedule/{entryId}:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/EntryId' }
     put:
       operationId: updateScheduleEntry
       tags: [schedule]
-      description: Editor role. Replaces the entry (`group_id` must not change).
+      description: Editor role. Replaces the entry (`team_id` must not change).
       requestBody:
         required: true
         content:
@@ -551,15 +674,17 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/schedule/timeline:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: getScheduleTimeline
       tags: [schedule]
       description: |
-        Viewer role. What each screen in the group plays between `from` and `to` (at most 14 days),
+        Viewer role. What each screen in the team plays between `from` and `to` (at most 14 days),
         with overrides, one-off events, weekly entries and default playlists resolved.
         Segments are contiguous and cover the whole range.
       parameters:
-        - name: group_id
+        - name: team_id
           in: query
           required: true
           schema: { type: string, format: uuid }
@@ -582,11 +707,13 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/floor-plans:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: listFloorPlans
       tags: [floor-plans]
       parameters:
-        - name: group_id
+        - name: team_id
           in: query
           required: true
           schema: { type: string, format: uuid }
@@ -602,7 +729,7 @@ paths:
     post:
       operationId: createFloorPlan
       tags: [floor-plans]
-      description: Editor role. Upload the image with `PUT /v1/blobs/{sha256}` first. User sockets in the group get `floor_plans_changed`.
+      description: Editor role. Upload the image with `PUT /v1/blobs/{sha256}` first. User sockets in the team get `floor_plans_changed`.
       requestBody:
         required: true
         content:
@@ -620,11 +747,12 @@ paths:
 
   /v1/floor-plans/{floorPlanId}:
     parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
       - { $ref: '#/components/parameters/FloorPlanId' }
     put:
       operationId: updateFloorPlan
       tags: [floor-plans]
-      description: Editor role. `group_id` must match. User sockets in the group get `floor_plans_changed`.
+      description: Editor role. `team_id` must match. User sockets in the team get `floor_plans_changed`.
       requestBody:
         required: true
         content:
@@ -668,10 +796,12 @@ paths:
               schema: { $ref: '#/components/schemas/PairingSession' }
 
   /v1/pairing/claim:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     post:
       operationId: claimPairing
       tags: [pairing]
-      description: Editor role in target group. Creates the Screen.
+      description: Editor role in target team. Creates the Screen.
       requestBody:
         required: true
         content:
@@ -736,7 +866,7 @@ paths:
     get:
       operationId: listDevicePlaylists
       tags: [device]
-      description: Device token only. Playlists in the screen's group, for choosing on the device.
+      description: Device token only. Playlists in the screen's team, for choosing on the device.
       responses:
         '200':
           description: Playlist summaries
@@ -752,10 +882,10 @@ paths:
       operationId: selectDevicePlaylist
       tags: [device]
       description: |
-        Device token only. Picks a playlist from the screen's group (null = nothing).
+        Device token only. Picks a playlist from the screen's team (null = nothing).
         If the screen has a schedule in the next 14 days this is an override until the next scheduled
         change; otherwise it sets the screen's default playlist like `updateScreen`.
-        The device gets `manifest_changed`; user sockets in the group get `screen_updated`.
+        The device gets `manifest_changed`; user sockets in the team get `screen_updated`.
       requestBody:
         required: true
         content:
@@ -767,6 +897,8 @@ paths:
         '422': { $ref: '#/components/responses/Unprocessable' }
 
   /v1/ws:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: openSocket
       tags: [device]
@@ -774,6 +906,7 @@ paths:
         WebSocket upgrade. Devices and users. Text frames carry `WsServerMessage` (server→client) and
         `WsClientMessage` (client→server). Server pings every 20 s; clients reconnect with backoff
         (1 s doubling, max 30 s) and refetch the manifest on reconnect.
+        User sockets may send `X-Organization` (checked like any org-scoped call); devices ignore it.
       parameters:
         - { $ref: '#/components/parameters/TokenQuery' }
       responses:
@@ -787,8 +920,21 @@ components:
       scheme: bearer
 
   parameters:
-    GroupId:
-      name: groupId
+    OrganizationHeader:
+      name: X-Organization
+      in: header
+      required: false
+      description: |
+        The org this request is for. Optional on a self-hosted server; if present it must match,
+        else `404 organization_not_found`. A hosting gateway requires it and routes by it.
+      schema: { type: string }
+    InviteId:
+      name: inviteId
+      in: path
+      required: true
+      schema: { type: string }
+    TeamId:
+      name: teamId
       in: path
       required: true
       schema: { type: string, format: uuid }
@@ -846,7 +992,7 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
     NotFound:
-      description: Not found (or not visible to caller)
+      description: 'Not found (or not visible to caller). Code `organization_not_found` when `X-Organization` does not match.'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -884,6 +1030,7 @@ components:
         api_version: { type: integer, description: Major API version (1) }
         server_id: { type: string, format: uuid, description: Stable per-installation ID }
         oidc_enabled: { type: boolean }
+        public_url: { type: string, description: 'Externally reachable base URL, when configured (`<SLUG>_PUBLIC_URL`)' }
 
     AuthConfig:
       type: object
@@ -904,6 +1051,72 @@ components:
       type: string
       enum: [viewer, editor, admin]
 
+    OrganizationRole:
+      type: string
+      enum: [admin, member]
+      description: '`admin` = server admin (`admin_groups` or the bootstrap token).'
+
+    Organization:
+      type: object
+      required: [id, name, team_count, role]
+      properties:
+        id: { type: string, description: 'Org id to send as `X-Organization`. Self-hosted: the server_id.' }
+        name: { type: string }
+        team_count: { type: integer, description: Teams the caller belongs to in this org (all teams for admins) }
+        role: { $ref: '#/components/schemas/OrganizationRole' }
+
+    Invite:
+      type: object
+      required: [id, organization_name, role]
+      properties:
+        id: { type: string }
+        organization_name: { type: string }
+        role: { $ref: '#/components/schemas/OrganizationRole' }
+
+    OrganizationList:
+      type: object
+      required: [organizations, can_create, invites]
+      properties:
+        organizations:
+          type: array
+          items: { $ref: '#/components/schemas/Organization' }
+        can_create: { type: boolean, description: Whether `POST /v1/organizations` is offered (always false self-hosted) }
+        invites:
+          type: array
+          description: Pending invites (always empty self-hosted)
+          items: { $ref: '#/components/schemas/Invite' }
+
+    OrganizationInput:
+      type: object
+      required: [name, timezone, first_team_name]
+      properties:
+        name: { type: string, minLength: 1 }
+        timezone: { type: string, description: IANA zone }
+        first_team_name: { type: string, minLength: 1 }
+
+    SettingName:
+      type: string
+      enum: [org_name, timezone]
+
+    Settings:
+      type: object
+      required: [organization_id, org_name, timezone, locked, configured]
+      properties:
+        organization_id: { type: string, description: Same as `server_id` }
+        org_name: { type: string, description: 'Org display name; defaults to the product name until set' }
+        timezone: { type: string, description: 'Org IANA zone for every schedule; defaults to the host zone, else UTC' }
+        locked:
+          type: array
+          description: Settings fixed by env vars (`<SLUG>_ORG_NAME`, `<SLUG>_ORG_TIMEZONE`); PATCH rejects them
+          items: { $ref: '#/components/schemas/SettingName' }
+        configured: { type: boolean, description: 'False until the org name has been set (by env var or PATCH): drives first-run setup' }
+
+    SettingsPatch:
+      type: object
+      properties:
+        org_name: { type: string, minLength: 1 }
+        timezone: { type: string, description: IANA zone }
+
     Me:
       type: object
       required: [kind, subject, server_admin, memberships]
@@ -922,10 +1135,10 @@ components:
 
     Membership:
       type: object
-      required: [group_id, role]
+      required: [team_id, role]
       properties:
-        group_id: { type: string, format: uuid }
-        group_name: { type: string }
+        team_id: { type: string, format: uuid }
+        team_name: { type: string }
         role: { $ref: '#/components/schemas/Role' }
 
     OidcBinding:
@@ -935,25 +1148,25 @@ components:
         claim_value: { type: string, description: Value that must appear in the IdP groups claim }
         role: { $ref: '#/components/schemas/Role' }
 
-    GroupInput:
+    TeamInput:
       type: object
       required: [name]
       properties:
         name: { type: string, minLength: 1 }
-        timezone:
-          type: [string, 'null']
-          description: IANA zone for schedules; null or absent uses the server default.
         oidc_bindings:
           type: array
+          description: |
+            Sign-in groups (IdP `groups` claim values) and the team role each grants. Lets a server
+            admin create the first team and map their sign-in groups to it in one call. Each
+            `claim_value` must be non-empty and appear at most once.
           items: { $ref: '#/components/schemas/OidcBinding' }
 
-    Group:
+    Team:
       type: object
-      required: [id, name, oidc_bindings, timezone, created_at]
+      required: [id, name, oidc_bindings, created_at]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
-        timezone: { type: string, description: Effective IANA zone (group setting or server default) }
         oidc_bindings:
           type: array
           items: { $ref: '#/components/schemas/OidcBinding' }
@@ -972,9 +1185,9 @@ components:
 
     MediaInput:
       type: object
-      required: [group_id, kind, sha256, mime, title]
+      required: [team_id, kind, sha256, mime, title]
       properties:
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/MediaKind' }
         sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
         mime: { type: string, examples: [video/mp4, video/quicktime, image/jpeg, image/png, image/heic, audio/mp4] }
@@ -1109,9 +1322,9 @@ components:
 
     PlaylistInput:
       type: object
-      required: [group_id, name]
+      required: [team_id, name]
       properties:
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         name: { type: string, minLength: 1 }
         loop: { type: boolean, default: true, description: Restart at item 1 after the last item }
         defaults: { $ref: '#/components/schemas/PlaylistDefaults' }
@@ -1139,10 +1352,10 @@ components:
 
     PlaylistSummary:
       type: object
-      required: [id, group_id, name, version, item_count, updated_at]
+      required: [id, team_id, name, version, item_count, updated_at]
       properties:
         id: { type: string, format: uuid }
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         name: { type: string }
         version: { type: integer, format: int64 }
         item_count: { type: integer }
@@ -1151,10 +1364,10 @@ components:
 
     Playlist:
       type: object
-      required: [id, group_id, name, version, loop, defaults, items, beds, updated_at]
+      required: [id, team_id, name, version, loop, defaults, items, beds, updated_at]
       properties:
         id: { type: string, format: uuid }
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         name: { type: string }
         version: { type: integer, format: int64 }
         loop: { type: boolean }
@@ -1199,10 +1412,10 @@ components:
 
     Screen:
       type: object
-      required: [id, group_id, name, online, status, created_at]
+      required: [id, team_id, name, online, status, created_at]
       properties:
         id: { type: string, format: uuid }
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         name: { type: string }
         playlist_id: { type: string, format: uuid, description: Default playlist (plays when nothing is scheduled) }
         override: { $ref: '#/components/schemas/ScreenOverride' }
@@ -1236,9 +1449,9 @@ components:
 
     FloorPlanInput:
       type: object
-      required: [group_id, name]
+      required: [team_id, name]
       properties:
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         name: { type: string }
         image_sha256:
           type: [string, 'null']
@@ -1290,21 +1503,21 @@ components:
 
     ScheduleEntryInput:
       type: object
-      required: [group_id, playlist_id, kind]
+      required: [team_id, playlist_id, kind]
       description: |
         `weekly`: `days` + `start_time`/`end_time`; an end at or before the start runs past midnight
         (equal = 24 h). Optional `starts_on`/`ends_on` (inclusive) bound the recurrence, and
         `skip_dates` lists occurrence start dates that don't run (one-off edits pair a skip with a `once` entry).
         `once`: `starts_at`/`ends_at`, end after start.
         Precedence: override > once > weekly > default playlist. Within a tier, entries naming
-        screens beat group-wide ones, then the newest entry wins.
+        screens beat team-wide ones, then the newest entry wins.
       properties:
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         playlist_id: { type: [string, 'null'], format: uuid, description: null = show nothing }
         title: { type: string }
         screen_ids:
           type: array
-          description: Empty or absent = every screen in the group
+          description: Empty or absent = every screen in the team
           items: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/ScheduleEntryKind' }
         enabled: { type: boolean, default: true }
@@ -1403,11 +1616,11 @@ components:
 
     PairingClaim:
       type: object
-      required: [code, name, group_id]
+      required: [code, name, team_id]
       properties:
         code: { type: string }
         name: { type: string }
-        group_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
         playlist_id: { type: string, format: uuid }
 
     PairingStatus:
@@ -1432,10 +1645,12 @@ components:
 
     Manifest:
       type: object
-      required: [screen_id, screen_name, assets, media]
+      required: [screen_id, screen_name, organization_id, organization_name, assets, media]
       properties:
         screen_id: { type: string, format: uuid }
         screen_name: { type: string }
+        organization_id: { type: string, description: 'The org this screen is paired to (self-hosted: server_id)' }
+        organization_name: { type: string, description: 'Shown on the TV, e.g. "Paired to Grace Church"' }
         playlist:
           $ref: '#/components/schemas/Playlist'
           description: What plays now; absent when nothing does
@@ -1468,7 +1683,7 @@ components:
         type: { $ref: '#/components/schemas/WsServerMessageType' }
         server_id: { type: string, format: uuid, description: hello }
         version: { type: integer, format: int64, description: manifest_changed (informational; devices refetch with If-None-Match) }
-        group_id: { type: string, format: uuid, description: schedule_changed / floor_plans_changed }
+        team_id: { type: string, format: uuid, description: schedule_changed / floor_plans_changed }
         command: { $ref: '#/components/schemas/ScreenCommand' }
         screen_id: { type: string, format: uuid, description: screen_status / online / offline / updated }
         status: { $ref: '#/components/schemas/ScreenStatus' }
