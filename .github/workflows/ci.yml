@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md']
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - uses: DeterminateSystems/magic-nix-cache-action@8a218f9e264e9c3803c9a1ee1c30d8e4ab55be63 # v2
+
+      - name: Evaluate flake (all systems)
+        run: nix flake check --no-build --all-systems
+
+      - name: cargo test
+        working-directory: server
+        run: nix develop -c cargo test --locked
+
+  nix:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            system: x86_64-linux
+            runner: ubuntu-24.04
+          - arch: arm64
+            system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+
+      - uses: DeterminateSystems/magic-nix-cache-action@8a218f9e264e9c3803c9a1ee1c30d8e4ab55be63 # v2
+
+      - name: nix build .#server
+        run: nix build .#packages.${{ matrix.system }}.server -L --no-link
+
+      - name: NixOS VM tests (module, docker image)
+        run: nix build .#checks.${{ matrix.system }}.vm .#checks.${{ matrix.system }}.docker -L --no-link
+
+      - name: nix build .#docker
+        run: nix build .#packages.${{ matrix.system }}.docker -L --out-link image.tar.gz
+
+      - name: Load image
+        run: |
+          slug=$(nix eval --raw --impure --expr '(builtins.fromTOML (builtins.readFile ./branding.toml)).product.slug')
+          port=$(nix eval --raw --impure --expr 'toString (builtins.fromTOML (builtins.readFile ./branding.toml)).network.default_port')
+          loaded=$(docker load -i image.tar.gz | sed -n 's/^Loaded image: //p')
+          {
+            echo "SLUG=$slug"
+            echo "PORT=$port"
+            echo "LOADED=$loaded"
+            echo "IMAGE=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/$slug"
+          } >> "$GITHUB_ENV"
+
+      - name: API smoke test against the image
+        run: |
+          prefix=$(echo "$SLUG" | tr '[:lower:]' '[:upper:]')
+          docker run -d --name smoke -p "$PORT:$PORT" -e "${prefix}_BONJOUR=false" "$LOADED"
+          trap 'docker logs smoke; docker rm -f smoke >/dev/null' EXIT
+          for _ in $(seq 1 30); do curl -sf "http://localhost:$PORT/v1/info" >/dev/null && break; sleep 1; done
+          docker cp smoke:/data/bootstrap-token token
+          TOKEN=$(cat token) BASE="http://localhost:$PORT" ./scripts/smoke.sh
+          rm token
+
+      - name: Push arch image
+        if: github.event_name != 'pull_request'
+        run: |
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          docker tag "$LOADED" "$IMAGE:sha-${GITHUB_SHA::7}-${{ matrix.arch }}"
+          docker push "$IMAGE:sha-${GITHUB_SHA::7}-${{ matrix.arch }}"
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: nix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Multi-arch manifest
+        run: |
+          slug=$(sed -n 's/^slug *= *"\([^"]*\)".*/\1/p' branding.toml)
+          image="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/$slug"
+          sha="sha-${GITHUB_SHA::7}"
+          tags=(-t "$image:$sha")
+          [ "$GITHUB_REF" = refs/heads/main ] && tags+=(-t "$image:latest")
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tags+=(-t "$image:${GITHUB_REF#refs/tags/v}"); fi
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          docker buildx imagetools create "${tags[@]}" "$image:$sha-amd64" "$image:$sha-arm64"
