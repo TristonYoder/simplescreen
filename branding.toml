@@ -4,6 +4,7 @@
 name = "Simple Screen"          # human-readable display name
 slug = "simplescreen"           # lowercase, no spaces: binaries, nix attr, docker image, Bonjour
 short = "Screen"                # Swift module/type prefix (ScreenKit, ScreenPlayback, ...)
+repository = "https://github.com/TristonYoder/simplescreen"
 
 [apple]
 bundle_id_prefix = "studio.sevenand.simplescreen"

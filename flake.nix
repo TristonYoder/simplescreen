@@ -9,7 +9,7 @@
       slug = branding.product.slug;
       port = branding.network.default_port;
       version = (builtins.fromTOML (builtins.readFile ./server/Cargo.toml)).package.version;
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
       mkServer = pkgs:
         pkgs.rustPlatform.buildRustPackage {
@@ -28,6 +28,41 @@
           '';
           meta.mainProgram = "${slug}-server";
         };
+      mkDocker = pkgs: server:
+        let
+          envPrefix = pkgs.lib.toUpper slug;
+          nss = pkgs.dockerTools.fakeNss.override {
+            extraPasswdLines = [ "${slug}:x:1000:1000::/data:" ];
+            extraGroupLines = [ "${slug}:x:1000:" ];
+          };
+        in
+        pkgs.dockerTools.buildLayeredImage {
+          name = slug;
+          tag = version;
+          contents = [ server pkgs.cacert nss ];
+          fakeRootCommands = ''
+            mkdir -p data tmp
+            chown 1000:1000 data
+            chmod 1777 tmp
+          '';
+          enableFakechroot = true;
+          config = {
+            Entrypoint = [ "${server}/bin/${slug}-server" ];
+            User = "1000:1000";
+            WorkingDir = "/data";
+            ExposedPorts."${toString port}/tcp" = { };
+            Env = [
+              "${envPrefix}_DATA_DIR=/data"
+              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            ];
+            Volumes."/data" = { };
+            Labels = {
+              "org.opencontainers.image.source" = branding.product.repository;
+              "org.opencontainers.image.version" = version;
+              "org.opencontainers.image.licenses" = "AGPL-3.0-only";
+            };
+          };
+        };
     in
     {
       packages = forAllSystems (system: pkgs:
@@ -38,20 +73,7 @@
           "${slug}-server" = server;
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          docker = pkgs.dockerTools.buildLayeredImage {
-            name = slug;
-            tag = version;
-            contents = [ server pkgs.cacert ];
-            config = {
-              Cmd = [ "${server}/bin/${slug}-server" ];
-              ExposedPorts."${toString port}/tcp" = { };
-              Env = [
-                "${pkgs.lib.toUpper slug}_DATA_DIR=/data"
-                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              ];
-              Volumes."/data" = { };
-            };
-          };
+          docker = mkDocker pkgs server;
         });
 
       nixosModules.default = import ./nix/module.nix { inherit slug port self; };
@@ -80,6 +102,23 @@
               machine.wait_for_unit("${slug}.service")
               machine.wait_for_open_port(${toString port})
               machine.succeed("curl -sf http://localhost:${toString port}/v1/info | grep ${slug}")
+            '';
+          };
+          docker = pkgs.testers.runNixOSTest {
+            name = "${slug}-docker";
+            nodes.machine = {
+              virtualisation.docker.enable = true;
+              virtualisation.diskSize = 4096;
+            };
+            testScript = ''
+              machine.wait_for_unit("docker.service")
+              machine.succeed("docker load < ${self.packages.${system}.docker}")
+              machine.succeed("docker run -d --name s -p ${toString port}:${toString port} -e ${pkgs.lib.toUpper slug}_BONJOUR=false -v data:/data ${slug}:${version}")
+              machine.wait_until_succeeds("curl -sf http://localhost:${toString port}/v1/info | grep ${slug}", timeout=60)
+              machine.succeed("docker cp s:/data/bootstrap-token /tmp/token")
+              machine.succeed("test -s /tmp/token")
+              machine.succeed("docker restart s")
+              machine.wait_until_succeeds("curl -sf http://localhost:${toString port}/v1/info", timeout=60)
             '';
           };
         });
