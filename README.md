@@ -83,3 +83,7 @@ To build it yourself on a Linux builder: `nix build .#docker && docker load < re
 - **Schedule doesn't switch while the server is down:** players switch offline only within the 48 h timeline they last fetched, and only to playlists they've finished caching. Let the screen reconnect once after editing the schedule.
 - **Screen shows offline:** the device WebSocket (`/v1/ws`) must pass through any reverse proxy with upgrade headers enabled.
 - **Verify a running server:** `DATA_DIR=./data scripts/smoke.sh` (needs `curl` and `jq`).
+
+## License and contributing
+
+AGPL-3.0, see [LICENSE](LICENSE). Contributions need a `git commit -s` sign-off under the terms in [CONTRIBUTING.md](CONTRIBUTING.md).
