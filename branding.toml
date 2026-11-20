@@ -15,3 +15,4 @@ editor_name = "Simple Screen Studio"
 [network]
 bonjour_type = "_simplescreen._tcp"
 default_port = 8420
+default_server = "simplescreen.7co.dev"  # hosted server offered on first launch (HTTPS, host only); empty = no default, custom server only
