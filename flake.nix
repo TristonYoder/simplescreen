@@ -113,11 +113,11 @@
             testScript = ''
               machine.wait_for_unit("docker.service")
               machine.succeed("docker load < ${self.packages.${system}.docker}")
-              machine.succeed("docker run -d --name s -p ${toString port}:${toString port} -e ${pkgs.lib.toUpper slug}_BONJOUR=false -v data:/data ${slug}:${version}")
+              machine.succeed("docker run -d --name ${slug} -p ${toString port}:${toString port} -e ${pkgs.lib.toUpper slug}_BONJOUR=false -v data:/data ${slug}:${version}")
               machine.wait_until_succeeds("curl -sf http://localhost:${toString port}/v1/info | grep ${slug}", timeout=60)
-              machine.succeed("docker cp s:/data/bootstrap-token /tmp/token")
+              machine.succeed("docker cp ${slug}:/data/bootstrap-token /tmp/token")
               machine.succeed("test -s /tmp/token")
-              machine.succeed("docker restart s")
+              machine.succeed("docker restart ${slug}")
               machine.wait_until_succeeds("curl -sf http://localhost:${toString port}/v1/info", timeout=60)
             '';
           };
