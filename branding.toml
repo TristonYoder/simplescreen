@@ -1,4 +1,4 @@
-# Product naming. After editing, run `scripts/apply-branding.sh`.
+# Product naming. The server and flake read it at build time; the Apple apps read it through a submodule of this repo.
 
 [product]
 name = "Simple Screen"          # human-readable display name

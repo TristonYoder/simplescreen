@@ -2,6 +2,8 @@
 
 Digital signage server for Apple TV players. This README covers deployment and troubleshooting only.
 
+Status: alpha. The server speaks plain HTTP; put it behind a TLS reverse proxy for anything beyond a trusted LAN. The Apple TV player and Studio editor apps live in a separate repository.
+
 ## Run
 
 ```sh
@@ -33,7 +35,7 @@ Environment variables (or a TOML file via `SIMPLESCREEN_CONFIG` using the same k
 
 ```nix
 {
-  inputs.simplescreen.url = "github:OWNER/simpleScreen";
+  inputs.simplescreen.url = "github:TristonYoder/simplescreen";
   # modules = [ simplescreen.nixosModules.default ];
   services.simplescreen = {
     enable = true;
