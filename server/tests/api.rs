@@ -558,3 +558,47 @@ async fn schedule_resolves_events_weekly_and_overrides() {
     let r = app.call("GET", &format!("/v1/schedule?group_id={g}"), None).await;
     assert_eq!(r.json()["entries"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn floor_plans_and_placement() {
+    let app = App::new().await;
+    let g = app.group().await;
+    let (screen, _) = pair(&app, &g, "Hall", None).await;
+
+    let missing = "0".repeat(64);
+    let r = app.call("POST", "/v1/floor-plans", Some(json!({ "group_id": g, "name": "Ground", "image_sha256": missing }))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    let sha = app.upload(b"map").await;
+    let r = app
+        .call("POST", "/v1/floor-plans", Some(json!({ "group_id": g, "name": " Ground ", "image_sha256": sha, "image_width": 1600, "image_height": 900 })))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let plan = r.json();
+    assert_eq!(plan["name"], "Ground");
+    assert_eq!(plan["position"], 0);
+    let plan_id = plan["id"].as_str().unwrap().to_string();
+    let r = app.call("POST", "/v1/floor-plans", Some(json!({ "group_id": g, "name": "Upstairs" }))).await;
+    assert_eq!(r.json()["position"], 1);
+
+    let r = app.call("PATCH", &format!("/v1/screens/{screen}"), Some(json!({ "placement": { "floor_plan_id": plan_id, "x": 1.5, "y": 0.2 } }))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = app.call("PATCH", &format!("/v1/screens/{screen}"), Some(json!({ "placement": { "floor_plan_id": plan_id, "x": 0.25, "y": 0.75 } }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["placement"]["x"], 0.25);
+
+    let r = app.call("PUT", &format!("/v1/floor-plans/{plan_id}"), Some(json!({ "group_id": g, "name": "Lobby floor", "image_sha256": null }))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.json().get("image_sha256").is_none());
+    assert_eq!(r.json()["position"], 0);
+
+    let r = app.call("GET", &format!("/v1/floor-plans?group_id={g}"), None).await;
+    assert_eq!(r.json().as_array().unwrap().len(), 2);
+
+    let r = app.call("DELETE", &format!("/v1/floor-plans/{plan_id}"), None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call("GET", &format!("/v1/screens/{screen}"), None).await;
+    assert!(r.json().get("placement").is_none());
+
+    let r = app.call("PATCH", &format!("/v1/screens/{screen}"), Some(json!({ "placement": { "floor_plan_id": plan_id, "x": 0.1, "y": 0.1 } }))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+}

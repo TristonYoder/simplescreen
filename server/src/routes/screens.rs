@@ -10,7 +10,7 @@ use crate::{
     auth::{Principal, Role},
     error::{ApiError, ApiJson, ApiResult},
     models::{
-        Screen, ScreenCommand, ScreenOverride, ScreenOverrideInput, ScreenPatch, ScreenRow, ScreenState, ScreenStatus,
+        Screen, ScreenCommand, ScreenOverride, ScreenPlacement, ScreenOverrideInput, ScreenPatch, ScreenRow, ScreenState, ScreenStatus,
         SCREEN_COLUMNS,
     },
     schedule,
@@ -30,12 +30,17 @@ pub fn to_screen(s: &AppState, row: ScreenRow) -> Screen {
         until: row.override_until.clone(),
         set_at: row.override_set_at.clone().unwrap_or_default(),
     });
+    let placement = match (row.placement_plan_id, row.placement_x, row.placement_y) {
+        (Some(floor_plan_id), Some(x), Some(y)) => Some(ScreenPlacement { floor_plan_id, x, y }),
+        _ => None,
+    };
     Screen {
         id: row.id,
         group_id: row.group_id,
         name: row.name,
         playlist_id: row.playlist_id,
         override_,
+        placement,
         online,
         status,
         last_seen_at: row.last_seen_at,
@@ -90,12 +95,39 @@ pub async fn patch(
         }
         sqlx::query("UPDATE screens SET name = ? WHERE id = ?").bind(name.trim()).bind(&id).execute(&s.db).await?;
     }
+    if let Some(placement) = &patch.placement {
+        set_placement(&s, &row, placement.as_ref()).await?;
+    }
     if let Some(playlist) = &patch.playlist_id {
         assign_playlist(&s, &row, playlist.as_deref()).await?;
-    } else if patch.name.is_some() {
+    } else if patch.name.is_some() || patch.placement.is_some() {
         broadcast_updated(&s, &row);
     }
     Ok(Json(to_screen(&s, fetch_row(&s, &id).await?)))
+}
+
+async fn set_placement(s: &AppState, row: &ScreenRow, placement: Option<&ScreenPlacement>) -> ApiResult<()> {
+    if let Some(p) = placement {
+        if !(0.0..=1.0).contains(&p.x) || !(0.0..=1.0).contains(&p.y) {
+            return Err(ApiError::bad_request("placement x and y must be between 0 and 1"));
+        }
+        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM floor_plans WHERE id = ? AND group_id = ?")
+            .bind(&p.floor_plan_id)
+            .bind(&row.group_id)
+            .fetch_optional(&s.db)
+            .await?;
+        if found.is_none() {
+            return Err(ApiError::unprocessable("invalid_floor_plan", "floor plan does not exist in the screen's group"));
+        }
+    }
+    sqlx::query("UPDATE screens SET placement_plan_id = ?, placement_x = ?, placement_y = ? WHERE id = ?")
+        .bind(placement.map(|p| &p.floor_plan_id))
+        .bind(placement.map(|p| p.x))
+        .bind(placement.map(|p| p.y))
+        .bind(&row.id)
+        .execute(&s.db)
+        .await?;
+    Ok(())
 }
 
 async fn check_playlist(s: &AppState, row: &ScreenRow, playlist: Option<&str>) -> ApiResult<i64> {

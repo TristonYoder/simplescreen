@@ -1,5 +1,6 @@
 mod blobs;
 mod device;
+mod floor_plans;
 mod groups;
 mod media;
 mod pairing;
@@ -44,6 +45,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/schedule", get(schedule::list).post(schedule::create))
         .route("/v1/schedule/timeline", get(schedule::timeline))
         .route("/v1/schedule/{id}", put(schedule::update).delete(schedule::delete))
+        .route("/v1/floor-plans", get(floor_plans::list).post(floor_plans::create))
+        .route("/v1/floor-plans/{id}", put(floor_plans::update).delete(floor_plans::delete))
         .route("/v1/pairing", post(pairing::start))
         .route("/v1/pairing/claim", post(pairing::claim))
         .route("/v1/pairing/{id}", get(pairing::poll))

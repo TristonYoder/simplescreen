@@ -132,6 +132,7 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
         return Err(ApiError::conflict("group_not_empty", "group still owns resources"));
     }
     sqlx::query("DELETE FROM schedule_entries WHERE group_id = ?").bind(&id).execute(&s.db).await?;
+    sqlx::query("DELETE FROM floor_plans WHERE group_id = ?").bind(&id).execute(&s.db).await?;
     let res = sqlx::query("DELETE FROM groups WHERE id = ?").bind(&id).execute(&s.db).await?;
     if res.rows_affected() == 0 {
         return Err(ApiError::not_found());

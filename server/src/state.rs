@@ -161,6 +161,7 @@ fn load_or_create_bootstrap(dir: &std::path::Path) -> anyhow::Result<String> {
 
 const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql"), include_str!("../migrations/0002_schedule.sql"),
     include_str!("../migrations/0003_skip_dates.sql"),
+    include_str!("../migrations/0004_floor_plans.sql"),
 ];
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {

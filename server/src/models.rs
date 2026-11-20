@@ -378,6 +378,8 @@ pub struct Screen {
     pub playlist_id: Option<String>,
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_: Option<ScreenOverride>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<ScreenPlacement>,
     pub online: bool,
     pub status: ScreenStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,10 +399,20 @@ pub struct ScreenRow {
     pub override_playlist_id: Option<String>,
     pub override_until: Option<String>,
     pub override_set_at: Option<String>,
+    pub placement_plan_id: Option<String>,
+    pub placement_x: Option<f64>,
+    pub placement_y: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ScreenPlacement {
+    pub floor_plan_id: String,
+    pub x: f64,
+    pub y: f64,
 }
 
 pub const SCREEN_COLUMNS: &str = "id, group_id, name, playlist_id, last_seen_at, created_at, \
-     override_set, override_playlist_id, override_until, override_set_at";
+     override_set, override_playlist_id, override_until, override_set_at, placement_plan_id, placement_x, placement_y";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ScreenOverride {
@@ -424,6 +436,8 @@ pub struct ScreenPatch {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     pub playlist_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub placement: Option<Option<ScreenPlacement>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
