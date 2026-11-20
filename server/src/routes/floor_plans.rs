@@ -17,7 +17,7 @@ use crate::{
 #[derive(Serialize, FromRow)]
 pub struct FloorPlan {
     id: String,
-    group_id: String,
+    team_id: String,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_sha256: Option<String>,
@@ -29,11 +29,11 @@ pub struct FloorPlan {
     created_at: String,
 }
 
-const COLUMNS: &str = "id, group_id, name, image_sha256, image_width, image_height, position, created_at";
+const COLUMNS: &str = "id, team_id, name, image_sha256, image_width, image_height, position, created_at";
 
 #[derive(Deserialize)]
 pub struct FloorPlanInput {
-    group_id: String,
+    team_id: String,
     name: String,
     #[serde(default)]
     image_sha256: Option<String>,
@@ -46,8 +46,8 @@ pub struct FloorPlanInput {
 }
 
 #[derive(Deserialize)]
-pub struct GroupQuery {
-    group_id: String,
+pub struct TeamQuery {
+    team_id: String,
 }
 
 fn validate(input: &mut FloorPlanInput) -> ApiResult<()> {
@@ -81,14 +81,14 @@ async fn fetch(s: &AppState, id: &str) -> ApiResult<FloorPlan> {
         .ok_or_else(ApiError::not_found)
 }
 
-fn broadcast(s: &AppState, group_id: &str) {
-    s.hub.broadcast_group(group_id, &json!({ "type": "floor_plans_changed", "group_id": group_id }));
+fn broadcast(s: &AppState, team_id: &str) {
+    s.hub.broadcast_team(team_id, &json!({ "type": "floor_plans_changed", "team_id": team_id }));
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<GroupQuery>) -> ApiResult<Json<Vec<FloorPlan>>> {
-    s.require_group(&p, &q.group_id, Role::Viewer).await?;
-    let rows = sqlx::query_as(&format!("SELECT {COLUMNS} FROM floor_plans WHERE group_id = ? ORDER BY position, created_at"))
-        .bind(&q.group_id)
+pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<TeamQuery>) -> ApiResult<Json<Vec<FloorPlan>>> {
+    s.require_team(&p, &q.team_id, Role::Viewer).await?;
+    let rows = sqlx::query_as(&format!("SELECT {COLUMNS} FROM floor_plans WHERE team_id = ? ORDER BY position, created_at"))
+        .bind(&q.team_id)
         .fetch_all(&s.db)
         .await?;
     Ok(Json(rows))
@@ -99,14 +99,14 @@ pub async fn create(
     p: Principal,
     ApiJson(mut input): ApiJson<FloorPlanInput>,
 ) -> ApiResult<(StatusCode, Json<FloorPlan>)> {
-    s.require_group(&p, &input.group_id, Role::Editor).await?;
+    s.require_team(&p, &input.team_id, Role::Editor).await?;
     validate(&mut input)?;
     check_blob(&s, &input).await?;
     let position = match input.position {
         Some(n) => n,
         None => {
-            let (max,): (Option<i64>,) = sqlx::query_as("SELECT MAX(position) FROM floor_plans WHERE group_id = ?")
-                .bind(&input.group_id)
+            let (max,): (Option<i64>,) = sqlx::query_as("SELECT MAX(position) FROM floor_plans WHERE team_id = ?")
+                .bind(&input.team_id)
                 .fetch_one(&s.db)
                 .await?;
             max.map_or(0, |m| m + 1)
@@ -114,11 +114,11 @@ pub async fn create(
     };
     let id = new_id();
     sqlx::query(
-        "INSERT INTO floor_plans (id, group_id, name, image_sha256, image_width, image_height, position, created_at)
+        "INSERT INTO floor_plans (id, team_id, name, image_sha256, image_width, image_height, position, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(&input.group_id)
+    .bind(&input.team_id)
     .bind(&input.name)
     .bind(&input.image_sha256)
     .bind(input.image_width)
@@ -127,7 +127,7 @@ pub async fn create(
     .bind(now())
     .execute(&s.db)
     .await?;
-    broadcast(&s, &input.group_id);
+    broadcast(&s, &input.team_id);
     Ok((StatusCode::CREATED, Json(fetch(&s, &id).await?)))
 }
 
@@ -138,9 +138,9 @@ pub async fn update(
     ApiJson(mut input): ApiJson<FloorPlanInput>,
 ) -> ApiResult<Json<FloorPlan>> {
     let existing = fetch(&s, &id).await?;
-    p.require(&existing.group_id, Role::Editor)?;
-    if input.group_id != existing.group_id {
-        return Err(ApiError::unprocessable("group_mismatch", "a floor plan can't move between groups"));
+    p.require(&existing.team_id, Role::Editor)?;
+    if input.team_id != existing.team_id {
+        return Err(ApiError::unprocessable("team_mismatch", "a floor plan can't move between teams"));
     }
     validate(&mut input)?;
     check_blob(&s, &input).await?;
@@ -153,13 +153,13 @@ pub async fn update(
         .bind(&id)
         .execute(&s.db)
         .await?;
-    broadcast(&s, &existing.group_id);
+    broadcast(&s, &existing.team_id);
     Ok(Json(fetch(&s, &id).await?))
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let existing = fetch(&s, &id).await?;
-    p.require(&existing.group_id, Role::Editor)?;
+    p.require(&existing.team_id, Role::Editor)?;
     let mut tx = s.db.begin().await?;
     sqlx::query("UPDATE screens SET placement_plan_id = NULL, placement_x = NULL, placement_y = NULL WHERE placement_plan_id = ?")
         .bind(&id)
@@ -167,6 +167,6 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
         .await?;
     sqlx::query("DELETE FROM floor_plans WHERE id = ?").bind(&id).execute(&mut *tx).await?;
     tx.commit().await?;
-    broadcast(&s, &existing.group_id);
+    broadcast(&s, &existing.team_id);
     Ok(StatusCode::NO_CONTENT)
 }

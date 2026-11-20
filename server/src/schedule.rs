@@ -28,7 +28,7 @@ pub enum EntryKind {
 #[derive(Serialize, Clone, Debug)]
 pub struct Entry {
     pub id: String,
-    pub group_id: String,
+    pub team_id: String,
     pub playlist_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -64,7 +64,7 @@ impl Entry {
 #[derive(FromRow)]
 pub struct EntryRow {
     id: String,
-    group_id: String,
+    team_id: String,
     playlist_id: Option<String>,
     title: Option<String>,
     screen_ids: String,
@@ -82,14 +82,14 @@ pub struct EntryRow {
     updated_at: String,
 }
 
-pub const ENTRY_COLUMNS: &str = "id, group_id, playlist_id, title, screen_ids, kind, enabled, days, start_time, end_time, \
+pub const ENTRY_COLUMNS: &str = "id, team_id, playlist_id, title, screen_ids, kind, enabled, days, start_time, end_time, \
      starts_on, ends_on, skip_dates, starts_at, ends_at, created_at, updated_at";
 
 impl EntryRow {
     pub fn into_entry(self) -> Entry {
         Entry {
             id: self.id,
-            group_id: self.group_id,
+            team_id: self.team_id,
             playlist_id: self.playlist_id,
             title: self.title,
             screen_ids: serde_json::from_str(&self.screen_ids).unwrap_or_default(),
@@ -300,20 +300,10 @@ pub fn parse_tz(name: &str) -> Option<Tz> {
     name.parse().ok()
 }
 
-pub fn server_tz(s: &AppState) -> Tz {
-    parse_tz(&s.cfg.timezone).unwrap_or(Tz::UTC)
-}
-
-pub async fn group_tz(s: &AppState, group_id: &str) -> ApiResult<Tz> {
-    let row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT timezone FROM groups WHERE id = ?").bind(group_id).fetch_optional(&s.db).await?;
-    Ok(row.and_then(|r| r.0).and_then(|t| parse_tz(&t)).unwrap_or_else(|| server_tz(s)))
-}
-
-pub async fn group_entries(s: &AppState, group_id: &str) -> ApiResult<Vec<Entry>> {
+pub async fn team_entries(s: &AppState, team_id: &str) -> ApiResult<Vec<Entry>> {
     let rows: Vec<EntryRow> =
-        sqlx::query_as(&format!("SELECT {ENTRY_COLUMNS} FROM schedule_entries WHERE group_id = ? ORDER BY created_at"))
-            .bind(group_id)
+        sqlx::query_as(&format!("SELECT {ENTRY_COLUMNS} FROM schedule_entries WHERE team_id = ? ORDER BY created_at"))
+            .bind(team_id)
             .fetch_all(&s.db)
             .await?;
     Ok(rows.into_iter().map(EntryRow::into_entry).collect())
@@ -343,21 +333,21 @@ pub fn screen_segments(
 }
 
 pub async fn screen_timeline(s: &AppState, row: &ScreenRow, from: DateTime<Utc>, to: DateTime<Utc>) -> ApiResult<Vec<Segment>> {
-    let tz = group_tz(s, &row.group_id).await?;
-    let entries = group_entries(s, &row.group_id).await?;
+    let tz = s.org_tz();
+    let entries = team_entries(s, &row.team_id).await?;
     Ok(screen_segments(row, &entries, &tz, true, from, to))
 }
 
 /// Schedule without the override for the next 14 days.
 pub async fn base_timeline(s: &AppState, row: &ScreenRow, now: DateTime<Utc>) -> ApiResult<Vec<Segment>> {
-    let tz = group_tz(s, &row.group_id).await?;
-    let entries = group_entries(s, &row.group_id).await?;
+    let tz = s.org_tz();
+    let entries = team_entries(s, &row.team_id).await?;
     Ok(screen_segments(row, &entries, &tz, false, now, now + MAX_RANGE))
 }
 
-pub async fn notify_group(s: &AppState, group_id: &str) {
-    let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE group_id = ?")
-        .bind(group_id)
+pub async fn notify_team(s: &AppState, team_id: &str) {
+    let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE team_id = ?")
+        .bind(team_id)
         .fetch_all(&s.db)
         .await
         .unwrap_or_default();
@@ -367,8 +357,21 @@ pub async fn notify_group(s: &AppState, group_id: &str) {
     s.schedule_wake.notify_one();
 }
 
-pub fn broadcast_changed(s: &AppState, group_id: &str) {
-    s.hub.broadcast_group(group_id, &json!({ "type": "schedule_changed", "group_id": group_id }));
+/// Re-resolves every schedule (after an org timezone change): devices refetch, user sockets reload.
+pub async fn notify_all(s: &AppState) {
+    let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens").fetch_all(&s.db).await.unwrap_or_default();
+    for (id,) in ids {
+        s.notify_manifest(&id, 0);
+    }
+    let teams: Vec<(String,)> = sqlx::query_as("SELECT id FROM teams").fetch_all(&s.db).await.unwrap_or_default();
+    for (id,) in teams {
+        broadcast_changed(s, &id);
+    }
+    s.schedule_wake.notify_one();
+}
+
+pub fn broadcast_changed(s: &AppState, team_id: &str) {
+    s.hub.broadcast_team(team_id, &json!({ "type": "schedule_changed", "team_id": team_id }));
 }
 
 pub fn invalid(message: &str) -> ApiError {
@@ -404,34 +407,34 @@ async fn tick(
 ) -> ApiResult<()> {
     let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let expired: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, group_id FROM screens WHERE override_set = 1 AND override_until IS NOT NULL AND override_until <= ?",
+        "SELECT id, team_id FROM screens WHERE override_set = 1 AND override_until IS NOT NULL AND override_until <= ?",
     )
     .bind(&stamp)
     .fetch_all(&s.db)
     .await?;
-    for (id, group_id) in &expired {
+    for (id, team_id) in &expired {
         sqlx::query("UPDATE screens SET override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL WHERE id = ?")
             .bind(id)
             .execute(&s.db)
             .await?;
-        s.hub.broadcast_group(group_id, &json!({ "type": "screen_updated", "screen_id": id }));
+        s.hub.broadcast_team(team_id, &json!({ "type": "screen_updated", "screen_id": id }));
     }
 
     let rows: Vec<ScreenRow> = sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens")).fetch_all(&s.db).await?;
-    let mut groups: HashMap<String, (Tz, Vec<Entry>)> = HashMap::new();
+    let mut teams: HashMap<String, (Tz, Vec<Entry>)> = HashMap::new();
     for row in &rows {
-        if !groups.contains_key(&row.group_id) {
-            let tz = group_tz(s, &row.group_id).await?;
-            let entries = group_entries(s, &row.group_id).await?;
-            groups.insert(row.group_id.clone(), (tz, entries));
+        if !teams.contains_key(&row.team_id) {
+            let tz = s.org_tz();
+            let entries = team_entries(s, &row.team_id).await?;
+            teams.insert(row.team_id.clone(), (tz, entries));
         }
-        let (tz, entries) = &groups[&row.group_id];
+        let (tz, entries) = &teams[&row.team_id];
         let segs = screen_segments(row, entries, tz, true, now, now + DEVICE_HORIZON);
         let current = segs.first().and_then(|g| g.playlist_id.clone());
         if let Some(previous) = active.insert(row.id.clone(), current.clone()) {
             if previous != current {
                 s.notify_manifest(&row.id, 0);
-                s.hub.broadcast_group(&row.group_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
+                s.hub.broadcast_team(&row.team_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
             }
         }
         if let Some(change) = next_change(&segs) {
@@ -449,7 +452,7 @@ mod tests {
     fn entry(id: &str, kind: EntryKind, playlist: &str) -> Entry {
         Entry {
             id: id.into(),
-            group_id: "g".into(),
+            team_id: "g".into(),
             playlist_id: Some(playlist.into()),
             title: None,
             screen_ids: vec![],
@@ -534,14 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn screen_specific_beats_group_wide_then_newest() {
-        let group_wide = weekly("2", "group", &[1, 2, 3, 4, 5, 6, 7], "00:00", "00:00");
+    fn screen_specific_beats_team_wide_then_newest() {
+        let team_wide = weekly("2", "team", &[1, 2, 3, 4, 5, 6, 7], "00:00", "00:00");
         let mut specific = weekly("1", "specific", &[1, 2, 3, 4, 5, 6, 7], "09:00", "10:00");
         specific.screen_ids = vec!["s1".into()];
         let newer = weekly("3", "newer", &[1, 2, 3, 4, 5, 6, 7], "09:30", "11:00");
-        let segs = resolve(&[&group_wide, &specific, &newer], None, None, &Tz::UTC, utc("2026-11-18T08:00:00Z"), utc("2026-11-18T12:00:00Z"));
+        let segs = resolve(&[&team_wide, &specific, &newer], None, None, &Tz::UTC, utc("2026-11-18T08:00:00Z"), utc("2026-11-18T12:00:00Z"));
         let names: Vec<_> = segs.iter().map(|g| g.playlist_id.clone().unwrap()).collect();
-        assert_eq!(names, vec!["group", "specific", "newer", "group"]);
+        assert_eq!(names, vec!["team", "specific", "newer", "team"]);
     }
 
     #[test]

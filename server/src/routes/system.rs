@@ -9,14 +9,18 @@ use crate::{
 };
 
 pub async fn info(State(s): State<AppState>) -> Json<Value> {
-    Json(json!({
+    let mut v = json!({
         "name": BRAND_NAME,
         "slug": BRAND_SLUG,
         "version": env!("CARGO_PKG_VERSION"),
         "api_version": 1,
         "server_id": s.server_id,
         "oidc_enabled": s.oidc.is_some(),
-    }))
+    });
+    if let Some(u) = &s.cfg.public_url {
+        v["public_url"] = json!(u);
+    }
+    Json(v)
 }
 
 pub async fn auth_config(State(s): State<AppState>) -> Json<Value> {
@@ -39,9 +43,9 @@ pub async fn auth_config(State(s): State<AppState>) -> Json<Value> {
 pub async fn me(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Value>> {
     let memberships: Vec<Membership> = if p.server_admin {
         let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT id, name FROM groups ORDER BY name").fetch_all(&s.db).await?;
+            sqlx::query_as("SELECT id, name FROM teams ORDER BY name").fetch_all(&s.db).await?;
         rows.into_iter()
-            .map(|(group_id, group_name)| Membership { group_id, group_name, role: Role::Admin })
+            .map(|(team_id, team_name)| Membership { team_id, team_name, role: Role::Admin })
             .collect()
     } else {
         p.memberships.clone()
