@@ -45,6 +45,8 @@ pub struct Entry {
     pub starts_on: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ends_on: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skip_dates: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub starts_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,6 +75,7 @@ pub struct EntryRow {
     end_time: Option<String>,
     starts_on: Option<String>,
     ends_on: Option<String>,
+    skip_dates: String,
     starts_at: Option<String>,
     ends_at: Option<String>,
     created_at: String,
@@ -80,7 +83,7 @@ pub struct EntryRow {
 }
 
 pub const ENTRY_COLUMNS: &str = "id, group_id, playlist_id, title, screen_ids, kind, enabled, days, start_time, end_time, \
-     starts_on, ends_on, starts_at, ends_at, created_at, updated_at";
+     starts_on, ends_on, skip_dates, starts_at, ends_at, created_at, updated_at";
 
 impl EntryRow {
     pub fn into_entry(self) -> Entry {
@@ -97,6 +100,7 @@ impl EntryRow {
             end_time: self.end_time,
             starts_on: self.starts_on,
             ends_on: self.ends_on,
+            skip_dates: serde_json::from_str(&self.skip_dates).unwrap_or_default(),
             starts_at: self.starts_at,
             ends_at: self.ends_at,
             created_at: self.created_at,
@@ -176,11 +180,13 @@ pub fn occurrences(e: &Entry, tz: &Tz, from: DateTime<Utc>, to: DateTime<Utc>) -
             };
             let starts_on = e.starts_on.as_deref().and_then(parse_date);
             let ends_on = e.ends_on.as_deref().and_then(parse_date);
+            let skips: Vec<NaiveDate> = e.skip_dates.iter().filter_map(|d| parse_date(d)).collect();
             let mut day = from.with_timezone(tz).date_naive() - Duration::days(1);
             let last = to.with_timezone(tz).date_naive();
             let mut out = vec![];
             while day <= last {
-                let in_range = starts_on.is_none_or(|d| day >= d) && ends_on.is_none_or(|d| day <= d);
+                let in_range =
+                    starts_on.is_none_or(|d| day >= d) && ends_on.is_none_or(|d| day <= d) && !skips.contains(&day);
                 if in_range && e.days.contains(&(day.weekday().number_from_monday() as u8)) {
                     let end_day = if et <= st { day + Duration::days(1) } else { day };
                     let s = local_to_utc(tz, day.and_time(st));
@@ -454,6 +460,7 @@ mod tests {
             end_time: None,
             starts_on: None,
             ends_on: None,
+            skip_dates: vec![],
             starts_at: None,
             ends_at: None,
             created_at: format!("2026-01-01T00:00:00.000Z{id}"),
@@ -558,6 +565,15 @@ mod tests {
         let segs = resolve(&[&e], None, None, &tz, utc("2026-11-19T00:00:00Z"), utc("2026-11-23T00:00:00Z"));
         let on: Vec<_> = segs.iter().filter(|g| g.playlist_id.is_some()).map(|g| g.starts_at).collect();
         assert_eq!(on, vec![utc("2026-11-20T14:00:00Z"), utc("2026-11-21T14:00:00Z")]);
+    }
+
+    #[test]
+    fn skip_dates_drop_one_occurrence() {
+        let mut e = weekly("1", "breakfast", &[1, 2, 3, 4, 5, 6, 7], "07:00", "11:00");
+        e.skip_dates = vec!["2026-11-19".into()];
+        let segs = resolve(&[&e], None, None, &Tz::UTC, utc("2026-11-18T00:00:00Z"), utc("2026-11-21T00:00:00Z"));
+        let on: Vec<_> = segs.iter().filter(|g| g.playlist_id.is_some()).map(|g| g.starts_at).collect();
+        assert_eq!(on, vec![utc("2026-11-18T07:00:00Z"), utc("2026-11-20T07:00:00Z")]);
     }
 
     #[test]

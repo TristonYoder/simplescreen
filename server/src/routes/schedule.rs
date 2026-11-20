@@ -34,6 +34,8 @@ pub struct EntryInput {
     end_time: Option<String>,
     starts_on: Option<String>,
     ends_on: Option<String>,
+    #[serde(default)]
+    skip_dates: Vec<String>,
     starts_at: Option<String>,
     ends_at: Option<String>,
 }
@@ -110,6 +112,11 @@ async fn validate(s: &AppState, input: &mut EntryInput) -> ApiResult<()> {
                     Some(d) => schedule::parse_date(d).map(Some).ok_or_else(|| invalid("dates must be YYYY-MM-DD")),
                 }
             };
+            for d in &input.skip_dates {
+                on(&Some(d.clone()))?;
+            }
+            input.skip_dates.sort();
+            input.skip_dates.dedup();
             if let (Some(a), Some(b)) = (on(&input.starts_on)?, on(&input.ends_on)?) {
                 if b < a {
                     return Err(invalid("ends_on must not be before starts_on"));
@@ -133,6 +140,7 @@ async fn validate(s: &AppState, input: &mut EntryInput) -> ApiResult<()> {
             input.end_time = None;
             input.starts_on = None;
             input.ends_on = None;
+            input.skip_dates.clear();
         }
     }
     Ok(())
@@ -161,7 +169,7 @@ pub async fn create(
     let stamp = now();
     sqlx::query(
         "INSERT INTO schedule_entries (id, group_id, playlist_id, title, screen_ids, kind, enabled, days, start_time, end_time, \
-         starts_on, ends_on, starts_at, ends_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         starts_on, ends_on, skip_dates, starts_at, ends_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&input.group_id)
@@ -175,6 +183,7 @@ pub async fn create(
     .bind(&input.end_time)
     .bind(&input.starts_on)
     .bind(&input.ends_on)
+    .bind(serde_json::to_string(&input.skip_dates)?)
     .bind(&input.starts_at)
     .bind(&input.ends_at)
     .bind(&stamp)
@@ -199,7 +208,7 @@ pub async fn update(
     validate(&s, &mut input).await?;
     sqlx::query(
         "UPDATE schedule_entries SET playlist_id = ?, title = ?, screen_ids = ?, kind = ?, enabled = ?, days = ?, start_time = ?, \
-         end_time = ?, starts_on = ?, ends_on = ?, starts_at = ?, ends_at = ?, updated_at = ? WHERE id = ?",
+         end_time = ?, starts_on = ?, ends_on = ?, skip_dates = ?, starts_at = ?, ends_at = ?, updated_at = ? WHERE id = ?",
     )
     .bind(&input.playlist_id)
     .bind(&input.title)
@@ -211,6 +220,7 @@ pub async fn update(
     .bind(&input.end_time)
     .bind(&input.starts_on)
     .bind(&input.ends_on)
+    .bind(serde_json::to_string(&input.skip_dates)?)
     .bind(&input.starts_at)
     .bind(&input.ends_at)
     .bind(now())

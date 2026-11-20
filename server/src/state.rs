@@ -159,7 +159,9 @@ fn load_or_create_bootstrap(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql"), include_str!("../migrations/0002_schedule.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql"), include_str!("../migrations/0002_schedule.sql"),
+    include_str!("../migrations/0003_skip_dates.sql"),
+];
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     let (current,): (i64,) = sqlx::query_as("PRAGMA user_version").fetch_one(db).await?;
