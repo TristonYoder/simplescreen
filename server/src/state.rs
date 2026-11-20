@@ -60,7 +60,7 @@ impl AppState {
         self.devices.lock().retain(|_, d| d.screen_id != screen_id);
     }
 
-    /// Any screen in the group may have the playlist scheduled; devices refetch with If-None-Match.
+    /// Notifies every screen in the group; devices refetch with If-None-Match.
     pub async fn notify_screens_for_playlist(&self, group_id: &str, version: i64) {
         let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE group_id = ?")
             .bind(group_id)
