@@ -29,7 +29,12 @@ Environment variables (or a TOML file via `SIMPLESCREEN_CONFIG` using the same k
 | `SIMPLESCREEN_OIDC_ADMIN_GROUPS` | | comma list, grants server admin |
 | `SIMPLESCREEN_OIDC_TOKEN_TYPE` | access_token | or `id_token` |
 | `SIMPLESCREEN_BONJOUR` | true | mDNS advertisement |
-| `SIMPLESCREEN_TIMEZONE` | host zone, else UTC | IANA zone for group schedules; a group's own timezone overrides it |
+| `SIMPLESCREEN_ORG_NAME` | | organization name shown in the apps and on paired TVs; if unset, set it in Studio's first-run setup |
+| `SIMPLESCREEN_ORG_TIMEZONE` | host zone, else UTC | IANA zone for every schedule; if unset, Studio can set it |
+| `SIMPLESCREEN_LISTEN` | | `unix:/path/to.sock` listens on a unix socket instead of `BIND`:`PORT` (no Bonjour) |
+| `SIMPLESCREEN_PUBLIC_URL` | | externally reachable base URL when behind a reverse proxy; reported in `/v1/info` |
+
+The server is one organization. Its name and timezone come from the env vars above when set (then Studio shows them as locked), otherwise from first-run setup in Studio (`PATCH /v1/settings`, server admin). People belong to **Teams**; a team's `oidc_bindings` map sign-in groups (the IdP groups claim) to viewer, editor or admin. Server admins (`OIDC_ADMIN_GROUPS` or the bootstrap token) manage teams and settings.
 
 ## NixOS
 
@@ -40,7 +45,8 @@ Environment variables (or a TOML file via `SIMPLESCREEN_CONFIG` using the same k
   services.simplescreen = {
     enable = true;
     openFirewall = true;
-    timezone = "America/Chicago";   # defaults to time.timeZone
+    orgName = "Grace Church";       # null = set in Studio's first-run setup
+    orgTimezone = "America/Chicago"; # null = host zone (time.timeZone), editable in Studio
     bootstrapTokenFile = "/run/secrets/simplescreen-token";
     oidc = {
       issuer = "https://id.example.com/application/o/screen/";
@@ -59,12 +65,12 @@ CI publishes a multi-arch image (amd64, arm64) to GHCR on every push to `main` (
 
 ```sh
 docker run -d --name simplescreen -p 8420:8420 \
-  -e SIMPLESCREEN_TIMEZONE=America/Chicago \
+  -e SIMPLESCREEN_ORG_TIMEZONE=America/Chicago \
   -v simplescreen-data:/data ghcr.io/tristonyoder/simplescreen:latest
 docker cp simplescreen:/data/bootstrap-token .   # first-run admin token
 ```
 
-- Configuration is the same `SIMPLESCREEN_*` environment as above. Set `SIMPLESCREEN_TIMEZONE`, since the container has no local timezone and defaults to UTC.
+- Configuration is the same `SIMPLESCREEN_*` environment as above. Set `SIMPLESCREEN_ORG_TIMEZONE` (or set the timezone in Studio's first-run setup), since the container has no local timezone and defaults to UTC.
 - The server runs as uid 1000. A named volume gets the right owner automatically. For a bind mount, `chown 1000:1000` the host directory first.
 - The image has no shell, so read files with `docker cp`, not `docker exec`.
 - For a token you provide, mount it and set `SIMPLESCREEN_BOOTSTRAP_TOKEN_FILE`.
@@ -76,10 +82,12 @@ To build it yourself on a Linux builder: `nix build .#docker && docker load < re
 
 - **Clients cannot discover the server:** mDNS (UDP 5353) must be reachable; in Docker use host networking, or enter the URL manually. Check `SIMPLESCREEN_BONJOUR` is not false. Advertisement failures only log a warning.
 - **401 with an OIDC token:** `iss` must equal the configured issuer exactly (including trailing slash), `aud` must match the audience or client id, and `SIMPLESCREEN_OIDC_TOKEN_TYPE` must match the token the client sends.
-- **Signed in but no groups visible:** the IdP groups claim must contain a value listed in a group's `oidc_bindings`; check `SIMPLESCREEN_OIDC_GROUPS_CLAIM`.
+- **Signed in but no teams visible:** the IdP groups claim must contain a value listed in a team's `oidc_bindings`; check `SIMPLESCREEN_OIDC_GROUPS_CLAIM`.
+- **Server refuses to start: "database predates the Teams schema":** a pre-release data dir. Delete `db.sqlite` in the data dir and restart.
+- **404 `organization_not_found`:** the client sent an `X-Organization` header for a different server; sign in again.
 - **Lost bootstrap token:** read `<data dir>/bootstrap-token`, or set `SIMPLESCREEN_BOOTSTRAP_TOKEN_FILE`.
 - **Uploads fail with 422 `hash_mismatch`:** the bytes differ from the SHA-256 in the URL; re-upload.
-- **Scheduled content starts at the wrong hour:** schedule times are wall-clock in the group's timezone. Check the group's timezone in Studio (Groups), then `SIMPLESCREEN_TIMEZONE` / `services.simplescreen.timezone`. The server refuses to start with an unknown zone name.
+- **Scheduled content starts at the wrong hour:** schedule times are wall-clock in the organization's timezone. Check it in Studio's settings, then `SIMPLESCREEN_ORG_TIMEZONE` / `services.simplescreen.orgTimezone`. The server refuses to start with an unknown zone name.
 - **Schedule doesn't switch while the server is down:** players switch offline only within the 48 h timeline they last fetched, and only to playlists they've finished caching. Let the screen reconnect once after editing the schedule.
 - **Screen shows offline:** the device WebSocket (`/v1/ws`) must pass through any reverse proxy with upgrade headers enabled.
 - **Verify a running server:** `DATA_DIR=./data scripts/smoke.sh` (needs `curl` and `jq`).

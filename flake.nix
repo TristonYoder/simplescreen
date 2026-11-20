@@ -17,7 +17,7 @@
           inherit version;
           src = pkgs.lib.fileset.toSource {
             root = ./.;
-            fileset = pkgs.lib.fileset.unions [ ./server ./branding.toml ];
+            fileset = pkgs.lib.fileset.unions [ ./server ./branding.toml ./api/openapi.yaml ];
           };
           buildInputs = [ pkgs.sqlite ];
           cargoRoot = "server";
@@ -96,12 +96,17 @@
                 enable = true;
                 package = self.packages.${system}.server;
                 bonjour = false;
+                orgName = "Grace Church";
               };
             };
             testScript = ''
               machine.wait_for_unit("${slug}.service")
               machine.wait_for_open_port(${toString port})
               machine.succeed("curl -sf http://localhost:${toString port}/v1/info | grep ${slug}")
+              machine.succeed(
+                "curl -sf -H \"Authorization: Bearer $(cat /var/lib/${slug}/bootstrap-token)\" "
+                "http://localhost:${toString port}/v1/me/organizations | grep 'Grace Church'"
+              )
             '';
           };
           docker = pkgs.testers.runNixOSTest {
