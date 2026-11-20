@@ -1182,7 +1182,8 @@ components:
       required: [group_id, playlist_id, kind]
       description: |
         `weekly`: `days` + `start_time`/`end_time`; an end at or before the start runs past midnight
-        (equal = 24 h). Optional `starts_on`/`ends_on` (inclusive) bound the recurrence.
+        (equal = 24 h). Optional `starts_on`/`ends_on` (inclusive) bound the recurrence, and
+        `skip_dates` lists occurrence start dates that don't run (one-off edits pair a skip with a `once` entry).
         `once`: `starts_at`/`ends_at`, end after start.
         Precedence: override > once > weekly > default playlist. Within a tier, entries naming
         screens beat group-wide ones, then the newest entry wins.
@@ -1204,6 +1205,10 @@ components:
         end_time: { type: string, pattern: '^[0-9]{2}:[0-9]{2}$' }
         starts_on: { type: string, format: date }
         ends_on: { type: string, format: date }
+        skip_dates:
+          type: array
+          description: Weekly only. Local dates whose occurrence (by start date) is skipped.
+          items: { type: string, format: date }
         starts_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$', description: Local wall clock }
         ends_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$', description: Local wall clock }
 
