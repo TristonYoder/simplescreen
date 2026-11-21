@@ -217,24 +217,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_teams.sql"),
 ];
 
-async fn table_exists(db: &SqlitePool, name: &str) -> anyhow::Result<bool> {
-    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
-        .bind(name)
-        .fetch_one(db)
-        .await?;
-    Ok(n == 1)
-}
-
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     let (current,): (i64,) = sqlx::query_as("PRAGMA user_version").fetch_one(db).await?;
-    let groups = table_exists(db, "groups").await?;
-    let teams = table_exists(db, "teams").await?;
-    anyhow::ensure!(!(groups && teams), "database has both groups and teams tables");
-    // The short-lived squashed migration created `teams` directly and stored user_version 1.
-    if teams && !groups && current < MIGRATIONS.len() as i64 {
-        sqlx::raw_sql(&format!("PRAGMA user_version = {}", MIGRATIONS.len())).execute(db).await?;
-        return Ok(());
-    }
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         let mut tx = db.begin().await?;
         sqlx::raw_sql(sql).execute(&mut *tx).await?;

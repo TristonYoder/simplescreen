@@ -83,7 +83,6 @@ To build it yourself on a Linux builder: `nix build .#docker && docker load < re
 - **Clients cannot discover the server:** mDNS (UDP 5353) must be reachable; in Docker use host networking, or enter the URL manually. Check `SIMPLESCREEN_BONJOUR` is not false. Advertisement failures only log a warning.
 - **401 with an OIDC token:** `iss` must equal the configured issuer exactly (including trailing slash), `aud` must match the audience or client id, and `SIMPLESCREEN_OIDC_TOKEN_TYPE` must match the token the client sends.
 - **Signed in but no teams visible:** the IdP groups claim must contain a value listed in a team's `oidc_bindings`; check `SIMPLESCREEN_OIDC_GROUPS_CLAIM`.
-- **Server refuses to start: "database predates the Teams schema":** a pre-release data dir. Delete `db.sqlite` in the data dir and restart.
 - **404 `organization_not_found`:** the client sent an `X-Organization` header for a different server; sign in again.
 - **Lost bootstrap token:** read `<data dir>/bootstrap-token`, or set `SIMPLESCREEN_BOOTSTRAP_TOKEN_FILE`.
 - **Uploads fail with 422 `hash_mismatch`:** the bytes differ from the SHA-256 in the URL; re-upload.

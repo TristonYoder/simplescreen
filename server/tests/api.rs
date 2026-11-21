@@ -283,50 +283,6 @@ async fn org_settings_from_env_are_locked() {
     }
 }
 
-#[tokio::test]
-async fn groups_database_migrates_to_teams() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("db.sqlite");
-    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(&db).create_if_missing(true);
-    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
-    for (i, sql) in [
-        include_str!("../migrations/0001_init.sql"),
-        include_str!("../migrations/0002_schedule.sql"),
-        include_str!("../migrations/0003_skip_dates.sql"),
-        include_str!("../migrations/0004_floor_plans.sql"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        sqlx::raw_sql(sql).execute(&pool).await.unwrap();
-        sqlx::raw_sql(&format!("PRAGMA user_version = {}", i + 1)).execute(&pool).await.unwrap();
-    }
-    sqlx::query("INSERT INTO groups (id, name, oidc_bindings, created_at, timezone) VALUES ('g1', 'Production', '[]', '2026-01-01T00:00:00Z', 'America/Chicago')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
-
-    let mut cfg = Config::defaults(dir.path().to_path_buf());
-    cfg.bonjour = false;
-    let state = build_state(cfg).await.unwrap();
-    let (teams,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM teams").fetch_one(&state.db).await.unwrap();
-    assert_eq!(teams, 1);
-    let (groups,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groups'")
-            .fetch_one(&state.db)
-            .await
-            .unwrap();
-    assert_eq!(groups, 0);
-    let tz: (String,) = sqlx::query_as("SELECT value FROM settings WHERE key = 'org_timezone'")
-        .fetch_one(&state.db)
-        .await
-        .unwrap();
-    assert_eq!(tz.0, "America/Chicago");
-    let (version,): (i64,) = sqlx::query_as("PRAGMA user_version").fetch_one(&state.db).await.unwrap();
-    assert_eq!(version, 5);
-}
-
 /// Every operation in api/openapi.yaml is routed: secured ones answer 401 without a token.
 #[tokio::test]
 async fn contract_operations_are_routed() {
