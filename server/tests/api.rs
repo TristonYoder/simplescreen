@@ -1834,3 +1834,360 @@ async fn retag_clash_is_allowed_and_flagged() {
     let entries = app.call("GET", "/v1/schedule", None).await.json();
     assert!(entries["entries"].as_array().unwrap().iter().all(|e| e["needs_resolution"] == false));
 }
+
+// MARK: Libraries
+
+async fn folder_as(app: &App, token: &str, library: &str, parent: Option<&str>, name: &str) -> Resp {
+    let mut body = json!({ "library_id": library, "name": name });
+    if let Some(p) = parent {
+        body["parent_id"] = json!(p);
+    }
+    app.call_as(token, "POST", "/v1/media-folders", Some(body)).await
+}
+
+async fn file_as(app: &App, token: &str, folder: &str, name: &str, data: &[u8]) -> Resp {
+    let sha = hex::encode(Sha256::digest(data));
+    let up = app
+        .call_as(token, "POST", "/v1/media/uploads", Some(json!({ "folder_id": folder, "name": name, "sha256": sha, "size": data.len(), "mime": "image/png" })))
+        .await;
+    if up.status != StatusCode::OK {
+        return up;
+    }
+    let up = up.json();
+    if !up["already_present"].as_bool().unwrap() {
+        let url = up["url"].as_str().unwrap();
+        if url.starts_with('/') {
+            let r = app.send("PUT", url, Some(token), &[], Body::from(data.to_vec()), false).await;
+            assert!(r.status.is_success(), "{:?}", r.body);
+        } else {
+            let mut req = reqwest::Client::new().put(url).body(data.to_vec());
+            for (k, v) in up["headers"].as_object().unwrap() {
+                req = req.header(k.as_str(), v.as_str().unwrap());
+            }
+            assert!(req.send().await.unwrap().status().is_success());
+        }
+    }
+    app.call_as(token, "POST", "/v1/media", Some(json!({ "folder_id": folder, "name": name, "kind": "image", "sha256": sha, "mime": "image/png" })))
+        .await
+}
+
+fn id(r: &Resp) -> String {
+    assert!(r.status.is_success(), "{} {:?}", r.status, r.body);
+    r.json()["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn folder_reach_tags_grants_and_inheritance() {
+    let o = org().await;
+    let app = &o.app;
+    let admin = app.token.clone();
+
+    let r = folder_as(app, &o.le, "managed", None, "Mine").await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let shared = id(&folder_as(app, &admin, "managed", None, "Shared").await);
+    let r = app.call("PUT", &format!("/v1/media-folders/{shared}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+
+    // Lobby reaches it through its tag; subfolders inherit; viewers can't write.
+    let loops = id(&folder_as(app, &o.le, "managed", Some(&shared), "Loops").await);
+    assert_eq!(folder_as(app, &o.lv, "managed", Some(&shared), "Nope").await.status, StatusCode::FORBIDDEN);
+    let r = app.call_as(&o.lv, "GET", "/v1/media-folders", None).await.json();
+    let access: Vec<(&str, &str)> = r.as_array().unwrap().iter().map(|f| (f["path"].as_str().unwrap(), f["access"].as_str().unwrap())).collect();
+    assert_eq!(access, vec![("Shared", "view"), ("Shared/Loops", "view")]);
+    assert_eq!(app.call_as(&o.ke, "GET", "/v1/media-folders", None).await.json().as_array().unwrap().len(), 0);
+    let r = app.call_as(&o.le, "GET", &format!("/v1/media-folders/{loops}"), None).await.json();
+    assert_eq!(r["inherited_tag_ids"], json!([o.front]));
+
+    // Lobby grants Loops to Kitchen, but can't tag with a tag it doesn't hold.
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/media-folders/{loops}/grants"), Some(json!({ "team_ids": [o.kitchen] }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/media-folders/{loops}/tags"), Some(json!({ "tag_ids": [o.back] }))).await;
+    assert_eq!(code(r, StatusCode::FORBIDDEN).await, "tag_not_held");
+    let r = app.call_as(&o.ke, "GET", "/v1/media-folders", None).await.json();
+    let access: Vec<(&str, &str)> = r.as_array().unwrap().iter().map(|f| (f["path"].as_str().unwrap(), f["access"].as_str().unwrap())).collect();
+    assert_eq!(access, vec![("Shared", "none"), ("Shared/Loops", "edit")]);
+
+    // Kitchen uploads; both teams can use the file.
+    let media = id(&file_as(app, &o.ke, &loops, "Welcome.png", b"welcome").await);
+    let r = file_as(app, &o.ke, &loops, "welcome.PNG", b"other").await;
+    assert_eq!(code(r, StatusCode::CONFLICT).await, "name_taken");
+    let item = json!([{ "kind": "image", "media_id": media }]);
+    let lp = id(&app.call_as(&o.le, "POST", "/v1/playlists", Some(json!({ "team_id": o.lobby, "name": "Lobby loop", "items": item }))).await);
+    let kp = app.call_as(&o.ke, "POST", "/v1/playlists", Some(json!({ "team_id": o.kitchen, "name": "Kitchen loop", "items": item }))).await;
+    let kp_json = kp.json();
+    let kp = id(&kp);
+
+    // Kitchen loses reach: its playlist keeps the file read-only, but can't add it again.
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/media-folders/{loops}/grants"), Some(json!({ "team_ids": [] }))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(app.call_as(&o.ke, "GET", &format!("/v1/media/{media}"), None).await.json()["access"], "playlist");
+    let r = app
+        .call_as(&o.ke, "PUT", &format!("/v1/playlists/{kp}"), Some(json!({ "base_version": 1, "name": "Kitchen loop 2", "loop": true, "defaults": kp_json["defaults"], "items": item, "beds": [] })))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let r = app.call_as(&o.ke, "POST", "/v1/playlists", Some(json!({ "team_id": o.kitchen, "name": "New", "items": item }))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "invalid_playlist");
+
+    // Usage shows both playlists; the other team's only by name.
+    let u = app.call_as(&o.le, "GET", &format!("/v1/media-folders/{shared}/usage"), None).await.json();
+    assert_eq!(u["media_count"], 1);
+    let rows: Vec<(&str, bool)> = u["playlists"].as_array().unwrap().iter().map(|p| (p["name"].as_str().unwrap(), p["member"].as_bool().unwrap())).collect();
+    assert_eq!(rows, vec![("Kitchen loop 2", false), ("Lobby loop", true)]);
+
+    // Renaming the top folder (admin) moves the file's path.
+    let r = app.call("PATCH", &format!("/v1/media-folders/{shared}"), Some(json!({ "name": "Common" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(app.call("GET", &format!("/v1/media/{media}"), None).await.json()["path"], "Common/Loops/Welcome.png");
+    let r = app.call_as(&o.le, "PATCH", &format!("/v1/media-folders/{shared}"), Some(json!({ "name": "Mine" }))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    // Deleting the folder leaves the file missing and tells Kitchen's last editor.
+    let r = app.call_as(&o.le, "DELETE", &format!("/v1/media-folders/{loops}"), None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(app.call_as(&o.le, "GET", &format!("/v1/media/{media}"), None).await.json()["missing"], true);
+    let n = app.call_as(&o.ke, "GET", "/v1/notices", None).await.json();
+    let n: Vec<&Value> = n.as_array().unwrap().iter().filter(|n| n["kind"] == "media_missing").collect();
+    assert_eq!(n.len(), 1);
+    assert_eq!(n[0]["detail"]["media_id"], media.as_str());
+    let lv = app.call_as(&o.le, "GET", &format!("/v1/playlists/{lp}"), None).await.json();
+    assert_eq!(lv["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn manifest_leaves_out_missing_media() {
+    let app = App::new().await;
+    let g = app.team().await;
+    let (a, _) = app.media(&g, "image", "image/png", b"a").await;
+    let (b, sha_b) = app.media(&g, "image", "image/png", b"b").await;
+    let (track, _) = app.media(&g, "audio", "audio/mp4", b"t").await;
+    let ia = "00000000-0000-4000-8000-00000000000a";
+    let ib = "00000000-0000-4000-8000-00000000000b";
+    let r = app
+        .call(
+            "POST",
+            "/v1/playlists",
+            Some(json!({ "team_id": g, "name": "P", "items": [
+                { "id": ia, "kind": "image", "media_id": a },
+                { "id": ib, "kind": "image", "media_id": b },
+            ], "beds": [{ "start_item_id": ia, "end_item_id": ib, "tracks": [track] }] })),
+        )
+        .await;
+    let pl = id(&r);
+    app.tag_playlist(&g, &pl).await;
+    let (_, token) = pair_tagged(&app, "Lobby", json!([app.tag(&g)])).await;
+    app.call("DELETE", &format!("/v1/media/{a}"), None).await;
+    let m = app.call_as(&token, "GET", "/v1/device/manifest", None).await.json();
+    let p = &m["playlists"][0];
+    assert_eq!(p["items"].as_array().unwrap().len(), 1);
+    assert_eq!(p["items"][0]["media_id"], b.as_str());
+    assert_eq!(p["beds"][0]["start_item_id"], ib);
+    let shas: Vec<&str> = m["assets"].as_array().unwrap().iter().map(|x| x["sha256"].as_str().unwrap()).collect();
+    assert!(shas.contains(&sha_b.as_str()));
+    assert!(m["media"].as_array().unwrap().iter().all(|x| x["id"] != a.as_str()));
+}
+
+#[tokio::test]
+async fn local_library_paths_moves_and_quota() {
+    let roots = tempfile::tempdir().unwrap();
+    let root = roots.path().canonicalize().unwrap();
+    let r2 = root.clone();
+    let app = App::with(move |c| c.library_roots = vec![r2]).await;
+    let g = app.team().await;
+
+    let r = app.call("POST", "/v1/libraries", Some(json!({ "name": "Elsewhere", "kind": "local", "path": "/tmp/../etc" }))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "path_not_allowed");
+    let r = app.call("POST", "/v1/libraries", Some(json!({ "name": "Elsewhere", "kind": "local", "path": "/var/empty/x" }))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "path_not_allowed");
+    let dir = root.join("signage");
+    let lib = id(&app.call("POST", "/v1/libraries", Some(json!({ "name": "Drive", "kind": "local", "path": dir.to_str().unwrap() }))).await);
+
+    let top = id(&folder_as(&app, &app.token, &lib, None, "Lobby").await);
+    assert!(dir.join("Lobby").is_dir());
+    app.call("PUT", &format!("/v1/media-folders/{top}/grants"), Some(json!({ "team_ids": [g] }))).await;
+    let r = file_as(&app, &app.token, &top, "Hello.png", b"hello local").await;
+    let media = id(&r);
+    let sha = r.json()["sha256"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::read(dir.join("Lobby/Hello.png")).unwrap(), b"hello local");
+    assert!(!app.state.blob_path(&sha).exists(), "the staged blob is cleaned up");
+    let r = app.call("GET", &format!("/v1/blobs/{sha}"), None).await;
+    assert_eq!(&r.body[..], b"hello local");
+
+    let pl = id(&app.call("POST", "/v1/playlists", Some(json!({ "team_id": g, "name": "P", "items": [{ "kind": "image", "media_id": media }] }))).await);
+
+    // Rename and folder rename happen on disk.
+    app.call("PATCH", &format!("/v1/media/{media}"), Some(json!({ "name": "Hi.png" }))).await;
+    assert!(dir.join("Lobby/Hi.png").exists() && !dir.join("Lobby/Hello.png").exists());
+    let r = app.call("PATCH", &format!("/v1/media-folders/{top}"), Some(json!({ "name": "Foyer" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert!(dir.join("Foyer/Hi.png").exists());
+
+    // Moving to the managed library copies the bytes and keeps the sha and the playlist.
+    let managed = app.folder(&g).await;
+    let r = app.call("PATCH", &format!("/v1/media/{media}"), Some(json!({ "folder_id": managed }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["library_id"], "managed");
+    assert_eq!(r.json()["sha256"], sha.as_str());
+    assert!(!dir.join("Foyer/Hi.png").exists());
+    assert!(app.state.blob_path(&sha).exists());
+    let p = app.call("GET", &format!("/v1/playlists/{pl}"), None).await.json();
+    assert_eq!(p["items"][0]["media_id"], media.as_str());
+
+    // A quota smaller than the file refuses the upload.
+    let r = app.call("PATCH", &format!("/v1/libraries/{lib}"), Some(json!({ "quota_bytes": 3 }))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let r = file_as(&app, &app.token, &top, "Big.png", b"too big for it").await;
+    assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE);
+    assert_eq!(r.json()["free_bytes"], 3);
+
+    let r = app.call("DELETE", &format!("/v1/libraries/{lib}"), None).await;
+    assert_eq!(code(r, StatusCode::CONFLICT).await, "library_not_empty");
+    let r = app.call("DELETE", "/v1/libraries/managed", None).await;
+    assert_eq!(code(r, StatusCode::CONFLICT).await, "library_managed");
+}
+
+/// A tiny path-style S3: PUT (with checksum check and copy), GET, HEAD, DELETE and ListObjectsV2.
+async fn fake_s3() -> (String, std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>) {
+    use axum::{extract::Request as AxReq, response::IntoResponse};
+    use base64::Engine;
+    type Store = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>;
+    let store: Store = Default::default();
+    let s2 = store.clone();
+    let handler = move |req: AxReq| {
+        let store = s2.clone();
+        async move {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            let headers = req.headers().clone();
+            let path = percent_decode(uri.path().trim_start_matches('/'));
+            let (_, key) = path.split_once('/').unwrap_or((path.as_str(), ""));
+            let key = key.to_string();
+            let query = uri.query().unwrap_or_default().to_string();
+            let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
+            let b64 = |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(Sha256::digest(d));
+            match method.as_str() {
+                "GET" if query.contains("list-type=2") => {
+                    let prefix = query
+                        .split('&')
+                        .find_map(|kv| kv.strip_prefix("prefix="))
+                        .map(percent_decode)
+                        .unwrap_or_default();
+                    let keys: Vec<String> = store.lock().unwrap().keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+                    let items: String = keys.iter().map(|k| format!("<Contents><Key>{k}</Key><Size>1</Size></Contents>")).collect();
+                    format!("<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated>{items}</ListBucketResult>").into_response()
+                }
+                "PUT" => {
+                    let data = match headers.get("x-amz-copy-source") {
+                        Some(src) => {
+                            let src = percent_decode(src.to_str().unwrap().trim_start_matches('/'));
+                            let (_, src_key) = src.split_once('/').unwrap();
+                            match store.lock().unwrap().get(src_key) {
+                                Some(d) => d.clone(),
+                                None => return StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                        None => body,
+                    };
+                    if let Some(c) = headers.get("x-amz-checksum-sha256") {
+                        if c.to_str().unwrap() != b64(&data) {
+                            return StatusCode::BAD_REQUEST.into_response();
+                        }
+                    }
+                    store.lock().unwrap().insert(key, data);
+                    StatusCode::OK.into_response()
+                }
+                "HEAD" => match store.lock().unwrap().get(&key) {
+                    Some(d) => ([(header::CONTENT_LENGTH, d.len().to_string()), (header::HeaderName::from_static("x-amz-checksum-sha256"), b64(d))]).into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                },
+                "GET" => match store.lock().unwrap().get(&key) {
+                    Some(d) => d.clone().into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                },
+                "DELETE" => {
+                    store.lock().unwrap().remove(&key);
+                    StatusCode::NO_CONTENT.into_response()
+                }
+                _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+            }
+        }
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, Router::new().fallback(handler)).await.unwrap() });
+    (format!("http://{addr}"), store)
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = vec![];
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+#[tokio::test]
+async fn s3_library_uploads_redirects_and_moves() {
+    let (endpoint, store) = fake_s3().await;
+    let o = org().await;
+    let app = &o.app;
+    let s3 = json!({ "endpoint": endpoint, "region": "us-east-1", "bucket": "media", "prefix": "signage", "path_style": true,
+                     "access_key_id": "AKID", "secret_access_key": "SECRET" });
+    let lib = id(&app.call("POST", "/v1/libraries", Some(json!({ "name": "Cloud", "kind": "s3", "s3": s3 }))).await);
+    assert!(store.lock().unwrap().is_empty(), "the probe cleans up");
+    let libs = app.call("GET", "/v1/libraries", None).await.json();
+    let cloud = libs.as_array().unwrap().iter().find(|l| l["id"] == lib.as_str()).unwrap().clone();
+    assert_eq!(cloud["s3"]["bucket"], "media");
+    assert!(cloud["s3"].get("secret_access_key").is_none());
+    let libs = app.call_as(&o.le, "GET", "/v1/libraries", None).await.json();
+    assert!(libs.as_array().unwrap().iter().all(|l| l.get("s3").is_none()));
+
+    let top = id(&folder_as(app, &app.token, &lib, None, "Lobby").await);
+    app.call("PUT", &format!("/v1/media-folders/{top}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+    let r = file_as(app, &o.le, &top, "Sky.png", b"sky bytes").await;
+    let media = id(&r);
+    let sha = r.json()["sha256"].as_str().unwrap().to_string();
+    assert_eq!(store.lock().unwrap().get("signage/Lobby/Sky.png").unwrap(), b"sky bytes");
+
+    // A wrong checksum is refused by S3 before the server records anything.
+    let up = app
+        .call_as(&o.le, "POST", "/v1/media/uploads", Some(json!({ "folder_id": top, "name": "Bad.png", "sha256": sha, "size": 3, "mime": "image/png" })))
+        .await
+        .json();
+    let mut req = reqwest::Client::new().put(up["url"].as_str().unwrap()).body(b"bad".to_vec());
+    for (k, v) in up["headers"].as_object().unwrap() {
+        req = req.header(k.as_str(), v.as_str().unwrap());
+    }
+    assert_eq!(req.send().await.unwrap().status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Players are redirected to S3.
+    let r = app.call("GET", &format!("/v1/blobs/{sha}"), None).await;
+    assert_eq!(r.status, StatusCode::FOUND);
+    let loc = r.headers[header::LOCATION].to_str().unwrap().to_string();
+    assert!(loc.starts_with(&endpoint) && loc.contains("X-Amz-Signature"));
+    assert_eq!(&reqwest::get(&loc).await.unwrap().bytes().await.unwrap()[..], b"sky bytes");
+
+    // Renames copy within the bucket; moving a managed file in uploads it.
+    app.call_as(&o.le, "PATCH", &format!("/v1/media/{media}"), Some(json!({ "name": "Clouds.png" }))).await;
+    assert!(store.lock().unwrap().contains_key("signage/Lobby/Clouds.png"));
+    assert!(!store.lock().unwrap().contains_key("signage/Lobby/Sky.png"));
+    let (other, other_sha) = app.media(&o.lobby, "image", "image/png", b"managed bytes").await;
+    let r = app.call("PATCH", &format!("/v1/media/{other}"), Some(json!({ "folder_id": top, "name": "Moved.png" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(store.lock().unwrap().get("signage/Lobby/Moved.png").unwrap(), b"managed bytes");
+    assert!(!app.state.blob_path(&other_sha).exists());
+
+    // Folder renames and deletes reach the bucket.
+    let r = app.call("PATCH", &format!("/v1/media-folders/{top}"), Some(json!({ "name": "Foyer" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert!(store.lock().unwrap().contains_key("signage/Foyer/Clouds.png"));
+    app.call("DELETE", &format!("/v1/media-folders/{top}"), None).await;
+    assert!(store.lock().unwrap().is_empty());
+}

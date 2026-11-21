@@ -33,10 +33,21 @@ Environment variables (or a TOML file via `SIMPLESCREEN_CONFIG` using the same k
 | `SIMPLESCREEN_ORG_TIMEZONE` | host zone, else UTC | IANA zone for every schedule; if unset, Studio can set it. `SIMPLESCREEN_TIMEZONE` is refused at startup |
 | `SIMPLESCREEN_LISTEN` | | `unix:/path/to.sock` listens on a unix socket instead of `BIND`:`PORT` (no Bonjour) |
 | `SIMPLESCREEN_PUBLIC_URL` | | externally reachable base URL when behind a reverse proxy; reported in `/v1/info` |
+| `SIMPLESCREEN_LIBRARY_ROOTS` | | comma-separated absolute directories that local media libraries may live under |
 
 The server is one organization. Its name and timezone come from the env vars above when set (then Studio shows them as locked), otherwise from first-run setup in Studio (`PATCH /v1/settings`, server admin). People belong to **Teams**; a team's `oidc_bindings` map sign-in groups (the IdP groups claim) to viewer, editor or admin. Server admins (`OIDC_ADMIN_GROUPS` or the bootstrap token) manage teams and settings. Screens, devices and floor plans belong to the organization; teams own content. Server admins tag screens and give each team the tags it reaches, and a team's playlists show on a screen only when they share a tag with it. An untagged screen plays nothing until an admin tags it.
 
 Upgrading to this release drops existing screens, devices and schedules: re-pair every device after the upgrade.
+
+### Media libraries
+
+Media lives in folders of **libraries**, which server admins add in Studio:
+
+- **Library** (managed): the server's own store in `<data dir>/blobs`. It always exists.
+- **Local:** a directory on the server, inside one of `SIMPLESCREEN_LIBRARY_ROOTS`. Folders and files are real, but change them only through the apps: the server doesn't watch the directory.
+- **S3:** a bucket (AWS or any S3-compatible store) with an optional key prefix and CDN URL. Players download from S3 or the CDN directly, so they need internet access to it. Studio uploads straight to the bucket (up to 5 GiB per file). The bucket's CORS settings don't matter (the apps aren't browsers). The access key needs `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket` on the prefix.
+
+Upgrading to this release also drops existing media and empties playlists: upload the files again into library folders.
 
 ## NixOS
 
@@ -59,7 +70,9 @@ Upgrading to this release drops existing screens, devices and schedules: re-pair
 }
 ```
 
-Data lives in `/var/lib/simplescreen`. Back up `db.sqlite` and `blobs/` together.
+Data lives in `/var/lib/simplescreen`. Back up `db.sqlite` and `blobs/` together, along with any local library directories.
+
+For local libraries, list their parent directories in `libraryRoots = [ "/srv/signage" ];`. The service runs with `DynamicUser`, so give the directory a group the service can write to (or put it under `dataDir`). `ProtectHome` blocks directories under `/home`.
 
 ## Docker
 
@@ -88,6 +101,10 @@ To build it yourself on a Linux builder: `nix build .#docker && docker load < re
 - **404 `organization_not_found`:** the client sent an `X-Organization` header for a different server; sign in again.
 - **Lost bootstrap token:** read `<data dir>/bootstrap-token`, or set `SIMPLESCREEN_BOOTSTRAP_TOKEN_FILE`.
 - **Uploads fail with 422 `hash_mismatch`:** the bytes differ from the SHA-256 in the URL; re-upload.
+- **Adding a local library fails with `path_not_allowed`:** the path must be inside `SIMPLESCREEN_LIBRARY_ROOTS` (or `libraryRoots`).
+- **Adding a library fails with `storage_unreachable`:** the server couldn't write, read back and delete a test file. The message has the reason: check directory permissions, or the S3 endpoint, region, bucket, path-style setting and key permissions.
+- **Uploads fail with 507 `insufficient_storage`:** the library's quota or disk is full (`free_bytes` in the error).
+- **Players don't download from an S3 library:** they're redirected to S3 or the CDN URL; that host must be reachable from the TVs' network.
 - **Scheduled content starts at the wrong hour:** schedule times are wall-clock in the organization's timezone. Check it in Studio's settings, then `SIMPLESCREEN_ORG_TIMEZONE` / `services.simplescreen.orgTimezone`. The server refuses to start with an unknown zone name.
 - **Schedule doesn't switch while the server is down:** players switch offline only within the 48 h timeline they last fetched, and only to playlists they've finished caching. Let the screen reconnect once after editing the schedule.
 - **Screen shows offline:** the device WebSocket (`/v1/ws`) must pass through any reverse proxy with upgrade headers enabled.
