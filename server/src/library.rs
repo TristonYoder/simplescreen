@@ -333,6 +333,23 @@ pub async fn delete_media(s: &AppState, p: &Principal, m: &Media) -> ApiResult<(
     Ok(())
 }
 
+/// Bumps every playlist using `media_id` so screens refetch their manifests.
+pub async fn bump_playlists_using(s: &AppState, media_id: &str) -> ApiResult<()> {
+    let users: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT pl.id, pl.team_id FROM playlist_media pm JOIN playlists pl ON pl.id = pm.playlist_id WHERE pm.media_id = ?",
+    )
+    .bind(media_id)
+    .fetch_all(&s.db)
+    .await?;
+    for (pl, team) in &users {
+        let (version,): (i64,) =
+            sqlx::query_as("UPDATE playlists SET version = version + 1 WHERE id = ? RETURNING version").bind(pl).fetch_one(&s.db).await?;
+        s.notify_screens_for_playlist(pl, version).await;
+        s.hub.broadcast_team(team, &json!({ "type": "schedule_changed", "team_id": team }));
+    }
+    Ok(())
+}
+
 /// Drops missing files no playlist uses any more, and resolves their notices.
 pub async fn sweep_missing(s: &AppState) -> ApiResult<()> {
     let gone: Vec<(String, Option<String>)> = sqlx::query_as(

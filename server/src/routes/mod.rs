@@ -67,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/media/uploads/{id}/complete", post(media::complete_upload))
         .route("/v1/media/{id}", get(media::get).patch(media::patch).delete(media::delete))
         .route("/v1/media/{id}/usage", get(media::usage))
+        .route("/v1/media/{id}/replace", post(media::replace))
         .route("/v1/playlists", get(playlists::list).post(playlists::create))
         .route(
             "/v1/playlists/{id}",

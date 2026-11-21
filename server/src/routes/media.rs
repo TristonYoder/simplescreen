@@ -136,12 +136,28 @@ pub struct UploadInput {
     size: i64,
     #[allow(dead_code)]
     mime: String,
+    replaces: Option<String>,
+}
+
+/// Where S3 bytes for a replace wait until `replace` swaps them in.
+fn staging_path(folder_path: &str, media_id: &str, sha: &str) -> String {
+    format!("{folder_path}/.replacing-{media_id}-{}", &sha[..16])
 }
 
 pub async fn upload(State(s): State<AppState>, p: Principal, ApiJson(input): ApiJson<UploadInput>) -> ApiResult<Json<Value>> {
     check_sha(&input.sha256)?;
-    let (lib, name, path) = target(&s, &p, &input.folder_id, &input.name).await?;
-    name_free(&s, &input.folder_id, &name, None).await?;
+    let (lib, name, mut path) = target(&s, &p, &input.folder_id, &input.name).await?;
+    name_free(&s, &input.folder_id, &name, input.replaces.as_deref()).await?;
+    if let Some(id) = &input.replaces {
+        let (m, tree, _) = editable(&s, &p, id).await?;
+        if m.folder_id.as_deref() != Some(input.folder_id.as_str()) {
+            return Err(ApiError::bad_request("folder_id must be the replaced file's folder"));
+        }
+        if m.sha256 == input.sha256 {
+            return Ok(Json(json!({ "already_present": true })));
+        }
+        path = staging_path(&tree.path(&input.folder_id), id, &input.sha256);
+    }
     if input.size < 0 {
         return Err(ApiError::bad_request("size must not be negative"));
     }
@@ -508,6 +524,126 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
     library::delete_media(&s, &p, &m).await?;
     library::changed(&s, m.folder_id.as_deref());
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceInput {
+    name: String,
+    kind: crate::models::MediaKind,
+    sha256: String,
+    mime: String,
+    width: Option<i64>,
+    height: Option<i64>,
+    duration_ms: Option<i64>,
+    codec: Option<String>,
+    hdr: Option<bool>,
+    frame_rate: Option<f64>,
+    source_filename: Option<String>,
+    source_sha256: Option<String>,
+    thumbnail_sha256: Option<String>,
+}
+
+pub async fn replace(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<ReplaceInput>,
+) -> ApiResult<Json<Media>> {
+    check_sha(&input.sha256)?;
+    if let Some(h) = &input.source_sha256 {
+        check_sha(h)?;
+    }
+    if input.mime.trim().is_empty() {
+        return Err(ApiError::bad_request("mime is required"));
+    }
+    let (m, tree, _) = editable(&s, &p, &id).await?;
+    let folder = m.folder_id.clone().unwrap_or_default();
+    let name = library::check_name(&input.name)?;
+    name_free(&s, &folder, &name, Some(&m.id)).await?;
+    if let Some(t) = &input.thumbnail_sha256 {
+        check_sha(t)?;
+        if tokio::fs::metadata(s.blob_path(t)).await.is_err() {
+            return Err(ApiError::unprocessable("blob_missing", "thumbnail blob has not been uploaded"));
+        }
+    }
+    let folder_path = tree.path(&folder);
+    let path = format!("{folder_path}/{name}");
+    let lib = library::library(&s, &m.library_id).await?;
+    let backend = lib.backend()?;
+    let same_bytes = input.sha256 == m.sha256;
+    let size = if same_bytes {
+        if path != m.path {
+            backend.rename_file(&m.path, &path).await?;
+        }
+        m.size
+    } else {
+        match &backend {
+            Backend::Managed | Backend::Local(_) => {
+                let staged = s.blob_path(&input.sha256);
+                let meta = tokio::fs::metadata(&staged)
+                    .await
+                    .map_err(|_| ApiError::unprocessable("blob_missing", "the file has not been uploaded"))?;
+                if matches!(backend, Backend::Local(_)) {
+                    library::ensure_space(&s, &lib, meta.len() as i64).await?;
+                    if path != m.path {
+                        backend.delete_file(&m.path).await?;
+                    }
+                    backend.put_from(&s, &staged, &path, &input.sha256).await?;
+                }
+                meta.len() as i64
+            }
+            Backend::S3(b) => {
+                let staging = staging_path(&folder_path, &m.id, &input.sha256);
+                let size = match b.head(&staging).await? {
+                    None => return Err(ApiError::unprocessable("blob_missing", "the file has not been uploaded to S3")),
+                    Some((size, sha)) if sha.as_deref() == Some(input.sha256.as_str()) => size,
+                    Some(_) => {
+                        b.delete(&staging).await?;
+                        return Err(ApiError::unprocessable("hash_mismatch", "the object in S3 does not match sha256"));
+                    }
+                };
+                b.copy(&staging, &path).await?;
+                b.delete(&staging).await?;
+                if path != m.path {
+                    b.delete(&m.path).await?;
+                }
+                size
+            }
+        }
+    };
+    sqlx::query(
+        "UPDATE media SET name = ?, path = ?, kind = ?, sha256 = ?, mime = ?, width = ?, height = ?, duration_ms = ?, codec = ?,
+            hdr = ?, frame_rate = ?, source_filename = ?, source_sha256 = ?, thumbnail_sha256 = ?, size = ? WHERE id = ?",
+    )
+    .bind(&name)
+    .bind(&path)
+    .bind(input.kind.as_str())
+    .bind(&input.sha256)
+    .bind(input.mime.trim())
+    .bind(input.width)
+    .bind(input.height)
+    .bind(input.duration_ms)
+    .bind(&input.codec)
+    .bind(input.hdr)
+    .bind(input.frame_rate)
+    .bind(&input.source_filename)
+    .bind(input.source_sha256.as_ref().unwrap_or(&input.sha256))
+    .bind(&input.thumbnail_sha256)
+    .bind(size)
+    .bind(&m.id)
+    .execute(&s.db)
+    .await?;
+    if m.library_id == "managed" {
+        library::gc_blob(&s, &m.sha256).await?;
+    } else {
+        library::gc_blob(&s, &input.sha256).await?;
+    }
+    if let Some(t) = m.thumbnail_sha256.as_deref().filter(|t| Some(*t) != input.thumbnail_sha256.as_deref()) {
+        library::gc_blob(&s, t).await?;
+    }
+    library::bump_playlists_using(&s, &m.id).await?;
+    library::changed(&s, Some(&folder));
+    Ok(Json(library::fetch_media(&s, &id).await?.with_access("edit")))
 }
 
 /// Media ids a team may add to its playlists: files in folders it reaches.

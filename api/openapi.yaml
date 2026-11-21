@@ -987,6 +987,37 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/media/{mediaId}/replace:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/MediaId' }
+    post:
+      operationId: replaceMedia
+      tags: [media]
+      description: |
+        Editor role in a team that reaches its folder. Swaps in new bytes uploaded with
+        `createMediaUpload` (`replaces` set to this file) and keeps the id, so every playlist that uses
+        it gets the new version: their versions bump and their screens get `manifest_changed`. The old
+        bytes are deleted. 409 `name_taken` if the new name belongs to another file; 422 `blob_missing`,
+        `hash_mismatch` or `media_missing`; 507 `insufficient_storage`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaReplaceInput' }
+      responses:
+        '200':
+          description: Replaced
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Media' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '507': { $ref: '#/components/responses/InsufficientStorage' }
+
   /v1/media/{mediaId}/usage:
     parameters:
       - { $ref: '#/components/parameters/OrganizationHeader' }
@@ -2655,6 +2686,31 @@ components:
         sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
         size: { type: integer, format: int64 }
         mime: { type: string }
+        replaces:
+          type: string
+          format: uuid
+          description: |
+            The file these bytes will replace (`replaceMedia`). `folder_id` must be its folder and `name`
+            may be its own name. S3 bytes go to a staging key until the replace finishes.
+
+    MediaReplaceInput:
+      type: object
+      required: [name, kind, sha256, mime]
+      description: Like `MediaInput` without `folder_id`; every metadata field is replaced, absent ones cleared
+      properties:
+        name: { type: string, description: The file's name after the replace; may differ from the old one (e.g. a new extension) }
+        kind: { $ref: '#/components/schemas/MediaKind' }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        mime: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+        duration_ms: { type: integer, format: int64 }
+        codec: { type: string }
+        hdr: { type: boolean }
+        frame_rate: { type: number }
+        source_filename: { type: string }
+        source_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        thumbnail_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
 
     MediaUpload:
       type: object

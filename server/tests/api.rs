@@ -2410,3 +2410,47 @@ async fn media_source_sha256_lookup() {
     let r = app.call("GET", "/v1/media?source_sha256=nope", None).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn media_replace_keeps_id_and_bumps_playlists() {
+    let app = App::new().await;
+    let g = app.team().await;
+    let folder = app.folder(&g).await;
+    let (media_id, old_sha) = app.media(&g, "video", "video/mp4", b"first-cut").await;
+    let (other, _) = app.media(&g, "video", "video/mp4", b"other").await;
+    let other_name = app.call("GET", &format!("/v1/media/{other}"), None).await.json()["name"].as_str().unwrap().to_string();
+    let r = app
+        .call("POST", "/v1/playlists", Some(json!({ "team_id": g, "name": "P", "items": [{ "kind": "video", "media_id": media_id }] })))
+        .await;
+    let pid = r.json()["id"].as_str().unwrap().to_string();
+
+    let new_sha = hex::encode(Sha256::digest(b"second-cut"));
+    let r = app
+        .call("POST", "/v1/media/uploads", Some(json!({ "folder_id": folder, "name": "Cut.mov", "sha256": new_sha, "size": 10, "mime": "video/quicktime", "replaces": media_id })))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    app.upload(b"second-cut").await;
+
+    let body = |name: &str| json!({ "name": name, "kind": "video", "sha256": new_sha, "mime": "video/quicktime", "duration_ms": 5000 });
+    let r = app.call("POST", &format!("/v1/media/{media_id}/replace"), Some(body(&other_name))).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+
+    let r = app.call("POST", &format!("/v1/media/{media_id}/replace"), Some(body("Cut.mov"))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["id"], media_id.as_str());
+    assert_eq!(r.json()["sha256"], new_sha.as_str());
+    assert_eq!(r.json()["name"], "Cut.mov");
+    assert_eq!(r.json()["size"], 10);
+    assert_eq!(r.json()["duration_ms"], 5000);
+    assert!(r.json().get("width").map_or(true, |w| w.is_null()));
+
+    let r = app.call("HEAD", &format!("/v1/blobs/{old_sha}"), None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = app.call("GET", &format!("/v1/playlists/{pid}"), None).await;
+    assert_eq!(r.json()["version"], 2);
+
+    let r = app
+        .call("POST", "/v1/media/uploads", Some(json!({ "folder_id": app.folder(&app.team().await).await, "name": "x.mov", "sha256": new_sha, "size": 10, "mime": "video/quicktime", "replaces": media_id })))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
