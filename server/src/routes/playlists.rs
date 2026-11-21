@@ -21,13 +21,13 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    group_id: Option<String>,
+    team_id: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct Summary {
     id: String,
-    group_id: String,
+    team_id: String,
     name: String,
     version: i64,
     item_count: i64,
@@ -40,26 +40,26 @@ pub async fn list(
     p: Principal,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Summary>>> {
-    let all = summaries(&s, q.group_id.as_deref()).await?;
-    Ok(Json(all.into_iter().filter(|r| p.can_view(&r.group_id)).collect()))
+    let all = summaries(&s, q.team_id.as_deref()).await?;
+    Ok(Json(all.into_iter().filter(|r| p.can_view(&r.team_id)).collect()))
 }
 
-pub async fn summaries(s: &AppState, group_id: Option<&str>) -> ApiResult<Vec<Summary>> {
+pub async fn summaries(s: &AppState, team_id: Option<&str>) -> ApiResult<Vec<Summary>> {
     let rows: Vec<(String, String, String, i64, i64, i64, String)> = sqlx::query_as(
-        "SELECT p.id, p.group_id, p.name, p.version, json_array_length(p.items),
+        "SELECT p.id, p.team_id, p.name, p.version, json_array_length(p.items),
                 COALESCE((SELECT SUM(m.size) FROM playlist_media pm JOIN media m ON m.id = pm.media_id
                           WHERE pm.playlist_id = p.id), 0),
                 p.updated_at
-         FROM playlists p WHERE (?1 IS NULL OR p.group_id = ?1) ORDER BY p.name",
+         FROM playlists p WHERE (?1 IS NULL OR p.team_id = ?1) ORDER BY p.name",
     )
-    .bind(group_id)
+    .bind(team_id)
     .fetch_all(&s.db)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, group_id, name, version, item_count, total_bytes, updated_at)| Summary {
+        .map(|(id, team_id, name, version, item_count, total_bytes, updated_at)| Summary {
             id,
-            group_id,
+            team_id,
             name,
             version,
             item_count,
@@ -80,7 +80,7 @@ pub async fn fetch(s: &AppState, id: &str) -> ApiResult<Playlist> {
 
 pub async fn get(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Playlist>> {
     let pl = fetch(&s, &id).await?;
-    p.require(&pl.group_id, Role::Viewer)?;
+    p.require(&pl.team_id, Role::Viewer)?;
     Ok(Json(pl))
 }
 
@@ -90,17 +90,17 @@ fn invalid(msg: impl Into<String>) -> ApiError {
 
 async fn validate(
     s: &AppState,
-    group_id: &str,
+    team_id: &str,
     defaults: &PlaylistDefaults,
     items: &mut [PlaylistItem],
     beds: &mut [Bed],
 ) -> ApiResult<()> {
     let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, kind FROM media WHERE group_id = ?").bind(group_id).fetch_all(&s.db).await?;
+        sqlx::query_as("SELECT id, kind FROM media WHERE team_id = ?").bind(team_id).fetch_all(&s.db).await?;
     let media: HashMap<String, String> = rows.into_iter().collect();
     let check = |id: &Uuid, kind: &str| -> ApiResult<()> {
         match media.get(&id.to_string()) {
-            None => Err(invalid(format!("media {id} does not exist in this group"))),
+            None => Err(invalid(format!("media {id} does not exist in this team"))),
             Some(k) if k == kind => Ok(()),
             Some(k) => Err(invalid(format!("media {id} is {k}, expected {kind}"))),
         }
@@ -184,20 +184,20 @@ pub async fn create(
     p: Principal,
     ApiJson(mut input): ApiJson<PlaylistInput>,
 ) -> ApiResult<(StatusCode, Json<Playlist>)> {
-    s.require_group(&p, &input.group_id, Role::Editor).await?;
+    s.require_team(&p, &input.team_id, Role::Editor).await?;
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
     let defaults = input.defaults.take().unwrap_or_default();
-    validate(&s, &input.group_id, &defaults, &mut input.items, &mut input.beds).await?;
+    validate(&s, &input.team_id, &defaults, &mut input.items, &mut input.beds).await?;
     let id = new_id();
     let mut tx = s.db.begin().await?;
     sqlx::query(
-        "INSERT INTO playlists (id, group_id, name, version, loop, defaults, items, beds, updated_at, updated_by)
+        "INSERT INTO playlists (id, team_id, name, version, loop, defaults, items, beds, updated_at, updated_by)
          VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(&input.group_id)
+    .bind(&input.team_id)
     .bind(input.name.trim())
     .bind(input.looping.unwrap_or(true))
     .bind(serde_json::to_string(&defaults)?)
@@ -225,7 +225,7 @@ pub async fn update(
     ApiJson(mut input): ApiJson<PlaylistUpdate>,
 ) -> ApiResult<Json<Playlist>> {
     let current = fetch(&s, &id).await?;
-    p.require(&current.group_id, Role::Editor)?;
+    p.require(&current.team_id, Role::Editor)?;
     let conflict = |cur: &Playlist| -> ApiError {
         let mut e = ApiError::conflict("version_conflict", "playlist was modified; base_version is stale");
         e.current = serde_json::to_value(cur).ok();
@@ -237,7 +237,7 @@ pub async fn update(
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
-    validate(&s, &current.group_id, &input.defaults, &mut input.items, &mut input.beds).await?;
+    validate(&s, &current.team_id, &input.defaults, &mut input.items, &mut input.beds).await?;
 
     let mut tx = s.db.begin().await?;
     let res = sqlx::query(
@@ -269,13 +269,13 @@ pub async fn update(
     }
     tx.commit().await?;
     let updated = fetch(&s, &id).await?;
-    s.notify_screens_for_playlist(&updated.group_id, updated.version).await;
+    s.notify_screens_for_playlist(&updated.team_id, updated.version).await;
     Ok(Json(updated))
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let current = fetch(&s, &id).await?;
-    p.require(&current.group_id, Role::Editor)?;
+    p.require(&current.team_id, Role::Editor)?;
     sqlx::query(
         "UPDATE screens SET override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL \
          WHERE override_playlist_id = ?",
@@ -284,7 +284,7 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
     .execute(&s.db)
     .await?;
     sqlx::query("DELETE FROM playlists WHERE id = ?").bind(&id).execute(&s.db).await?;
-    crate::schedule::notify_group(&s, &current.group_id).await;
-    crate::schedule::broadcast_changed(&s, &current.group_id);
+    crate::schedule::notify_team(&s, &current.team_id).await;
+    crate::schedule::broadcast_changed(&s, &current.team_id);
     Ok(StatusCode::NO_CONTENT)
 }

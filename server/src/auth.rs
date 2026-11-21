@@ -27,8 +27,8 @@ pub enum Role {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Membership {
-    pub group_id: String,
-    pub group_name: String,
+    pub team_id: String,
+    pub team_name: String,
     pub role: Role,
 }
 
@@ -49,23 +49,23 @@ pub struct Principal {
     pub server_admin: bool,
     pub memberships: Vec<Membership>,
     pub screen_id: Option<String>,
-    pub device_group: Option<String>,
+    pub device_team: Option<String>,
 }
 
 impl Principal {
-    pub fn role_in(&self, group_id: &str) -> Option<Role> {
+    pub fn role_in(&self, team_id: &str) -> Option<Role> {
         if self.server_admin {
             return Some(Role::Admin);
         }
-        self.memberships.iter().find(|m| m.group_id == group_id).map(|m| m.role)
+        self.memberships.iter().find(|m| m.team_id == team_id).map(|m| m.role)
     }
 
-    pub fn can_view(&self, group_id: &str) -> bool {
-        self.role_in(group_id).is_some()
+    pub fn can_view(&self, team_id: &str) -> bool {
+        self.role_in(team_id).is_some()
     }
 
-    pub fn require(&self, group_id: &str, min: Role) -> Result<(), ApiError> {
-        match self.role_in(group_id) {
+    pub fn require(&self, team_id: &str, min: Role) -> Result<(), ApiError> {
+        match self.role_in(team_id) {
             None => Err(ApiError::not_found()),
             Some(r) if r >= min => Ok(()),
             Some(_) => Err(ApiError::forbidden()),
@@ -84,7 +84,7 @@ impl Principal {
 #[derive(Clone)]
 pub struct DeviceInfo {
     pub screen_id: String,
-    pub group_id: String,
+    pub team_id: String,
 }
 
 impl<S> FromRequestParts<S> for Principal
@@ -96,8 +96,44 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
         let state = AppState::from_ref(state);
-        let token = bearer(parts).or_else(|| query_token(parts)).ok_or_else(ApiError::unauthorized)?;
-        authenticate(&state, &token).await
+        let p = principal_from_parts(&state, parts).await?;
+        if !p.is_device() {
+            check_organization(&state, parts)?;
+        }
+        Ok(p)
+    }
+}
+
+/// A principal for calls that are not scoped to one org (`/v1/me/organizations` and friends):
+/// `X-Organization` is not checked.
+pub struct Unscoped(pub Principal);
+
+impl<S> FromRequestParts<S> for Unscoped
+where
+    S: Send + Sync,
+    AppState: axum::extract::FromRef<S>,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let state = AppState::from_ref(state);
+        principal_from_parts(&state, parts).await.map(Unscoped)
+    }
+}
+
+pub const ORGANIZATION_HEADER: &str = "x-organization";
+
+async fn principal_from_parts(state: &AppState, parts: &Parts) -> Result<Principal, ApiError> {
+    let token = bearer(parts).or_else(|| query_token(parts)).ok_or_else(ApiError::unauthorized)?;
+    authenticate(state, &token).await
+}
+
+/// A present `X-Organization` header must name this server's org; absent is accepted.
+fn check_organization(state: &AppState, parts: &Parts) -> Result<(), ApiError> {
+    match parts.headers.get(ORGANIZATION_HEADER) {
+        None => Ok(()),
+        Some(v) if v.to_str().is_ok_and(|v| v.trim() == state.org_id()) => Ok(()),
+        Some(_) => Err(ApiError::organization_not_found()),
     }
 }
 
@@ -129,7 +165,7 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
                 server_admin: true,
                 memberships: vec![],
                 screen_id: None,
-                device_group: None,
+                device_team: None,
             });
         }
     }
@@ -140,12 +176,12 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
         Some(d) => Some(d),
         None => {
             let row: Option<(String, String)> =
-                sqlx::query_as("SELECT id, group_id FROM screens WHERE token_hash = ?")
+                sqlx::query_as("SELECT id, team_id FROM screens WHERE token_hash = ?")
                     .bind(&hash)
                     .fetch_optional(&state.db)
                     .await?;
-            row.map(|(screen_id, group_id)| {
-                let d = DeviceInfo { screen_id, group_id };
+            row.map(|(screen_id, team_id)| {
+                let d = DeviceInfo { screen_id, team_id };
                 state.devices.lock().insert(hash.clone(), d.clone());
                 d
             })
@@ -160,7 +196,7 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
             server_admin: false,
             memberships: vec![],
             screen_id: Some(d.screen_id),
-            device_group: Some(d.group_id),
+            device_team: Some(d.team_id),
         });
     }
 
@@ -180,21 +216,21 @@ async fn user_principal(state: &AppState, oidc: &Oidc, claims: &Value) -> Result
         .or_else(|| claims["preferred_username"].as_str())
         .map(String::from);
     let email = claims["email"].as_str().map(String::from);
-    let groups: Vec<String> = match claims.get(&oidc.groups_claim) {
+    let idp_groups: Vec<String> = match claims.get(&oidc.groups_claim) {
         Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
         Some(Value::String(s)) => vec![s.clone()],
         _ => vec![],
     };
-    let server_admin = groups.iter().any(|g| oidc.admin_groups.contains(g));
+    let server_admin = idp_groups.iter().any(|g| oidc.admin_groups.contains(g));
 
     let rows: Vec<(String, String, String)> =
-        sqlx::query_as("SELECT id, name, oidc_bindings FROM groups").fetch_all(&state.db).await?;
+        sqlx::query_as("SELECT id, name, oidc_bindings FROM teams").fetch_all(&state.db).await?;
     let mut memberships = vec![];
     for (id, name, bindings) in rows {
         let bindings: Vec<OidcBinding> = serde_json::from_str(&bindings).unwrap_or_default();
-        let best = bindings.iter().filter(|b| groups.contains(&b.claim_value)).map(|b| b.role).max();
+        let best = bindings.iter().filter(|b| idp_groups.contains(&b.claim_value)).map(|b| b.role).max();
         if let Some(role) = best {
-            memberships.push(Membership { group_id: id, group_name: name, role });
+            memberships.push(Membership { team_id: id, team_name: name, role });
         }
     }
 
@@ -230,7 +266,7 @@ async fn user_principal(state: &AppState, oidc: &Oidc, claims: &Value) -> Result
         server_admin,
         memberships,
         screen_id: None,
-        device_group: None,
+        device_team: None,
     })
 }
 

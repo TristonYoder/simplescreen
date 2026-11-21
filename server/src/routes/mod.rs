@@ -1,8 +1,9 @@
 mod blobs;
 mod device;
 mod floor_plans;
-mod groups;
+mod teams;
 mod media;
+mod org;
 mod pairing;
 mod playlists;
 mod schedule;
@@ -25,8 +26,12 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/info", get(system::info))
         .route("/v1/auth/config", get(system::auth_config))
         .route("/v1/me", get(system::me))
-        .route("/v1/groups", get(groups::list).post(groups::create))
-        .route("/v1/groups/{id}", get(groups::get).put(groups::update).delete(groups::delete))
+        .route("/v1/me/organizations", get(org::mine))
+        .route("/v1/organizations", post(org::create))
+        .route("/v1/invites/{id}/accept", post(org::accept_invite))
+        .route("/v1/settings", get(org::get_settings).patch(org::patch_settings))
+        .route("/v1/teams", get(teams::list).post(teams::create))
+        .route("/v1/teams/{id}", get(teams::get).put(teams::update).delete(teams::delete))
         .route(
             "/v1/blobs/{sha}",
             get(blobs::get).head(blobs::get).put(blobs::put).layer(DefaultBodyLimit::disable()),

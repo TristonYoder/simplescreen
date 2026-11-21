@@ -36,7 +36,7 @@ pub fn to_screen(s: &AppState, row: ScreenRow) -> Screen {
     };
     Screen {
         id: row.id,
-        group_id: row.group_id,
+        team_id: row.team_id,
         name: row.name,
         playlist_id: row.playlist_id,
         override_,
@@ -58,7 +58,7 @@ pub async fn fetch_row(s: &AppState, id: &str) -> ApiResult<ScreenRow> {
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    group_id: Option<String>,
+    team_id: Option<String>,
 }
 
 pub async fn list(
@@ -67,17 +67,17 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Screen>>> {
     let rows: Vec<ScreenRow> = sqlx::query_as(&format!(
-        "SELECT {SCREEN_COLUMNS} FROM screens WHERE (?1 IS NULL OR group_id = ?1) ORDER BY name"
+        "SELECT {SCREEN_COLUMNS} FROM screens WHERE (?1 IS NULL OR team_id = ?1) ORDER BY name"
     ))
-    .bind(&q.group_id)
+    .bind(&q.team_id)
     .fetch_all(&s.db)
     .await?;
-    Ok(Json(rows.into_iter().filter(|r| p.can_view(&r.group_id)).map(|r| to_screen(&s, r)).collect()))
+    Ok(Json(rows.into_iter().filter(|r| p.can_view(&r.team_id)).map(|r| to_screen(&s, r)).collect()))
 }
 
 pub async fn get(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Screen>> {
     let row = fetch_row(&s, &id).await?;
-    p.require(&row.group_id, Role::Viewer)?;
+    p.require(&row.team_id, Role::Viewer)?;
     Ok(Json(to_screen(&s, row)))
 }
 
@@ -88,7 +88,7 @@ pub async fn patch(
     ApiJson(patch): ApiJson<ScreenPatch>,
 ) -> ApiResult<Json<Screen>> {
     let row = fetch_row(&s, &id).await?;
-    p.require(&row.group_id, Role::Editor)?;
+    p.require(&row.team_id, Role::Editor)?;
     if let Some(name) = &patch.name {
         if name.trim().is_empty() {
             return Err(ApiError::bad_request("name must not be empty"));
@@ -111,13 +111,13 @@ async fn set_placement(s: &AppState, row: &ScreenRow, placement: Option<&ScreenP
         if !(0.0..=1.0).contains(&p.x) || !(0.0..=1.0).contains(&p.y) {
             return Err(ApiError::bad_request("placement x and y must be between 0 and 1"));
         }
-        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM floor_plans WHERE id = ? AND group_id = ?")
+        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM floor_plans WHERE id = ? AND team_id = ?")
             .bind(&p.floor_plan_id)
-            .bind(&row.group_id)
+            .bind(&row.team_id)
             .fetch_optional(&s.db)
             .await?;
         if found.is_none() {
-            return Err(ApiError::unprocessable("invalid_floor_plan", "floor plan does not exist in the screen's group"));
+            return Err(ApiError::unprocessable("invalid_floor_plan", "floor plan does not exist in the screen's team"));
         }
     }
     sqlx::query("UPDATE screens SET placement_plan_id = ?, placement_x = ?, placement_y = ? WHERE id = ?")
@@ -132,15 +132,15 @@ async fn set_placement(s: &AppState, row: &ScreenRow, placement: Option<&ScreenP
 
 async fn check_playlist(s: &AppState, row: &ScreenRow, playlist: Option<&str>) -> ApiResult<i64> {
     let Some(pid) = playlist else { return Ok(0) };
-    let found: Option<(i64,)> = sqlx::query_as("SELECT version FROM playlists WHERE id = ? AND group_id = ?")
+    let found: Option<(i64,)> = sqlx::query_as("SELECT version FROM playlists WHERE id = ? AND team_id = ?")
         .bind(pid)
-        .bind(&row.group_id)
+        .bind(&row.team_id)
         .fetch_optional(&s.db)
         .await?;
-    Ok(found.ok_or_else(|| ApiError::unprocessable("invalid_playlist", "playlist does not exist in the screen's group"))?.0)
+    Ok(found.ok_or_else(|| ApiError::unprocessable("invalid_playlist", "playlist does not exist in the screen's team"))?.0)
 }
 
-/// Sets (or with `None` clears) the default playlist from the screen's own group and notifies the device and group users.
+/// Sets (or with `None` clears) the default playlist from the screen's own team and notifies the device and team users.
 pub async fn assign_playlist(s: &AppState, row: &ScreenRow, playlist: Option<&str>) -> ApiResult<()> {
     let version = check_playlist(s, row, playlist).await?;
     sqlx::query("UPDATE screens SET playlist_id = ? WHERE id = ?").bind(playlist).bind(&row.id).execute(&s.db).await?;
@@ -191,7 +191,7 @@ pub async fn set_override(
     ApiJson(input): ApiJson<ScreenOverrideInput>,
 ) -> ApiResult<Json<Screen>> {
     let row = fetch_row(&s, &id).await?;
-    p.require(&row.group_id, Role::Editor)?;
+    p.require(&row.team_id, Role::Editor)?;
     let until = match (input.until, input.until_next_change) {
         (Some(u), _) => Some(u),
         (None, true) => schedule::next_change(&schedule::base_timeline(&s, &row, chrono::Utc::now()).await?),
@@ -203,18 +203,18 @@ pub async fn set_override(
 
 pub async fn clear_override(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Screen>> {
     let row = fetch_row(&s, &id).await?;
-    p.require(&row.group_id, Role::Editor)?;
+    p.require(&row.team_id, Role::Editor)?;
     clear_override_row(&s, &row).await?;
     Ok(Json(to_screen(&s, fetch_row(&s, &id).await?)))
 }
 
 fn broadcast_updated(s: &AppState, row: &ScreenRow) {
-    s.hub.broadcast_group(&row.group_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
+    s.hub.broadcast_team(&row.team_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let row = fetch_row(&s, &id).await?;
-    p.require(&row.group_id, Role::Editor)?;
+    p.require(&row.team_id, Role::Editor)?;
     sqlx::query("DELETE FROM screens WHERE id = ?").bind(&id).execute(&s.db).await?;
     s.forget_device_tokens(&id);
     s.hub.send_device(&id, &json!({ "type": "unpaired" }));
@@ -229,7 +229,7 @@ pub async fn command(
     ApiJson(cmd): ApiJson<ScreenCommand>,
 ) -> ApiResult<StatusCode> {
     let row = fetch_row(&s, &id).await?;
-    p.require(&row.group_id, Role::Editor)?;
+    p.require(&row.team_id, Role::Editor)?;
     if !s.hub.send_device(&id, &json!({ "type": "command", "command": cmd })) {
         return Err(ApiError::conflict("screen_offline", "screen is offline"));
     }

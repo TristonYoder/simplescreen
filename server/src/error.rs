@@ -28,6 +28,12 @@ impl ApiError {
     pub fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", "not found")
     }
+    pub fn organization_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "organization_not_found", "no such organization on this server")
+    }
+    pub fn not_supported(msg: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "not_supported", msg)
+    }
     pub fn bad_request(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "bad_request", msg)
     }

@@ -62,7 +62,7 @@ pub async fn start(State(s): State<AppState>) -> ApiResult<(StatusCode, Json<Ses
 pub struct Claim {
     code: String,
     name: String,
-    group_id: String,
+    team_id: String,
     playlist_id: Option<String>,
 }
 
@@ -71,7 +71,7 @@ pub async fn claim(
     p: Principal,
     ApiJson(input): ApiJson<Claim>,
 ) -> ApiResult<(StatusCode, Json<Screen>)> {
-    s.require_group(&p, &input.group_id, Role::Editor).await?;
+    s.require_team(&p, &input.team_id, Role::Editor).await?;
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
@@ -85,13 +85,13 @@ pub async fn claim(
     .await?;
     let (pairing_id,) = pairing.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "pairing_not_found", "unknown or expired code"))?;
     if let Some(pid) = &input.playlist_id {
-        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM playlists WHERE id = ? AND group_id = ?")
+        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM playlists WHERE id = ? AND team_id = ?")
             .bind(pid)
-            .bind(&input.group_id)
+            .bind(&input.team_id)
             .fetch_optional(&s.db)
             .await?;
         if found.is_none() {
-            return Err(ApiError::unprocessable("invalid_playlist", "playlist does not exist in the group"));
+            return Err(ApiError::unprocessable("invalid_playlist", "playlist does not exist in the team"));
         }
     }
 
@@ -100,10 +100,10 @@ pub async fn claim(
     let created = now();
     let mut tx = s.db.begin().await?;
     sqlx::query(
-        "INSERT INTO screens (id, group_id, name, playlist_id, token_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO screens (id, team_id, name, playlist_id, token_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
     )
     .bind(&screen_id)
-    .bind(&input.group_id)
+    .bind(&input.team_id)
     .bind(input.name.trim())
     .bind(&input.playlist_id)
     .bind(sha256_hex(token.as_bytes()))

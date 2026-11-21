@@ -15,20 +15,20 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    group_id: Option<String>,
+    team_id: Option<String>,
     kind: Option<String>,
 }
 
 pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Media>>> {
     let rows: Vec<Media> = sqlx::query_as(&format!(
-        "SELECT {MEDIA_COLUMNS} FROM media WHERE (?1 IS NULL OR group_id = ?1) AND (?2 IS NULL OR kind = ?2)
+        "SELECT {MEDIA_COLUMNS} FROM media WHERE (?1 IS NULL OR team_id = ?1) AND (?2 IS NULL OR kind = ?2)
          ORDER BY created_at DESC"
     ))
-    .bind(&q.group_id)
+    .bind(&q.team_id)
     .bind(&q.kind)
     .fetch_all(&s.db)
     .await?;
-    Ok(Json(rows.into_iter().filter(|m| p.can_view(&m.group_id)).collect()))
+    Ok(Json(rows.into_iter().filter(|m| p.can_view(&m.team_id)).collect()))
 }
 
 pub async fn fetch(s: &AppState, id: &str) -> ApiResult<Media> {
@@ -41,7 +41,7 @@ pub async fn fetch(s: &AppState, id: &str) -> ApiResult<Media> {
 
 pub async fn get(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Media>> {
     let m = fetch(&s, &id).await?;
-    p.require(&m.group_id, Role::Viewer)?;
+    p.require(&m.team_id, Role::Viewer)?;
     Ok(Json(m))
 }
 
@@ -57,7 +57,7 @@ pub async fn create(
     p: Principal,
     ApiJson(input): ApiJson<MediaInput>,
 ) -> ApiResult<(StatusCode, Json<Media>)> {
-    s.require_group(&p, &input.group_id, Role::Editor).await?;
+    s.require_team(&p, &input.team_id, Role::Editor).await?;
     if input.title.trim().is_empty() || input.mime.trim().is_empty() {
         return Err(ApiError::bad_request("title and mime are required"));
     }
@@ -71,12 +71,12 @@ pub async fn create(
     }
     let id = new_id();
     sqlx::query(
-        "INSERT INTO media (id, group_id, kind, sha256, mime, title, width, height, duration_ms, codec, hdr,
+        "INSERT INTO media (id, team_id, kind, sha256, mime, title, width, height, duration_ms, codec, hdr,
             frame_rate, source_filename, thumbnail_sha256, size, created_by, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(&input.group_id)
+    .bind(&input.team_id)
     .bind(input.kind.as_str())
     .bind(&input.sha256)
     .bind(&input.mime)
@@ -104,7 +104,7 @@ pub async fn patch(
     ApiJson(patch): ApiJson<MediaPatch>,
 ) -> ApiResult<Json<Media>> {
     let m = fetch(&s, &id).await?;
-    p.require(&m.group_id, Role::Editor)?;
+    p.require(&m.team_id, Role::Editor)?;
     if let Some(title) = patch.title {
         if title.trim().is_empty() {
             return Err(ApiError::bad_request("title must not be empty"));
@@ -116,7 +116,7 @@ pub async fn patch(
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let m = fetch(&s, &id).await?;
-    p.require(&m.group_id, Role::Editor)?;
+    p.require(&m.team_id, Role::Editor)?;
     let (refs,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM playlist_media WHERE media_id = ?").bind(&id).fetch_one(&s.db).await?;
     if refs > 0 {

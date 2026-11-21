@@ -18,7 +18,7 @@ type Tx = mpsc::UnboundedSender<Out>;
 
 struct Device {
     conn: u64,
-    group_id: String,
+    team_id: String,
     tx: Tx,
 }
 
@@ -35,13 +35,13 @@ pub struct Hub {
 }
 
 impl Hub {
-    pub fn register_device(&self, screen_id: &str, group_id: &str) -> (u64, mpsc::UnboundedReceiver<Out>) {
+    pub fn register_device(&self, screen_id: &str, team_id: &str) -> (u64, mpsc::UnboundedReceiver<Out>) {
         let conn = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let old = self
             .devices
             .lock()
-            .insert(screen_id.to_string(), Device { conn, group_id: group_id.to_string(), tx });
+            .insert(screen_id.to_string(), Device { conn, team_id: team_id.to_string(), tx });
         if let Some(old) = old {
             let _ = old.tx.send(Out::Close);
         }
@@ -63,7 +63,7 @@ impl Hub {
     }
 
     pub fn online_devices(&self) -> Vec<(String, String)> {
-        self.devices.lock().iter().map(|(k, d)| (k.clone(), d.group_id.clone())).collect()
+        self.devices.lock().iter().map(|(k, d)| (k.clone(), d.team_id.clone())).collect()
     }
 
     pub fn send_device(&self, screen_id: &str, msg: &Value) -> bool {
@@ -90,10 +90,10 @@ impl Hub {
         self.users.lock().remove(&conn);
     }
 
-    pub fn broadcast_group(&self, group_id: &str, msg: &Value) {
+    pub fn broadcast_team(&self, team_id: &str, msg: &Value) {
         let text = msg.to_string();
         for u in self.users.lock().values() {
-            if u.principal.can_view(group_id) {
+            if u.principal.can_view(team_id) {
                 let _ = u.tx.send(Out::Msg(text.clone()));
             }
         }

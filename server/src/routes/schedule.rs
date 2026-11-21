@@ -19,7 +19,7 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct EntryInput {
-    group_id: String,
+    team_id: String,
     playlist_id: Option<String>,
     #[serde(default)]
     title: Option<String>,
@@ -45,8 +45,8 @@ fn yes() -> bool {
 }
 
 #[derive(Deserialize)]
-pub struct GroupQuery {
-    group_id: String,
+pub struct TeamQuery {
+    team_id: String,
 }
 
 #[derive(Serialize)]
@@ -55,10 +55,10 @@ pub struct ScheduleList {
     entries: Vec<Entry>,
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<GroupQuery>) -> ApiResult<Json<ScheduleList>> {
-    s.require_group(&p, &q.group_id, Role::Viewer).await?;
-    let tz = schedule::group_tz(&s, &q.group_id).await?;
-    Ok(Json(ScheduleList { timezone: tz.name().to_string(), entries: schedule::group_entries(&s, &q.group_id).await? }))
+pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<TeamQuery>) -> ApiResult<Json<ScheduleList>> {
+    s.require_team(&p, &q.team_id, Role::Viewer).await?;
+    let tz = s.org_tz();
+    Ok(Json(ScheduleList { timezone: tz.name().to_string(), entries: schedule::team_entries(&s, &q.team_id).await? }))
 }
 
 async fn fetch(s: &AppState, id: &str) -> ApiResult<Entry> {
@@ -72,25 +72,25 @@ async fn fetch(s: &AppState, id: &str) -> ApiResult<Entry> {
 /// Normalizes the input in place: trims the title, drops fields that don't belong to `kind`.
 async fn validate(s: &AppState, input: &mut EntryInput) -> ApiResult<()> {
     if let Some(pid) = &input.playlist_id {
-        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM playlists WHERE id = ? AND group_id = ?")
+        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM playlists WHERE id = ? AND team_id = ?")
             .bind(pid)
-            .bind(&input.group_id)
+            .bind(&input.team_id)
             .fetch_optional(&s.db)
             .await?;
         if found.is_none() {
-            return Err(ApiError::unprocessable("invalid_playlist", "playlist does not exist in the group"));
+            return Err(ApiError::unprocessable("invalid_playlist", "playlist does not exist in the team"));
         }
     }
     let mut seen = HashSet::new();
     input.screen_ids.retain(|id| seen.insert(id.clone()));
     for id in &input.screen_ids {
-        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE id = ? AND group_id = ?")
+        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE id = ? AND team_id = ?")
             .bind(id)
-            .bind(&input.group_id)
+            .bind(&input.team_id)
             .fetch_optional(&s.db)
             .await?;
         if found.is_none() {
-            return Err(invalid("screen_ids must be screens in the group"));
+            return Err(invalid("screen_ids must be screens in the team"));
         }
     }
     input.title = input.title.take().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
@@ -153,9 +153,9 @@ fn kind_name(kind: EntryKind) -> &'static str {
     }
 }
 
-async fn changed(s: &AppState, group_id: &str) {
-    schedule::notify_group(s, group_id).await;
-    schedule::broadcast_changed(s, group_id);
+async fn changed(s: &AppState, team_id: &str) {
+    schedule::notify_team(s, team_id).await;
+    schedule::broadcast_changed(s, team_id);
 }
 
 pub async fn create(
@@ -163,16 +163,16 @@ pub async fn create(
     p: Principal,
     ApiJson(mut input): ApiJson<EntryInput>,
 ) -> ApiResult<(StatusCode, Json<Entry>)> {
-    s.require_group(&p, &input.group_id, Role::Editor).await?;
+    s.require_team(&p, &input.team_id, Role::Editor).await?;
     validate(&s, &mut input).await?;
     let id = new_id();
     let stamp = now();
     sqlx::query(
-        "INSERT INTO schedule_entries (id, group_id, playlist_id, title, screen_ids, kind, enabled, days, start_time, end_time, \
+        "INSERT INTO schedule_entries (id, team_id, playlist_id, title, screen_ids, kind, enabled, days, start_time, end_time, \
          starts_on, ends_on, skip_dates, starts_at, ends_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(&input.group_id)
+    .bind(&input.team_id)
     .bind(&input.playlist_id)
     .bind(&input.title)
     .bind(serde_json::to_string(&input.screen_ids)?)
@@ -190,7 +190,7 @@ pub async fn create(
     .bind(&stamp)
     .execute(&s.db)
     .await?;
-    changed(&s, &input.group_id).await;
+    changed(&s, &input.team_id).await;
     Ok((StatusCode::CREATED, Json(fetch(&s, &id).await?)))
 }
 
@@ -201,9 +201,9 @@ pub async fn update(
     ApiJson(mut input): ApiJson<EntryInput>,
 ) -> ApiResult<Json<Entry>> {
     let current = fetch(&s, &id).await?;
-    p.require(&current.group_id, Role::Editor)?;
-    if input.group_id != current.group_id {
-        return Err(invalid("group_id cannot change"));
+    p.require(&current.team_id, Role::Editor)?;
+    if input.team_id != current.team_id {
+        return Err(invalid("team_id cannot change"));
     }
     validate(&s, &mut input).await?;
     sqlx::query(
@@ -227,21 +227,21 @@ pub async fn update(
     .bind(&id)
     .execute(&s.db)
     .await?;
-    changed(&s, &current.group_id).await;
+    changed(&s, &current.team_id).await;
     Ok(Json(fetch(&s, &id).await?))
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let current = fetch(&s, &id).await?;
-    p.require(&current.group_id, Role::Editor)?;
+    p.require(&current.team_id, Role::Editor)?;
     sqlx::query("DELETE FROM schedule_entries WHERE id = ?").bind(&id).execute(&s.db).await?;
-    changed(&s, &current.group_id).await;
+    changed(&s, &current.team_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
 pub struct TimelineQuery {
-    group_id: String,
+    team_id: String,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 }
@@ -259,14 +259,14 @@ pub struct Timeline {
 }
 
 pub async fn timeline(State(s): State<AppState>, p: Principal, Query(q): Query<TimelineQuery>) -> ApiResult<Json<Timeline>> {
-    s.require_group(&p, &q.group_id, Role::Viewer).await?;
+    s.require_team(&p, &q.team_id, Role::Viewer).await?;
     if q.to <= q.from || q.to - q.from > schedule::MAX_RANGE {
         return Err(ApiError::bad_request("to must be after from and at most 14 days later"));
     }
-    let tz = schedule::group_tz(&s, &q.group_id).await?;
-    let entries = schedule::group_entries(&s, &q.group_id).await?;
-    let rows: Vec<ScreenRow> = sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens WHERE group_id = ? ORDER BY name"))
-        .bind(&q.group_id)
+    let tz = s.org_tz();
+    let entries = schedule::team_entries(&s, &q.team_id).await?;
+    let rows: Vec<ScreenRow> = sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens WHERE team_id = ? ORDER BY name"))
+        .bind(&q.team_id)
         .fetch_all(&s.db)
         .await?;
     let screens = rows

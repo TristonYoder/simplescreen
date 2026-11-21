@@ -28,7 +28,7 @@ async fn device_screen(s: &AppState, p: &Principal) -> ApiResult<ScreenRow> {
 
 pub async fn playlists(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Vec<super::playlists::Summary>>> {
     let screen = device_screen(&s, &p).await?;
-    Ok(Json(super::playlists::summaries(&s, Some(&screen.group_id)).await?))
+    Ok(Json(super::playlists::summaries(&s, Some(&screen.team_id)).await?))
 }
 
 #[derive(Deserialize)]
@@ -72,12 +72,14 @@ pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMa
     }
     let active = timeline.first().and_then(|g| g.playlist_id.as_ref()).and_then(|id| playlists.iter().find(|pl| &pl.id == id));
 
+    let org_name = s.org_name();
     let fingerprint = json!({
         "segments": timeline.iter().enumerate().map(|(i, g)| json!([
             g.playlist_id, g.source, g.entry_id, (i + 1 < timeline.len()).then_some(g.ends_at),
         ])).collect::<Vec<_>>(),
         "playlists": playlists.iter().map(|pl| json!([pl.id, pl.version])).collect::<Vec<_>>(),
         "name": screen.name,
+        "org": org_name,
     });
     let etag = format!("\"{}\"", &sha256_hex(fingerprint.to_string().as_bytes())[..20]);
     let not_modified = headers
@@ -92,8 +94,8 @@ pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMa
     let mut media: Vec<Media> = vec![];
     let mut assets = vec![];
     if !playlists.is_empty() {
-        let all: Vec<Media> = sqlx::query_as(&format!("SELECT {MEDIA_COLUMNS} FROM media WHERE group_id = ?"))
-            .bind(&screen.group_id)
+        let all: Vec<Media> = sqlx::query_as(&format!("SELECT {MEDIA_COLUMNS} FROM media WHERE team_id = ?"))
+            .bind(&screen.team_id)
             .fetch_all(&s.db)
             .await?;
         let by_id: HashMap<String, Media> = all.into_iter().map(|m| (m.id.clone(), m)).collect();
@@ -140,6 +142,8 @@ pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMa
     let mut body = json!({
         "screen_id": screen.id,
         "screen_name": screen.name,
+        "organization_id": s.org_id(),
+        "organization_name": org_name,
         "timeline": timeline,
         "playlists": playlists,
         "media": media,

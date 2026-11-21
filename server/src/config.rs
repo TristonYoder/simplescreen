@@ -15,7 +15,16 @@ pub struct Config {
     pub oidc_admin_groups: Vec<String>,
     pub oidc_token_type: String,
     pub bonjour: bool,
-    pub timezone: String,
+    /// Org display name from `<SLUG>_ORG_NAME`; wins over the stored setting.
+    pub org_name: Option<String>,
+    /// Org IANA zone from `<SLUG>_ORG_TIMEZONE`; wins over the stored setting.
+    pub org_timezone: Option<String>,
+    /// Zone used when neither env nor setup set one: the host zone, else UTC.
+    pub default_timezone: String,
+    /// `unix:/path` listens on a unix socket instead of `bind`:`port`.
+    pub listen: Option<String>,
+    /// Externally reachable base URL (behind a reverse proxy or gateway).
+    pub public_url: Option<String>,
 }
 
 impl Config {
@@ -32,7 +41,11 @@ impl Config {
             oidc_admin_groups: vec![],
             oidc_token_type: "access_token".into(),
             bonjour: true,
-            timezone: iana_time_zone::get_timezone().ok().filter(|t| t.parse::<chrono_tz::Tz>().is_ok()).unwrap_or_else(|| "UTC".into()),
+            org_name: None,
+            org_timezone: None,
+            listen: None,
+            public_url: None,
+            default_timezone: iana_time_zone::get_timezone().ok().filter(|t| t.parse::<chrono_tz::Tz>().is_ok()).unwrap_or_else(|| "UTC".into()),
         }
     }
 
@@ -91,10 +104,24 @@ impl Config {
         if let Some(b) = get("bonjour") {
             cfg.bonjour = matches!(b.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
         }
-        if let Some(t) = get("timezone") {
-            anyhow::ensure!(t.parse::<chrono_tz::Tz>().is_ok(), "invalid timezone {t}");
-            cfg.timezone = t;
+        cfg.org_name = get("org_name").map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
+        if let Some(t) = get("org_timezone") {
+            anyhow::ensure!(t.parse::<chrono_tz::Tz>().is_ok(), "invalid org_timezone {t}");
+            cfg.org_timezone = Some(t);
         }
+        if get("timezone").is_some() {
+            anyhow::bail!(
+                "{prefix}_TIMEZONE was renamed to {prefix}_ORG_TIMEZONE; set only the new variable (the old one is refused, not read)"
+            );
+        }
+        if let Some(l) = get("listen") {
+            anyhow::ensure!(
+                l.strip_prefix("unix:").is_some_and(|p| !p.is_empty()),
+                "listen must be unix:/path (use bind and port for TCP)"
+            );
+            cfg.listen = Some(l);
+        }
+        cfg.public_url = get("public_url").map(|u| u.trim_end_matches('/').to_string());
         Ok(cfg)
     }
 }

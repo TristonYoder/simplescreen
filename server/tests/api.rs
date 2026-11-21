@@ -29,9 +29,14 @@ impl Resp {
 
 impl App {
     async fn new() -> Self {
+        Self::with(|_| {}).await
+    }
+
+    async fn with(tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::defaults(dir.path().to_path_buf());
         cfg.bonjour = false;
+        tweak(&mut cfg);
         let state = build_state(cfg).await.unwrap();
         let token = state.bootstrap.clone().unwrap();
         Self { router: router(state), token, _dir: dir }
@@ -67,8 +72,8 @@ impl App {
         }
     }
 
-    async fn group(&self) -> String {
-        let r = self.call("POST", "/v1/groups", Some(json!({ "name": "Lobby" }))).await;
+    async fn team(&self) -> String {
+        let r = self.call("POST", "/v1/teams", Some(json!({ "name": "Lobby" }))).await;
         assert_eq!(r.status, StatusCode::CREATED);
         r.json()["id"].as_str().unwrap().to_string()
     }
@@ -82,10 +87,10 @@ impl App {
         sha
     }
 
-    async fn media(&self, group: &str, kind: &str, mime: &str, data: &[u8]) -> (String, String) {
+    async fn media(&self, team: &str, kind: &str, mime: &str, data: &[u8]) -> (String, String) {
         let sha = self.upload(data).await;
         let r = self
-            .call("POST", "/v1/media", Some(json!({ "group_id": group, "kind": kind, "sha256": sha, "mime": mime, "title": "t" })))
+            .call("POST", "/v1/media", Some(json!({ "team_id": team, "kind": kind, "sha256": sha, "mime": mime, "title": "t" })))
             .await;
         assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
         (r.json()["id"].as_str().unwrap().to_string(), sha)
@@ -112,20 +117,204 @@ async fn info_and_auth() {
 }
 
 #[tokio::test]
-async fn groups() {
+async fn teams() {
     let app = App::new().await;
-    let r = app.call("POST", "/v1/groups", Some(json!({ "name": "" }))).await;
+    let r = app.call("POST", "/v1/teams", Some(json!({ "name": "" }))).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    let id = app.group().await;
-    let r = app.call("GET", "/v1/groups", None).await;
+    let id = app.team().await;
+    let r = app.call("GET", "/v1/teams", None).await;
     assert_eq!(r.json().as_array().unwrap().len(), 1);
     let r = app
-        .call("PUT", &format!("/v1/groups/{id}"), Some(json!({ "name": "X", "oidc_bindings": [{ "claim_value": "a", "role": "editor" }] })))
+        .call("PUT", &format!("/v1/teams/{id}"), Some(json!({ "name": "X", "oidc_bindings": [{ "claim_value": "a", "role": "editor" }] })))
         .await;
     assert_eq!(r.json()["oidc_bindings"][0]["role"], "editor");
+    assert!(r.json().get("timezone").is_none());
     app.media(&id, "image", "image/png", b"png").await;
-    let r = app.call("DELETE", &format!("/v1/groups/{id}"), None).await;
+    let r = app.call("DELETE", &format!("/v1/teams/{id}"), None).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn first_team_with_sign_in_groups() {
+    let app = App::new().await;
+    let bindings = json!([
+        { "claim_value": "signage-admins", "role": "admin" },
+        { "claim_value": " signage-editors ", "role": "editor" },
+        { "claim_value": "staff", "role": "viewer" },
+    ]);
+    let r = app.call("POST", "/v1/teams", Some(json!({ "name": "Production", "oidc_bindings": bindings }))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let team = r.json();
+    assert_eq!(team["name"], "Production");
+    assert_eq!(team["oidc_bindings"].as_array().unwrap().len(), 3);
+    assert_eq!(team["oidc_bindings"][1]["claim_value"], "signage-editors");
+    assert_eq!(team["oidc_bindings"][0]["role"], "admin");
+
+    let r = app.call("GET", &format!("/v1/teams/{}", team["id"].as_str().unwrap()), None).await;
+    assert_eq!(r.json()["oidc_bindings"][2]["role"], "viewer");
+
+    for bad in [
+        json!([{ "claim_value": "", "role": "editor" }]),
+        json!([{ "claim_value": "a", "role": "editor" }, { "claim_value": "a", "role": "viewer" }]),
+        json!([{ "claim_value": "a", "role": "owner" }]),
+    ] {
+        let r = app.call("POST", "/v1/teams", Some(json!({ "name": "Kids", "oidc_bindings": bad }))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    let r = app.call("GET", "/v1/teams", None).await;
+    assert_eq!(r.json().as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn organizations() {
+    let app = App::new().await;
+    let org_id = app.send("GET", "/v1/info", None, &[], Body::empty(), false).await.json()["server_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = app.call("GET", "/v1/me/organizations", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(
+        r.json(),
+        json!({
+            "organizations": [{ "id": org_id, "name": "Simple Screen", "team_count": 0, "role": "admin" }],
+            "can_create": false,
+            "invites": [],
+        })
+    );
+    let r = app.send("GET", "/v1/me/organizations", None, &[], Body::empty(), false).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+
+    let team = app.team().await;
+    app.team().await;
+    let r = app.call("GET", "/v1/me/organizations", None).await;
+    assert_eq!(r.json()["organizations"][0]["team_count"], 2);
+
+    let r = app
+        .call("POST", "/v1/organizations", Some(json!({ "name": "Grace", "timezone": "UTC", "first_team_name": "Production" })))
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(r.json()["code"], "not_supported");
+    let r = app.call("POST", "/v1/invites/abc/accept", None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    // X-Organization: absent or matching is accepted, a mismatch is organization_not_found.
+    let t = app.token.clone();
+    let r = app.send("GET", "/v1/teams", Some(&t), &[("X-Organization", &org_id)], Body::empty(), false).await;
+    assert_eq!(r.status, StatusCode::OK);
+    for uri in ["/v1/teams", "/v1/me", "/v1/settings", "/v1/ws"] {
+        let r = app.send("GET", uri, Some(&t), &[("X-Organization", "other-org")], Body::empty(), false).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(r.json()["code"], "organization_not_found", "{uri}");
+    }
+    // The org listing itself is never scoped.
+    let r = app.send("GET", "/v1/me/organizations", Some(&t), &[("X-Organization", "other-org")], Body::empty(), false).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    // Devices ignore the header; the manifest names the org.
+    let (_, device) = pair(&app, &team, "Hall", None).await;
+    let r = app.send("GET", "/v1/device/manifest", Some(&device), &[("X-Organization", "other-org")], Body::empty(), false).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["organization_id"], org_id.as_str());
+    assert_eq!(r.json()["organization_name"], "Simple Screen");
+    let etag = r.headers[header::ETAG].to_str().unwrap().to_string();
+    let r = app.call_as(&device, "GET", "/v1/me/organizations", None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    // Renaming the org changes the manifest.
+    app.call("PATCH", "/v1/settings", Some(json!({ "org_name": "Grace Church" }))).await;
+    let r = app.send("GET", "/v1/device/manifest", Some(&device), &[("If-None-Match", &etag)], Body::empty(), false).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["organization_name"], "Grace Church");
+}
+
+#[tokio::test]
+async fn org_settings_first_run() {
+    let app = App::new().await;
+    let r = app.call("GET", "/v1/settings", None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let v = r.json();
+    assert_eq!(v["configured"], false);
+    assert_eq!(v["org_name"], "Simple Screen");
+    assert_eq!(v["locked"], json!([]));
+    assert!(v["timezone"].as_str().unwrap().parse::<chrono_tz::Tz>().is_ok());
+
+    let r = app.call("PATCH", "/v1/settings", Some(json!({ "timezone": "Mars/Base" }))).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json()["code"], "invalid_timezone");
+    let r = app.call("PATCH", "/v1/settings", Some(json!({ "org_name": "  " }))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = app.call("PATCH", "/v1/settings", Some(json!({ "name": "typo" }))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    let r = app
+        .call("PATCH", "/v1/settings", Some(json!({ "org_name": " Grace Church ", "timezone": "America/Chicago" })))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["org_name"], "Grace Church");
+    assert_eq!(r.json()["timezone"], "America/Chicago");
+    assert_eq!(r.json()["configured"], true);
+
+    let team = app.team().await;
+    let r = app.call("GET", &format!("/v1/schedule?team_id={team}"), None).await;
+    assert_eq!(r.json()["timezone"], "America/Chicago");
+    let r = app.call("GET", "/v1/me/organizations", None).await;
+    assert_eq!(r.json()["organizations"][0]["name"], "Grace Church");
+}
+
+#[tokio::test]
+async fn org_settings_from_env_are_locked() {
+    let app = App::with(|c| {
+        c.org_name = Some("Grace Church".into());
+        c.org_timezone = Some("Europe/London".into());
+    })
+    .await;
+    let r = app.call("GET", "/v1/settings", None).await;
+    let v = r.json();
+    assert_eq!(v["org_name"], "Grace Church");
+    assert_eq!(v["timezone"], "Europe/London");
+    assert_eq!(v["configured"], true);
+    assert_eq!(v["locked"], json!(["org_name", "timezone"]));
+    for body in [json!({ "org_name": "Other" }), json!({ "timezone": "UTC" })] {
+        let r = app.call("PATCH", "/v1/settings", Some(body)).await;
+        assert_eq!(r.status, StatusCode::CONFLICT);
+        assert_eq!(r.json()["code"], "setting_locked");
+    }
+}
+
+/// Every operation in api/openapi.yaml is routed: secured ones answer 401 without a token.
+#[tokio::test]
+async fn contract_operations_are_routed() {
+    let spec = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../api/openapi.yaml")).unwrap();
+    let mut ops: Vec<(String, String, bool)> = vec![];
+    let mut path = None;
+    for line in spec.lines() {
+        if line == "components:" {
+            break;
+        }
+        if let Some(p) = line.strip_prefix("  /").and_then(|l| l.strip_suffix(':')) {
+            path = Some(format!("/{p}"));
+        } else if let (Some(p), Some(m)) = (&path, line.strip_prefix("    ").and_then(|l| l.strip_suffix(':'))) {
+            if ["get", "post", "put", "patch", "delete", "head"].contains(&m) {
+                ops.push((m.to_uppercase(), p.clone(), true));
+            }
+        } else if line.trim() == "security: []" {
+            ops.last_mut().unwrap().2 = false;
+        }
+    }
+    assert!(ops.len() > 40, "parsed {} operations", ops.len());
+    let app = App::new().await;
+    let id = "00000000-0000-4000-8000-000000000000";
+    for (method, path, secured) in ops.iter().filter(|o| o.2) {
+        let uri = path
+            .split('/')
+            .map(|seg| if seg.starts_with('{') { if seg == "{sha256}" { "0".repeat(64) } else { id.to_string() } } else { seg.to_string() })
+            .collect::<Vec<_>>()
+            .join("/");
+        let r = app.send(method, &uri, None, &[], Body::empty(), false).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{method} {path} (secured: {secured})");
+    }
 }
 
 #[tokio::test]
@@ -185,11 +374,11 @@ async fn blobs() {
 #[tokio::test]
 async fn media_lifecycle_and_delete_conflict() {
     let app = App::new().await;
-    let g = app.group().await;
+    let g = app.team().await;
 
     let missing = "a".repeat(64);
     let r = app
-        .call("POST", "/v1/media", Some(json!({ "group_id": g, "kind": "video", "sha256": missing, "mime": "video/mp4", "title": "x" })))
+        .call("POST", "/v1/media", Some(json!({ "team_id": g, "kind": "video", "sha256": missing, "mime": "video/mp4", "title": "x" })))
         .await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
 
@@ -199,11 +388,11 @@ async fn media_lifecycle_and_delete_conflict() {
     let r = app.call("PATCH", &format!("/v1/media/{media_id}"), Some(json!({ "title": "Renamed" }))).await;
     assert_eq!(r.json()["title"], "Renamed");
     assert_eq!(r.json()["size"], 11);
-    let r = app.call("GET", &format!("/v1/media?group_id={g}&kind=video"), None).await;
+    let r = app.call("GET", &format!("/v1/media?team_id={g}&kind=video"), None).await;
     assert_eq!(r.json().as_array().unwrap().len(), 1);
 
     let r = app
-        .call("POST", "/v1/playlists", Some(json!({ "group_id": g, "name": "P", "items": [{ "kind": "video", "media_id": media_id }] })))
+        .call("POST", "/v1/playlists", Some(json!({ "team_id": g, "name": "P", "items": [{ "kind": "video", "media_id": media_id }] })))
         .await;
     assert_eq!(r.status, StatusCode::CREATED);
     let pid = r.json()["id"].as_str().unwrap().to_string();
@@ -222,7 +411,7 @@ async fn media_lifecycle_and_delete_conflict() {
 #[tokio::test]
 async fn playlists() {
     let app = App::new().await;
-    let g = app.group().await;
+    let g = app.team().await;
     let (v1, _) = app.media(&g, "video", "video/mp4", b"v1").await;
     let (v2, _) = app.media(&g, "video", "video/mp4", b"v2").await;
     let (img, _) = app.media(&g, "image", "image/png", b"i1").await;
@@ -232,7 +421,7 @@ async fn playlists() {
         .call(
             "POST",
             "/v1/playlists",
-            Some(json!({ "group_id": g, "name": "P", "items": [
+            Some(json!({ "team_id": g, "name": "P", "items": [
                 { "kind": "video", "media_id": v1 },
                 { "kind": "image", "media_id": img },
             ]})),
@@ -289,12 +478,12 @@ async fn playlists() {
     let r = app.call("PUT", &format!("/v1/playlists/{pid}"), Some(update(2, bad_kind, json!([])))).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
 
-    let r = app.call("GET", &format!("/v1/playlists?group_id={g}"), None).await;
+    let r = app.call("GET", &format!("/v1/playlists?team_id={g}"), None).await;
     assert_eq!(r.json()[0]["item_count"], 3);
     assert!(r.json()[0]["total_bytes"].as_i64().unwrap() > 0);
 }
 
-async fn pair(app: &App, group: &str, name: &str, playlist: Option<&str>) -> (String, String) {
+async fn pair(app: &App, team: &str, name: &str, playlist: Option<&str>) -> (String, String) {
     let r = app.send("POST", "/v1/pairing", None, &[], Body::empty(), false).await;
     assert_eq!(r.status, StatusCode::CREATED);
     let s = r.json();
@@ -308,9 +497,9 @@ async fn pair(app: &App, group: &str, name: &str, playlist: Option<&str>) -> (St
     let r = app.send("GET", &format!("{}x", poll), None, &[], Body::empty(), false).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 
-    let r = app.call("POST", "/v1/pairing/claim", Some(json!({ "code": "ZZZZZZ", "name": name, "group_id": group }))).await;
+    let r = app.call("POST", "/v1/pairing/claim", Some(json!({ "code": "ZZZZZZ", "name": name, "team_id": team }))).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    let mut claim = json!({ "code": code.to_lowercase(), "name": name, "group_id": group });
+    let mut claim = json!({ "code": code.to_lowercase(), "name": name, "team_id": team });
     if let Some(p) = playlist {
         claim["playlist_id"] = json!(p);
     }
@@ -334,7 +523,7 @@ async fn pair(app: &App, group: &str, name: &str, playlist: Option<&str>) -> (St
 #[tokio::test]
 async fn pairing_and_manifest() {
     let app = App::new().await;
-    let g = app.group().await;
+    let g = app.team().await;
     let (v1, sha_v1) = app.media(&g, "video", "video/mp4", b"video-1").await;
     let (v2, sha_v2) = app.media(&g, "video", "video/mp4", b"video-2").await;
     let (img, sha_img) = app.media(&g, "image", "image/png", b"image-1").await;
@@ -346,7 +535,7 @@ async fn pairing_and_manifest() {
         .call(
             "POST",
             "/v1/playlists",
-            Some(json!({ "group_id": g, "name": "P", "items": [
+            Some(json!({ "team_id": g, "name": "P", "items": [
                 { "kind": "video", "media_id": v1 },
                 { "kind": "image", "media_id": img },
                 { "kind": "sequence", "pages": [p1, p2] },
@@ -413,16 +602,16 @@ async fn pairing_and_manifest() {
 #[tokio::test]
 async fn device_selects_playlist() {
     let app = App::new().await;
-    let g = app.group().await;
-    let other = app.group().await;
+    let g = app.team().await;
+    let other = app.team().await;
     let (img, _) = app.media(&g, "image", "image/png", b"img").await;
-    let mk = |group: &str, name: &str| json!({ "group_id": group, "name": name, "items": [{ "kind": "image", "media_id": img }] });
+    let mk = |team: &str, name: &str| json!({ "team_id": team, "name": name, "items": [{ "kind": "image", "media_id": img }] });
     let a = app.call("POST", "/v1/playlists", Some(mk(&g, "A"))).await.json()["id"].as_str().unwrap().to_string();
-    let b = app.call("POST", "/v1/playlists", Some(json!({ "group_id": g, "name": "B", "items": [] }))).await.json()["id"]
+    let b = app.call("POST", "/v1/playlists", Some(json!({ "team_id": g, "name": "B", "items": [] }))).await.json()["id"]
         .as_str()
         .unwrap()
         .to_string();
-    let foreign = app.call("POST", "/v1/playlists", Some(json!({ "group_id": other, "name": "X", "items": [] }))).await.json()
+    let foreign = app.call("POST", "/v1/playlists", Some(json!({ "team_id": other, "name": "X", "items": [] }))).await.json()
         ["id"]
         .as_str()
         .unwrap()
@@ -461,15 +650,13 @@ async fn device_selects_playlist() {
 async fn schedule_resolves_events_weekly_and_overrides() {
     use chrono::{DateTime, Duration, Timelike, Utc};
     let app = App::new().await;
-    let g = app.group().await;
-    let r = app.call("PUT", &format!("/v1/groups/{g}"), Some(json!({ "name": "Lobby", "timezone": "Mars/Base" }))).await;
-    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
-    let r = app.call("PUT", &format!("/v1/groups/{g}"), Some(json!({ "name": "Lobby", "timezone": "UTC" }))).await;
+    let g = app.team().await;
+    let r = app.call("PATCH", "/v1/settings", Some(json!({ "timezone": "UTC" }))).await;
     assert_eq!(r.json()["timezone"], "UTC");
 
     let (img, _) = app.media(&g, "image", "image/png", b"one").await;
     let (img2, sha2) = app.media(&g, "image", "image/png", b"two").await;
-    let mk = |name: &str, m: &str| json!({ "group_id": g, "name": name, "items": [{ "kind": "image", "media_id": m }] });
+    let mk = |name: &str, m: &str| json!({ "team_id": g, "name": name, "items": [{ "kind": "image", "media_id": m }] });
     let id = |r: Resp| r.json()["id"].as_str().unwrap().to_string();
     let a = id(app.call("POST", "/v1/playlists", Some(mk("A", &img))).await);
     let b = id(app.call("POST", "/v1/playlists", Some(mk("B", &img))).await);
@@ -481,11 +668,11 @@ async fn schedule_resolves_events_weekly_and_overrides() {
     let clock = |d: DateTime<Utc>| d.format("%H:%M").to_string();
 
     let bad = app
-        .call("POST", "/v1/schedule", Some(json!({ "group_id": g, "playlist_id": b, "kind": "once", "starts_at": local(now), "ends_at": local(now) })))
+        .call("POST", "/v1/schedule", Some(json!({ "team_id": g, "playlist_id": b, "kind": "once", "starts_at": local(now), "ends_at": local(now) })))
         .await;
     assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
     let bad = app
-        .call("POST", "/v1/schedule", Some(json!({ "group_id": g, "playlist_id": b, "kind": "weekly", "days": [], "start_time": "07:00", "end_time": "08:00" })))
+        .call("POST", "/v1/schedule", Some(json!({ "team_id": g, "playlist_id": b, "kind": "weekly", "days": [], "start_time": "07:00", "end_time": "08:00" })))
         .await;
     assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
 
@@ -494,7 +681,7 @@ async fn schedule_resolves_events_weekly_and_overrides() {
         .call(
             "POST",
             "/v1/schedule",
-            Some(json!({ "group_id": g, "playlist_id": b, "kind": "once", "title": "Launch", "starts_at": local(now - Duration::hours(1)), "ends_at": local(event_end) })),
+            Some(json!({ "team_id": g, "playlist_id": b, "kind": "once", "title": "Launch", "starts_at": local(now - Duration::hours(1)), "ends_at": local(event_end) })),
         )
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
@@ -503,13 +690,13 @@ async fn schedule_resolves_events_weekly_and_overrides() {
         .call(
             "POST",
             "/v1/schedule",
-            Some(json!({ "group_id": g, "playlist_id": c, "kind": "weekly", "days": [1,2,3,4,5,6,7], "screen_ids": [screen],
+            Some(json!({ "team_id": g, "playlist_id": c, "kind": "weekly", "days": [1,2,3,4,5,6,7], "screen_ids": [screen],
                          "start_time": clock(now + Duration::hours(3)), "end_time": clock(now + Duration::hours(4)) })),
         )
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
 
-    let r = app.call("GET", &format!("/v1/schedule?group_id={g}"), None).await;
+    let r = app.call("GET", &format!("/v1/schedule?team_id={g}"), None).await;
     assert_eq!(r.json()["timezone"], "UTC");
     assert_eq!(r.json()["entries"].as_array().unwrap().len(), 2);
 
@@ -530,7 +717,7 @@ async fn schedule_resolves_events_weekly_and_overrides() {
     let from = Utc::now().to_rfc3339();
     let to = (Utc::now() + Duration::hours(6)).to_rfc3339();
     let r = app
-        .call("GET", &format!("/v1/schedule/timeline?group_id={g}&from={}&to={}", from.replace('+', "%2B"), to.replace('+', "%2B")), None)
+        .call("GET", &format!("/v1/schedule/timeline?team_id={g}&from={}&to={}", from.replace('+', "%2B"), to.replace('+', "%2B")), None)
         .await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(r.json()["screens"][0]["segments"][0]["playlist_id"], b);
@@ -555,29 +742,29 @@ async fn schedule_resolves_events_weekly_and_overrides() {
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     let r = app.call("DELETE", &format!("/v1/playlists/{c}"), None).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
-    let r = app.call("GET", &format!("/v1/schedule?group_id={g}"), None).await;
+    let r = app.call("GET", &format!("/v1/schedule?team_id={g}"), None).await;
     assert_eq!(r.json()["entries"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
 async fn floor_plans_and_placement() {
     let app = App::new().await;
-    let g = app.group().await;
+    let g = app.team().await;
     let (screen, _) = pair(&app, &g, "Hall", None).await;
 
     let missing = "0".repeat(64);
-    let r = app.call("POST", "/v1/floor-plans", Some(json!({ "group_id": g, "name": "Ground", "image_sha256": missing }))).await;
+    let r = app.call("POST", "/v1/floor-plans", Some(json!({ "team_id": g, "name": "Ground", "image_sha256": missing }))).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     let sha = app.upload(b"map").await;
     let r = app
-        .call("POST", "/v1/floor-plans", Some(json!({ "group_id": g, "name": " Ground ", "image_sha256": sha, "image_width": 1600, "image_height": 900 })))
+        .call("POST", "/v1/floor-plans", Some(json!({ "team_id": g, "name": " Ground ", "image_sha256": sha, "image_width": 1600, "image_height": 900 })))
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
     let plan = r.json();
     assert_eq!(plan["name"], "Ground");
     assert_eq!(plan["position"], 0);
     let plan_id = plan["id"].as_str().unwrap().to_string();
-    let r = app.call("POST", "/v1/floor-plans", Some(json!({ "group_id": g, "name": "Upstairs" }))).await;
+    let r = app.call("POST", "/v1/floor-plans", Some(json!({ "team_id": g, "name": "Upstairs" }))).await;
     assert_eq!(r.json()["position"], 1);
 
     let r = app.call("PATCH", &format!("/v1/screens/{screen}"), Some(json!({ "placement": { "floor_plan_id": plan_id, "x": 1.5, "y": 0.2 } }))).await;
@@ -586,12 +773,12 @@ async fn floor_plans_and_placement() {
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(r.json()["placement"]["x"], 0.25);
 
-    let r = app.call("PUT", &format!("/v1/floor-plans/{plan_id}"), Some(json!({ "group_id": g, "name": "Lobby floor", "image_sha256": null }))).await;
+    let r = app.call("PUT", &format!("/v1/floor-plans/{plan_id}"), Some(json!({ "team_id": g, "name": "Lobby floor", "image_sha256": null }))).await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(r.json().get("image_sha256").is_none());
     assert_eq!(r.json()["position"], 0);
 
-    let r = app.call("GET", &format!("/v1/floor-plans?group_id={g}"), None).await;
+    let r = app.call("GET", &format!("/v1/floor-plans?team_id={g}"), None).await;
     assert_eq!(r.json().as_array().unwrap().len(), 2);
 
     let r = app.call("DELETE", &format!("/v1/floor-plans/{plan_id}"), None).await;

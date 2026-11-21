@@ -37,10 +37,10 @@ struct ClientMessage {
 }
 
 async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
-    let (Some(screen_id), Some(group_id)) = (p.screen_id.clone(), p.device_group.clone()) else { return };
-    let (conn, mut rx) = s.hub.register_device(&screen_id, &group_id);
+    let (Some(screen_id), Some(team_id)) = (p.screen_id.clone(), p.device_team.clone()) else { return };
+    let (conn, mut rx) = s.hub.register_device(&screen_id, &team_id);
     touch_last_seen(&s, &screen_id).await;
-    s.hub.broadcast_group(&group_id, &json!({ "type": "screen_online", "screen_id": screen_id }));
+    s.hub.broadcast_team(&team_id, &json!({ "type": "screen_online", "screen_id": screen_id }));
     let hello = json!({ "type": "hello", "server_id": s.server_id }).to_string();
     let mut alive = sock.send(Message::Text(hello.into())).await.is_ok();
 
@@ -63,7 +63,7 @@ async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
                         if let Some(mut status) = m.status {
                             status.updated_at = Some(now());
                             s.statuses.lock().insert(screen_id.clone(), status.clone());
-                            s.hub.broadcast_group(&group_id, &json!({
+                            s.hub.broadcast_team(&team_id, &json!({
                                 "type": "screen_status", "screen_id": screen_id, "status": status,
                             }));
                             if last_write.elapsed() > Duration::from_secs(30) {
@@ -87,7 +87,7 @@ async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
     if s.hub.unregister_device(&screen_id, conn) {
         s.statuses.lock().remove(&screen_id);
         touch_last_seen(&s, &screen_id).await;
-        s.hub.broadcast_group(&group_id, &json!({ "type": "screen_offline", "screen_id": screen_id }));
+        s.hub.broadcast_team(&team_id, &json!({ "type": "screen_offline", "screen_id": screen_id }));
     }
 }
 
@@ -103,8 +103,8 @@ async fn user_socket(s: AppState, p: Principal, mut sock: WebSocket) {
     let (conn, mut rx) = s.hub.register_user(p.clone());
     let hello = json!({ "type": "hello", "server_id": s.server_id }).to_string();
     let mut alive = sock.send(Message::Text(hello.into())).await.is_ok();
-    for (screen_id, group_id) in s.hub.online_devices() {
-        if !alive || !p.can_view(&group_id) {
+    for (screen_id, team_id) in s.hub.online_devices() {
+        if !alive || !p.can_view(&team_id) {
             continue;
         }
         let mut msgs = vec![json!({ "type": "screen_online", "screen_id": screen_id })];

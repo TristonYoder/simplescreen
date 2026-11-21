@@ -38,7 +38,7 @@ impl MediaKind {
 
 #[derive(Deserialize)]
 pub struct MediaInput {
-    pub group_id: String,
+    pub team_id: String,
     pub kind: MediaKind,
     pub sha256: String,
     pub mime: String,
@@ -61,7 +61,7 @@ pub struct MediaPatch {
 #[derive(Serialize, FromRow, Clone, Debug)]
 pub struct Media {
     pub id: String,
-    pub group_id: String,
+    pub team_id: String,
     pub kind: String,
     pub sha256: String,
     pub mime: String,
@@ -79,7 +79,7 @@ pub struct Media {
     pub created_at: String,
 }
 
-pub const MEDIA_COLUMNS: &str = "id, group_id, kind, sha256, mime, title, width, height, duration_ms, codec, hdr, frame_rate, source_filename, thumbnail_sha256, size, created_by, created_at";
+pub const MEDIA_COLUMNS: &str = "id, team_id, kind, sha256, mime, title, width, height, duration_ms, codec, hdr, frame_rate, source_filename, thumbnail_sha256, size, created_by, created_at";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -233,7 +233,7 @@ pub struct Bed {
 
 #[derive(Deserialize)]
 pub struct PlaylistInput {
-    pub group_id: String,
+    pub team_id: String,
     pub name: String,
     #[serde(rename = "loop")]
     pub looping: Option<bool>,
@@ -258,7 +258,7 @@ pub struct PlaylistUpdate {
 #[derive(Serialize, Clone, Debug)]
 pub struct Playlist {
     pub id: String,
-    pub group_id: String,
+    pub team_id: String,
     pub name: String,
     pub version: i64,
     #[serde(rename = "loop")]
@@ -274,7 +274,7 @@ pub struct Playlist {
 #[derive(FromRow)]
 pub struct PlaylistRow {
     pub id: String,
-    pub group_id: String,
+    pub team_id: String,
     pub name: String,
     pub version: i64,
     #[sqlx(rename = "loop")]
@@ -287,13 +287,13 @@ pub struct PlaylistRow {
 }
 
 pub const PLAYLIST_COLUMNS: &str =
-    "id, group_id, name, version, loop, defaults, items, beds, updated_at, updated_by";
+    "id, team_id, name, version, loop, defaults, items, beds, updated_at, updated_by";
 
 impl PlaylistRow {
     pub fn into_playlist(self) -> Result<Playlist, serde_json::Error> {
         Ok(Playlist {
             id: self.id,
-            group_id: self.group_id,
+            team_id: self.team_id,
             name: self.name,
             version: self.version,
             looping: self.looping,
@@ -372,7 +372,7 @@ impl ScreenStatus {
 #[derive(Serialize)]
 pub struct Screen {
     pub id: String,
-    pub group_id: String,
+    pub team_id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub playlist_id: Option<String>,
@@ -390,7 +390,7 @@ pub struct Screen {
 #[derive(FromRow)]
 pub struct ScreenRow {
     pub id: String,
-    pub group_id: String,
+    pub team_id: String,
     pub name: String,
     pub playlist_id: Option<String>,
     pub last_seen_at: Option<String>,
@@ -411,7 +411,7 @@ pub struct ScreenPlacement {
     pub y: f64,
 }
 
-pub const SCREEN_COLUMNS: &str = "id, group_id, name, playlist_id, last_seen_at, created_at, \
+pub const SCREEN_COLUMNS: &str = "id, team_id, name, playlist_id, last_seen_at, created_at, \
      override_set, override_playlist_id, override_until, override_set_at, placement_plan_id, placement_x, placement_y";
 
 #[derive(Serialize, Clone, Debug)]

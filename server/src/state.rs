@@ -28,6 +28,16 @@ pub struct Inner {
     pub statuses: Mutex<HashMap<String, ScreenStatus>>,
     pub shutdown: watch::Sender<bool>,
     pub schedule_wake: Notify,
+    pub org: Mutex<StoredOrg>,
+    /// Serializes `PATCH /v1/settings` across the read, the write, and the in-memory update.
+    pub settings_write: tokio::sync::Mutex<()>,
+}
+
+/// Org settings written by first-run setup (`PATCH /v1/settings`); env vars win over these.
+#[derive(Clone, Default)]
+pub struct StoredOrg {
+    pub name: Option<String>,
+    pub timezone: Option<String>,
 }
 
 #[derive(Clone)]
@@ -49,21 +59,49 @@ impl AppState {
         self.cfg.data_dir.join("tmp")
     }
 
-    pub async fn require_group(&self, p: &Principal, group_id: &str, min: Role) -> Result<(), ApiError> {
-        p.require(group_id, min)?;
+    pub async fn require_team(&self, p: &Principal, team_id: &str, min: Role) -> Result<(), ApiError> {
+        p.require(team_id, min)?;
         let found: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM groups WHERE id = ?").bind(group_id).fetch_optional(&self.db).await?;
+            sqlx::query_as("SELECT id FROM teams WHERE id = ?").bind(team_id).fetch_optional(&self.db).await?;
         found.map(|_| ()).ok_or_else(ApiError::not_found)
+    }
+
+    /// The org's id: this installation's `server_id`.
+    pub fn org_id(&self) -> &str {
+        &self.server_id
+    }
+
+    pub fn org_name(&self) -> String {
+        self.cfg
+            .org_name
+            .clone()
+            .or_else(|| self.org.lock().name.clone())
+            .unwrap_or_else(|| crate::BRAND_NAME.to_string())
+    }
+
+    /// Whether the org name has been set by env or setup.
+    pub fn org_configured(&self) -> bool {
+        self.cfg.org_name.is_some() || self.org.lock().name.is_some()
+    }
+
+    pub fn org_tz(&self) -> chrono_tz::Tz {
+        self.cfg
+            .org_timezone
+            .clone()
+            .or_else(|| self.org.lock().timezone.clone())
+            .and_then(|t| t.parse().ok())
+            .or_else(|| self.cfg.default_timezone.parse().ok())
+            .unwrap_or(chrono_tz::Tz::UTC)
     }
 
     pub fn forget_device_tokens(&self, screen_id: &str) {
         self.devices.lock().retain(|_, d| d.screen_id != screen_id);
     }
 
-    /// Notifies every screen in the group; devices refetch with If-None-Match.
-    pub async fn notify_screens_for_playlist(&self, group_id: &str, version: i64) {
-        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE group_id = ?")
-            .bind(group_id)
+    /// Notifies every screen in the team; devices refetch with If-None-Match.
+    pub async fn notify_screens_for_playlist(&self, team_id: &str, version: i64) {
+        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE team_id = ?")
+            .bind(team_id)
             .fetch_all(&self.db)
             .await
             .unwrap_or_default();
@@ -109,6 +147,16 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         }
     };
 
+    let stored: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, value FROM settings WHERE key IN ('org_name', 'org_timezone')").fetch_all(&db).await?;
+    let mut org = StoredOrg::default();
+    for (k, v) in stored {
+        match k.as_str() {
+            "org_name" => org.name = Some(v),
+            _ => org.timezone = Some(v),
+        }
+    }
+
     let oidc = cfg.oidc_issuer.clone().map(|issuer| {
         Oidc::new(
             issuer,
@@ -141,6 +189,8 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         statuses: Mutex::default(),
         shutdown,
         schedule_wake: Notify::new(),
+        org: Mutex::new(org),
+        settings_write: tokio::sync::Mutex::new(()),
     })))
 }
 
@@ -159,9 +209,12 @@ fn load_or_create_bootstrap(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql"), include_str!("../migrations/0002_schedule.sql"),
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_schedule.sql"),
     include_str!("../migrations/0003_skip_dates.sql"),
     include_str!("../migrations/0004_floor_plans.sql"),
+    include_str!("../migrations/0005_teams.sql"),
 ];
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
