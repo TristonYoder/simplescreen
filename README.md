@@ -34,7 +34,9 @@ Environment variables (or a TOML file via `SIMPLESCREEN_CONFIG` using the same k
 | `SIMPLESCREEN_LISTEN` | | `unix:/path/to.sock` listens on a unix socket instead of `BIND`:`PORT` (no Bonjour) |
 | `SIMPLESCREEN_PUBLIC_URL` | | externally reachable base URL when behind a reverse proxy; reported in `/v1/info` |
 
-The server is one organization. Its name and timezone come from the env vars above when set (then Studio shows them as locked), otherwise from first-run setup in Studio (`PATCH /v1/settings`, server admin). People belong to **Teams**; a team's `oidc_bindings` map sign-in groups (the IdP groups claim) to viewer, editor or admin. Server admins (`OIDC_ADMIN_GROUPS` or the bootstrap token) manage teams and settings.
+The server is one organization. Its name and timezone come from the env vars above when set (then Studio shows them as locked), otherwise from first-run setup in Studio (`PATCH /v1/settings`, server admin). People belong to **Teams**; a team's `oidc_bindings` map sign-in groups (the IdP groups claim) to viewer, editor or admin. Server admins (`OIDC_ADMIN_GROUPS` or the bootstrap token) manage teams and settings. Screens, devices and floor plans belong to the organization; teams own content. Server admins tag screens and give each team the tags it reaches, and a team's playlists show on a screen only when they share a tag with it. An untagged screen plays nothing until an admin tags it.
+
+Upgrading to this release drops existing screens, devices and schedules: re-pair every device after the upgrade.
 
 ## NixOS
 
