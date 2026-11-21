@@ -64,15 +64,24 @@ pub struct ObjectInfo {
 }
 
 impl ObjectInfo {
-    /// SHA-256 (hex) of the whole object, if known.
+    /// SHA-256 (hex) of the whole object, if known. The metadata wins: some stores report a
+    /// joined object's composite checksum without the `-<parts>` suffix.
     pub fn sha(&self) -> Option<String> {
-        let full = self
-            .checksum
-            .as_deref()
-            .and_then(|c| base64::engine::general_purpose::STANDARD.decode(c).ok())
-            .filter(|b| b.len() == 32)
-            .map(hex::encode);
-        full.or_else(|| self.meta_sha.clone())
+        self.meta_sha.clone().or_else(|| {
+            self.checksum
+                .as_deref()
+                .and_then(|c| base64::engine::general_purpose::STANDARD.decode(c).ok())
+                .filter(|b| b.len() == 32)
+                .map(hex::encode)
+        })
+    }
+
+    /// Whether the reported checksum (if any) is this composite, with or without its `-<parts>` suffix.
+    pub fn matches_composite(&self, composite: &str) -> bool {
+        match self.checksum.as_deref() {
+            None => true,
+            Some(c) => c == composite || composite.split_once('-').is_some_and(|(hash, _)| hash == c),
+        }
     }
 }
 
@@ -639,5 +648,24 @@ impl Backend {
         .await;
         let _ = tokio::fs::remove_file(&tmp).await;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composite_checksums_with_or_without_part_count() {
+        let parts = vec!["ab".repeat(32), "cd".repeat(32)];
+        let composite = composite_checksum(&parts).unwrap();
+        let (hash, count) = composite.split_once('-').unwrap();
+        assert_eq!(count, "2");
+        let info = |checksum: Option<&str>| ObjectInfo { size: 1, checksum: checksum.map(String::from), meta_sha: Some("ef".repeat(32)) };
+        assert!(info(Some(&composite)).matches_composite(&composite));
+        assert!(info(Some(hash)).matches_composite(&composite));
+        assert!(info(None).matches_composite(&composite));
+        assert!(!info(Some("AAAA")).matches_composite(&composite));
+        assert_eq!(info(Some(hash)).sha(), Some("ef".repeat(32)), "metadata wins over a bare composite");
     }
 }

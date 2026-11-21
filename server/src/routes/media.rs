@@ -300,7 +300,7 @@ pub async fn complete_upload(
     b.complete_multipart(&row.path, &row.s3_upload_id, &parts).await?;
     let info = b.head_info(&row.path).await?.ok_or_else(|| ApiError::unprocessable("upload_incomplete", "the joined file is not in S3"))?;
     let composite = composite_checksum(&shas)?;
-    let checksum_ok = info.checksum.as_deref().is_none_or(|c| c == composite);
+    let checksum_ok = info.matches_composite(&composite);
     if info.size != row.size || !checksum_ok {
         b.delete(&row.path).await?;
         sqlx::query("DELETE FROM media_uploads WHERE id = ?").bind(&row.id).execute(&s.db).await?;
