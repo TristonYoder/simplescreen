@@ -109,9 +109,9 @@ impl Config {
             anyhow::ensure!(t.parse::<chrono_tz::Tz>().is_ok(), "invalid org_timezone {t}");
             cfg.org_timezone = Some(t);
         }
-        if get("timezone").is_some() && cfg.org_timezone.is_none() {
+        if get("timezone").is_some() {
             anyhow::bail!(
-                "{prefix}_TIMEZONE was renamed to {prefix}_ORG_TIMEZONE; set the new variable (the old one is no longer read)"
+                "{prefix}_TIMEZONE was renamed to {prefix}_ORG_TIMEZONE; set only the new variable (the old one is refused, not read)"
             );
         }
         if let Some(l) = get("listen") {
