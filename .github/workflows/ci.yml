@@ -55,17 +55,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Enable KVM
-        id: kvm
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm || true
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "KVM is not usable on this runner; NixOS VM tests will be skipped"
-          fi
 
       - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
         with:
@@ -73,6 +66,19 @@ jobs:
           extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
 
       - uses: DeterminateSystems/magic-nix-cache-action@8a218f9e264e9c3803c9a1ee1c30d8e4ab55be63 # v2
+
+      - name: Check KVM
+        id: kvm
+        run: |
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm 2>/dev/null || true
+          fi
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "KVM is not usable on this runner; NixOS VM tests will be skipped"
+          fi
 
       - name: nix build .#server
         run: nix build .#packages.${{ matrix.system }}.server -L --no-link
