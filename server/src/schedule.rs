@@ -346,22 +346,22 @@ pub async fn base_timeline(s: &AppState, row: &ScreenRow, now: DateTime<Utc>) ->
 }
 
 pub async fn notify_team(s: &AppState, team_id: &str) {
-    let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE team_id = ?")
+    let ids: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, node_id FROM screens WHERE team_id = ?")
         .bind(team_id)
         .fetch_all(&s.db)
         .await
         .unwrap_or_default();
-    for (id,) in ids {
-        s.notify_manifest(&id, 0);
+    for (id, node_id) in ids {
+        s.notify_manifest(node_id.as_deref(), &id, 0);
     }
     s.schedule_wake.notify_one();
 }
 
 /// Re-resolves every schedule (after an org timezone change): devices refetch, user sockets reload.
 pub async fn notify_all(s: &AppState) {
-    let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens").fetch_all(&s.db).await.unwrap_or_default();
-    for (id,) in ids {
-        s.notify_manifest(&id, 0);
+    let ids: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, node_id FROM screens").fetch_all(&s.db).await.unwrap_or_default();
+    for (id, node_id) in ids {
+        s.notify_manifest(node_id.as_deref(), &id, 0);
     }
     let teams: Vec<(String,)> = sqlx::query_as("SELECT id FROM teams").fetch_all(&s.db).await.unwrap_or_default();
     for (id,) in teams {
@@ -433,7 +433,7 @@ async fn tick(
         let current = segs.first().and_then(|g| g.playlist_id.clone());
         if let Some(previous) = active.insert(row.id.clone(), current.clone()) {
             if previous != current {
-                s.notify_manifest(&row.id, 0);
+                s.notify_manifest(row.node_id.as_deref(), &row.id, 0);
                 s.hub.broadcast_team(&row.team_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
             }
         }

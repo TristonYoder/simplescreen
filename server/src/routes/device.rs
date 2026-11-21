@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -13,26 +13,67 @@ use serde_json::json;
 use crate::{
     auth::Principal,
     error::{ApiError, ApiJson, ApiResult},
-    models::{ItemKind, Media, Playlist, ScreenRow, MEDIA_COLUMNS},
+    models::{ItemKind, Media, Output, Playlist, Screen, ScreenRow, MEDIA_COLUMNS, SCREEN_COLUMNS},
     schedule,
     state::AppState,
-    util::sha256_hex,
+    util::{new_id, now, sha256_hex},
 };
 
-async fn device_screen(s: &AppState, p: &Principal) -> ApiResult<ScreenRow> {
-    match (&p.screen_id, p.is_device()) {
-        (Some(id), true) => super::screens::fetch_row(s, id).await.map_err(|_| ApiError::unauthorized()),
+pub(super) fn device_node(p: &Principal) -> ApiResult<&str> {
+    match (&p.node_id, p.is_device()) {
+        (Some(id), true) => Ok(id),
         _ => Err(ApiError::unauthorized()),
     }
 }
 
-pub async fn playlists(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Vec<super::playlists::Summary>>> {
-    let screen = device_screen(&s, &p).await?;
+/// The screen a device call is about. An explicit `screen_id` must belong to the node (404 otherwise);
+/// without one, the node's only screen is used, so single-screen devices need no changes.
+async fn device_screen(s: &AppState, p: &Principal, explicit: Option<&str>) -> ApiResult<ScreenRow> {
+    let node_id = device_node(p)?;
+    if let Some(id) = explicit {
+        let row = super::screens::fetch_row(s, id).await?;
+        return if row.node_id.as_deref() == Some(node_id) { Ok(row) } else { Err(ApiError::not_found()) };
+    }
+    let mut rows: Vec<ScreenRow> =
+        sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens WHERE node_id = ? LIMIT 2")).bind(node_id).fetch_all(&s.db).await?;
+    if rows.len() == 1 {
+        Ok(rows.remove(0))
+    } else {
+        Err(ApiError::unprocessable("screen_id_required", "screen_id is required unless the node has exactly one screen"))
+    }
+}
+
+/// Like `device_screen`, but a screen this node holds a control assignment on is accepted too
+/// (remote playlist choice). Confidence-only targets are 403; unrelated screens are 404.
+async fn controlled_screen(s: &AppState, p: &Principal, explicit: Option<&str>) -> ApiResult<ScreenRow> {
+    let node_id = device_node(p)?;
+    if let Some(id) = explicit {
+        let row = super::screens::fetch_row(s, id).await?;
+        if row.node_id.as_deref() == Some(node_id) || crate::assignments::targets(s, node_id, id, false).await? {
+            return Ok(row);
+        }
+        return Err(if crate::assignments::targets(s, node_id, id, true).await? { ApiError::forbidden() } else { ApiError::not_found() });
+    }
+    device_screen(s, p, None).await
+}
+
+#[derive(Deserialize)]
+pub struct ScreenQuery {
+    screen_id: Option<String>,
+}
+
+pub async fn playlists(
+    State(s): State<AppState>,
+    p: Principal,
+    Query(q): Query<ScreenQuery>,
+) -> ApiResult<Json<Vec<super::playlists::Summary>>> {
+    let screen = controlled_screen(&s, &p, q.screen_id.as_deref()).await?;
     Ok(Json(super::playlists::summaries(&s, Some(&screen.team_id)).await?))
 }
 
 #[derive(Deserialize)]
 pub struct Selection {
+    screen_id: Option<String>,
     playlist_id: Option<String>,
 }
 
@@ -41,7 +82,7 @@ pub async fn select_playlist(
     p: Principal,
     ApiJson(selection): ApiJson<Selection>,
 ) -> ApiResult<StatusCode> {
-    let screen = device_screen(&s, &p).await?;
+    let screen = controlled_screen(&s, &p, selection.screen_id.as_deref()).await?;
     let base = schedule::base_timeline(&s, &screen, Utc::now()).await?;
     let scheduled = base.len() > 1 || base.first().is_some_and(|g| g.source != schedule::Source::Default);
     if scheduled {
@@ -55,8 +96,17 @@ pub async fn select_playlist(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMap) -> ApiResult<Response> {
-    let screen = device_screen(&s, &p).await?;
+pub async fn manifest(
+    State(s): State<AppState>,
+    p: Principal,
+    Query(q): Query<ScreenQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    // Read-only access also covers screens this node watches through control or confidence assignments.
+    let screen = match q.screen_id.as_deref() {
+        Some(id) if crate::assignments::targets(&s, device_node(&p)?, id, true).await? => super::screens::fetch_row(&s, id).await?,
+        other => device_screen(&s, &p, other).await?,
+    };
     let now = Utc::now();
     let timeline = schedule::screen_timeline(&s, &screen, now, now + schedule::DEVICE_HORIZON).await?;
 
@@ -153,4 +203,133 @@ pub async fn manifest(State(s): State<AppState>, p: Principal, headers: HeaderMa
         body["playlist"] = serde_json::to_value(pl)?;
     }
     Ok(([(header::ETAG, etag_value)], Json(body)).into_response())
+}
+
+// MARK: Node
+
+pub async fn node(State(s): State<AppState>, p: Principal) -> ApiResult<Json<serde_json::Value>> {
+    let node_id = device_node(&p)?;
+    let row = super::nodes::fetch_row(&s, node_id).await.map_err(|_| ApiError::unauthorized())?;
+    let rows: Vec<ScreenRow> =
+        sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens WHERE node_id = ? ORDER BY name, id")).bind(node_id).fetch_all(&s.db).await?;
+    let screens: Vec<Screen> = rows.into_iter().map(|r| super::screens::to_screen(&s, r)).collect();
+    Ok(Json(json!({ "node": super::nodes::to_node(&s, row).await?, "screens": screens })))
+}
+
+pub async fn put_outputs(
+    State(s): State<AppState>,
+    p: Principal,
+    ApiJson(outputs): ApiJson<Vec<Output>>,
+) -> ApiResult<Json<crate::models::Node>> {
+    let node_id = device_node(&p)?;
+    let team_id = p.device_team.clone().unwrap_or_default();
+    let mut keys = HashSet::new();
+    for o in &outputs {
+        if o.key.trim().is_empty() || o.name.trim().is_empty() {
+            return Err(ApiError::unprocessable("invalid_outputs", "output key and name must not be empty"));
+        }
+        if !keys.insert(o.key.as_str()) {
+            return Err(ApiError::unprocessable("invalid_outputs", format!("duplicate output key {}", o.key)));
+        }
+    }
+    // role and screen_id are copies of the assignments. A hardware report cannot change them.
+    let node = super::nodes::fetch_row(&s, node_id).await.map_err(|_| ApiError::unauthorized())?;
+    let set = crate::assignments::load(&s, node_id).await?;
+    let mut stored = outputs;
+    crate::assignments::overlay_outputs(&mut stored, &set);
+    let res = sqlx::query("UPDATE nodes SET outputs = ? WHERE id = ?")
+        .bind(serde_json::to_string(&stored)?)
+        .bind(&node.id)
+        .execute(&s.db)
+        .await?;
+    if res.rows_affected() == 0 {
+        return Err(ApiError::unauthorized());
+    }
+    s.hub.broadcast_team(&team_id, &json!({ "type": "node_updated", "node_id": node_id }));
+    Ok(Json(super::nodes::to_node(&s, super::nodes::fetch_row(&s, node_id).await?).await?))
+}
+
+#[derive(Deserialize)]
+pub struct NewScreen {
+    output_key: String,
+    name: String,
+}
+
+/// A node creates its own screens, in its own team, one per reported output. Studio approval is not needed.
+pub async fn create_screen(
+    State(s): State<AppState>,
+    p: Principal,
+    ApiJson(input): ApiJson<NewScreen>,
+) -> ApiResult<(StatusCode, Json<Screen>)> {
+    let node_id = device_node(&p)?.to_string();
+    let name = input.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+    let node = super::nodes::fetch_row(&s, &node_id).await.map_err(|_| ApiError::unauthorized())?;
+    if crate::assignments::Mode::parse(&node.mode) != crate::assignments::Mode::Player {
+        return Err(ApiError::unprocessable("job_not_allowed_in_mode", "only player devices own screens"));
+    }
+    let mut outputs = super::nodes::outputs_of(&node);
+    let Some(output) = outputs.iter_mut().find(|o| o.key == input.output_key) else {
+        return Err(ApiError::unprocessable("unknown_output", "output_key is not in the node's reported outputs"));
+    };
+    let taken: Option<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE node_id = ? AND output_key = ?")
+        .bind(&node_id)
+        .bind(&input.output_key)
+        .fetch_optional(&s.db)
+        .await?;
+    let conflict = || ApiError::conflict("output_has_screen", "that output already has a screen");
+    if taken.is_some() {
+        return Err(conflict());
+    }
+
+    let id = new_id();
+    output.screen_id = Some(id.clone());
+    output.role = crate::models::OutputRole::Screen;
+    let mut tx = s.db.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO screens (id, team_id, name, node_id, output_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&node.team_id)
+    .bind(name)
+    .bind(&node_id)
+    .bind(&input.output_key)
+    .bind(now())
+    .execute(&mut *tx)
+    .await;
+    match inserted {
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Err(conflict()),
+        other => other?,
+    };
+    // The screen job for this output; any settings already stored for it are kept.
+    sqlx::query(
+        "INSERT INTO assignments (node_id, output_key, job, screen_id, updated_by, updated_at) VALUES (?1, ?2, 'screen', ?3, ?1, ?4) \
+         ON CONFLICT (node_id, output_key) DO UPDATE SET job = 'screen', screen_id = ?3, updated_by = ?1, updated_at = ?4",
+    )
+    .bind(&node_id)
+    .bind(&input.output_key)
+    .bind(&id)
+    .bind(now())
+    .execute(&mut *tx)
+    .await?;
+    let version: i64 = sqlx::query_scalar(
+        "UPDATE nodes SET outputs = ?, assignments_version = assignments_version + 1, \
+         applied_assignments_version = assignments_version + 1 WHERE id = ? RETURNING assignments_version",
+    )
+    .bind(serde_json::to_string(&outputs)?)
+    .bind(&node_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    s.hub.send_node(&node_id, &json!({ "type": "assignments_changed", "version": version }));
+
+    let row = super::screens::fetch_row(&s, &id).await?;
+    super::screens::broadcast_updated(&s, &row);
+    s.hub.broadcast_team(&node.team_id, &json!({ "type": "node_updated", "node_id": node_id }));
+    if s.hub.is_online(&node_id) {
+        s.hub.broadcast_team(&node.team_id, &json!({ "type": "screen_online", "screen_id": id }));
+    }
+    Ok((StatusCode::CREATED, Json(super::screens::to_screen(&s, row))))
 }

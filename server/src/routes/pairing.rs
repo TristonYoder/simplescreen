@@ -1,4 +1,5 @@
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
@@ -11,7 +12,7 @@ use subtle::ConstantTimeEq;
 use crate::{
     auth::{Principal, Role},
     error::{ApiError, ApiJson, ApiResult},
-    models::Screen,
+    models::{Output, OutputKind, OutputRole},
     state::AppState,
     util::{new_id, now, random_token, sha256_hex},
 };
@@ -26,7 +27,36 @@ pub struct Session {
     expires_at: String,
 }
 
-pub async fn start(State(s): State<AppState>) -> ApiResult<(StatusCode, Json<Session>)> {
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum PairingKind {
+    #[default]
+    Single,
+    Node,
+}
+
+#[derive(Deserialize, Default)]
+struct StartInput {
+    #[serde(default)]
+    kind: PairingKind,
+    mode: Option<crate::assignments::Mode>,
+}
+
+/// The body is optional: an absent body (or `kind: "single"`) pairs a single-screen device such as an Apple TV.
+pub async fn start(State(s): State<AppState>, body: Bytes) -> ApiResult<(StatusCode, Json<Session>)> {
+    let input: StartInput = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        StartInput::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?
+    };
+    let mode = input.mode.unwrap_or_default();
+    if matches!(input.kind, PairingKind::Single) && mode != crate::assignments::Mode::Player {
+        return Err(ApiError::bad_request("mode only applies to kind node; single-screen devices are players"));
+    }
+    let kind = match input.kind {
+        PairingKind::Single => "single",
+        PairingKind::Node => "node",
+    };
     let cutoff = (Utc::now() - Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
     sqlx::query("DELETE FROM pairings WHERE expires_at < ?").bind(cutoff).execute(&s.db).await?;
 
@@ -47,11 +77,13 @@ pub async fn start(State(s): State<AppState>) -> ApiResult<(StatusCode, Json<Ses
     let id = new_id();
     let secret = random_token(32);
     let expires_at = (Utc::now() + Duration::minutes(10)).to_rfc3339_opts(SecondsFormat::Millis, true);
-    sqlx::query("INSERT INTO pairings (id, code, secret_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO pairings (id, code, secret_hash, expires_at, kind, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .bind(&id)
         .bind(&code)
         .bind(sha256_hex(secret.as_bytes()))
         .bind(&expires_at)
+        .bind(kind)
+        .bind(mode.as_str())
         .bind(now())
         .execute(&s.db)
         .await?;
@@ -70,20 +102,24 @@ pub async fn claim(
     State(s): State<AppState>,
     p: Principal,
     ApiJson(input): ApiJson<Claim>,
-) -> ApiResult<(StatusCode, Json<Screen>)> {
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     s.require_team(&p, &input.team_id, Role::Editor).await?;
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
     let code = input.code.trim().to_uppercase();
-    let pairing: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM pairings WHERE code = ? AND expires_at > ? AND screen_id IS NULL ORDER BY created_at DESC LIMIT 1",
+    let pairing: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT id, kind, mode FROM pairings WHERE code = ? AND expires_at > ? AND node_id IS NULL ORDER BY created_at DESC LIMIT 1",
     )
     .bind(&code)
     .bind(now())
     .fetch_optional(&s.db)
     .await?;
-    let (pairing_id,) = pairing.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "pairing_not_found", "unknown or expired code"))?;
+    let (pairing_id, kind, mode) = pairing.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "pairing_not_found", "unknown or expired code"))?;
+    let single = kind == "single";
+    if !single && input.playlist_id.is_some() {
+        return Err(ApiError::bad_request("playlist_id only applies to single-screen pairings"));
+    }
     if let Some(pid) = &input.playlist_id {
         let found: Option<(String,)> = sqlx::query_as("SELECT id FROM playlists WHERE id = ? AND team_id = ?")
             .bind(pid)
@@ -95,22 +131,58 @@ pub async fn claim(
         }
     }
 
-    let screen_id = new_id();
+    let node_id = new_id();
+    let screen_id = single.then(new_id);
     let token = random_token(32);
     let created = now();
     let mut tx = s.db.begin().await?;
-    sqlx::query(
-        "INSERT INTO screens (id, team_id, name, playlist_id, token_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&screen_id)
-    .bind(&input.team_id)
-    .bind(input.name.trim())
-    .bind(&input.playlist_id)
-    .bind(sha256_hex(token.as_bytes()))
-    .bind(&created)
-    .execute(&mut *tx)
-    .await?;
-    let res = sqlx::query("UPDATE pairings SET screen_id = ?, device_token = ? WHERE id = ? AND screen_id IS NULL")
+    let outputs = match &screen_id {
+        Some(sid) => serde_json::to_string(&[Output {
+            key: "main".into(),
+            kind: OutputKind::Display,
+            name: "Main".into(),
+            role: OutputRole::Screen,
+            screen_id: Some(sid.clone()),
+            format: None,
+            audio_device: None,
+        }])?,
+        None => "[]".into(),
+    };
+    sqlx::query("INSERT INTO nodes (id, team_id, name, token_hash, outputs, single, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        .bind(&node_id)
+        .bind(&input.team_id)
+        .bind(input.name.trim())
+        .bind(sha256_hex(token.as_bytes()))
+        .bind(outputs)
+        .bind(single)
+        .bind(&mode)
+        .bind(&created)
+        .execute(&mut *tx)
+        .await?;
+    if let Some(sid) = &screen_id {
+        sqlx::query(
+            "INSERT INTO screens (id, team_id, name, playlist_id, node_id, output_key, created_at) VALUES (?, ?, ?, ?, ?, 'main', ?)",
+        )
+        .bind(sid)
+        .bind(&input.team_id)
+        .bind(input.name.trim())
+        .bind(&input.playlist_id)
+        .bind(&node_id)
+        .bind(&created)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO assignments (node_id, output_key, job, screen_id, updated_by, updated_at) VALUES (?, 'main', 'screen', ?, 'pairing', ?)",
+        )
+        .bind(&node_id)
+        .bind(sid)
+        .bind(&created)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE nodes SET assignments_version = 1, applied_assignments_version = 1 WHERE id = ?").bind(&node_id).execute(&mut *tx).await?;
+    }
+    let res = sqlx::query("UPDATE pairings SET node_id = ?, screen_id = ?, device_token = ? WHERE id = ? AND node_id IS NULL")
+        .bind(&node_id)
         .bind(&screen_id)
         .bind(&token)
         .bind(&pairing_id)
@@ -120,8 +192,14 @@ pub async fn claim(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "pairing_not_found", "unknown or expired code"));
     }
     tx.commit().await?;
-    let row = super::screens::fetch_row(&s, &screen_id).await?;
-    Ok((StatusCode::CREATED, Json(super::screens::to_screen(&s, row))))
+    let body = match screen_id {
+        Some(sid) => {
+            let row = super::screens::fetch_row(&s, &sid).await?;
+            serde_json::to_value(super::screens::to_screen(&s, row))?
+        }
+        None => serde_json::to_value(super::nodes::to_node(&s, super::nodes::fetch_row(&s, &node_id).await?).await?)?,
+    };
+    Ok((StatusCode::CREATED, Json(body)))
 }
 
 #[derive(Deserialize)]
@@ -133,6 +211,7 @@ pub struct PollQuery {
 struct PairingRow {
     secret_hash: String,
     expires_at: String,
+    node_id: Option<String>,
     screen_id: Option<String>,
     device_token: Option<String>,
 }
@@ -143,7 +222,7 @@ pub async fn poll(
     Query(q): Query<PollQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let row: PairingRow =
-        sqlx::query_as("SELECT secret_hash, expires_at, screen_id, device_token FROM pairings WHERE id = ?")
+        sqlx::query_as("SELECT secret_hash, expires_at, node_id, screen_id, device_token FROM pairings WHERE id = ?")
             .bind(&id)
             .fetch_optional(&s.db)
             .await?
@@ -152,8 +231,11 @@ pub async fn poll(
     if !bool::from(given.as_bytes().ct_eq(row.secret_hash.as_bytes())) {
         return Err(ApiError::not_found());
     }
-    if let Some(screen_id) = row.screen_id {
-        let mut v = serde_json::json!({ "status": "claimed", "screen_id": screen_id });
+    if let Some(node_id) = row.node_id {
+        let mut v = serde_json::json!({ "status": "claimed", "node_id": node_id });
+        if let Some(screen_id) = row.screen_id {
+            v["screen_id"] = serde_json::json!(screen_id);
+        }
         let taken = sqlx::query("UPDATE pairings SET device_token = NULL, token_delivered = 1 WHERE id = ? AND device_token IS NOT NULL")
             .bind(&id)
             .execute(&s.db)

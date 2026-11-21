@@ -10,7 +10,7 @@ use crate::{
     auth::{Principal, Role},
     error::{ApiError, ApiJson, ApiResult},
     models::{
-        Screen, ScreenCommand, ScreenOverride, ScreenPlacement, ScreenOverrideInput, ScreenPatch, ScreenRow, ScreenState, ScreenStatus,
+        CommandName, Screen, ScreenCommand, ScreenOverride, ScreenPlacement, ScreenOverrideInput, ScreenPatch, ScreenRow, ScreenState, ScreenStatus,
         SCREEN_COLUMNS,
     },
     schedule,
@@ -19,7 +19,7 @@ use crate::{
 };
 
 pub fn to_screen(s: &AppState, row: ScreenRow) -> Screen {
-    let online = s.hub.is_online(&row.id);
+    let online = row.node_id.as_deref().is_some_and(|n| s.hub.is_online(n));
     let status = if online {
         s.statuses.lock().get(&row.id).cloned().unwrap_or_else(|| ScreenStatus::simple(ScreenState::Idle))
     } else {
@@ -41,6 +41,8 @@ pub fn to_screen(s: &AppState, row: ScreenRow) -> Screen {
         playlist_id: row.playlist_id,
         override_,
         placement,
+        node_id: row.node_id,
+        output_key: row.output_key,
         online,
         status,
         last_seen_at: row.last_seen_at,
@@ -179,7 +181,7 @@ pub async fn clear_override_row(s: &AppState, row: &ScreenRow) -> ApiResult<()> 
 }
 
 fn changed(s: &AppState, row: &ScreenRow, version: i64) {
-    s.notify_manifest(&row.id, version);
+    s.notify_manifest(row.node_id.as_deref(), &row.id, version);
     s.schedule_wake.notify_one();
     broadcast_updated(s, row);
 }
@@ -208,17 +210,70 @@ pub async fn clear_override(State(s): State<AppState>, p: Principal, Path(id): P
     Ok(Json(to_screen(&s, fetch_row(&s, &id).await?)))
 }
 
-fn broadcast_updated(s: &AppState, row: &ScreenRow) {
+pub fn broadcast_updated(s: &AppState, row: &ScreenRow) {
     s.hub.broadcast_team(&row.team_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let row = fetch_row(&s, &id).await?;
     p.require(&row.team_id, Role::Editor)?;
-    sqlx::query("DELETE FROM screens WHERE id = ?").bind(&id).execute(&s.db).await?;
-    s.forget_device_tokens(&id);
-    s.hub.send_device(&id, &json!({ "type": "unpaired" }));
-    s.hub.close_device(&id);
+
+    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
+    let pointing: Vec<(String,)> =
+        sqlx::query_as("SELECT DISTINCT node_id FROM assignments WHERE screen_id = ?").bind(&id).fetch_all(&mut *tx).await?;
+    // Off, with no screen id, before the row goes away. ON DELETE SET NULL must not leave a live job.
+    sqlx::query("UPDATE assignments SET job = 'off', screen_id = NULL, settings = '{}' WHERE screen_id = ?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM screens WHERE id = ?").bind(&id).execute(&mut *tx).await?;
+
+    let mut node_ids: Vec<String> = pointing.into_iter().map(|(n,)| n).collect();
+    if let Some(owner) = &row.node_id {
+        if !node_ids.iter().any(|n| n == owner) {
+            node_ids.push(owner.clone());
+        }
+    }
+    let mut versions = Vec::new();
+    let mut removed_node = None;
+    for node_id in &node_ids {
+        let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM nodes WHERE id = ?").bind(node_id).fetch_optional(&mut *tx).await?;
+        if exists.is_none() {
+            continue;
+        }
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM screens WHERE node_id = ?").bind(node_id).fetch_one(&mut *tx).await?;
+        // `nodes.single` is the pairing kind, not a screen count. Unpair only when nothing is left.
+        if row.node_id.as_deref() == Some(node_id.as_str()) && remaining == 0 {
+            sqlx::query("DELETE FROM nodes WHERE id = ?").bind(node_id).execute(&mut *tx).await?;
+            removed_node = Some(node_id.clone());
+            continue;
+        }
+        crate::assignments::sync_reported_outputs(&mut tx, node_id).await?;
+        let version: i64 = sqlx::query_scalar(
+            "UPDATE nodes SET assignments_version = assignments_version + 1 WHERE id = ? RETURNING assignments_version",
+        )
+        .bind(node_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        versions.push((node_id.clone(), version));
+    }
+    tx.commit().await?;
+
+    s.statuses.lock().remove(&id);
+    let offline = json!({ "type": "screen_offline", "screen_id": &id });
+    s.hub.broadcast_team(&row.team_id, &offline);
+    s.hub.send_subscribers(&id, row.node_id.as_deref(), &offline);
+    if let Some(node_id) = &removed_node {
+        s.forget_device_tokens(node_id);
+        s.node_statuses.lock().remove(node_id);
+        s.hub.send_node(node_id, &json!({ "type": "unpaired" }));
+        s.hub.close_node(node_id);
+    }
+    for (node_id, version) in &versions {
+        s.hub.send_node(node_id, &json!({ "type": "assignments_changed", "version": version }));
+        s.hub.broadcast_team(&row.team_id, &json!({ "type": "node_updated", "node_id": node_id }));
+        crate::assignments::refresh_subscriptions(&s, node_id).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -230,7 +285,21 @@ pub async fn command(
 ) -> ApiResult<StatusCode> {
     let row = fetch_row(&s, &id).await?;
     p.require(&row.team_id, Role::Editor)?;
-    if !s.hub.send_device(&id, &json!({ "type": "command", "command": cmd })) {
+    send_command(&s, &row, &cmd)
+}
+
+/// Validates a command and delivers it to the node that plays the screen.
+pub fn send_command(s: &AppState, row: &ScreenRow, cmd: &ScreenCommand) -> ApiResult<StatusCode> {
+    if matches!(cmd.name, CommandName::Jump) && cmd.item_index.is_none_or(|i| i < 0) {
+        return Err(ApiError::bad_request("jump requires a non-negative item_index"));
+    }
+    if cmd.step_index.is_some_and(|i| i < 0) {
+        return Err(ApiError::bad_request("step_index must not be negative"));
+    }
+    let delivered = row.node_id.as_deref().is_some_and(|n| {
+        s.hub.send_node(n, &json!({ "type": "command", "screen_id": row.id, "command": cmd }))
+    });
+    if !delivered {
         return Err(ApiError::conflict("screen_offline", "screen is offline"));
     }
     Ok(StatusCode::ACCEPTED)

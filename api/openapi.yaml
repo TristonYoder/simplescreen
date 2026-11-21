@@ -21,6 +21,9 @@ info:
     - Auth: `Authorization: Bearer <token>`. Token is an OIDC JWT (users), the
       bootstrap token (server admin), or a device token (paired screens).
       Blob GET and the WebSocket also accept `?token=` for clients that cannot set headers.
+    - A node is a paired device (an Apple TV, or a Mac/iPad that drives several outputs). A node owns the
+      device token and one WebSocket, and plays one or more Screens, each bound to one of its outputs.
+      An Apple TV is a single-screen node: device endpoints without `screen_id` use its only screen.
     - WebSocket message schemas are `WsServerMessage` / `WsClientMessage` (JSON text frames).
   license:
     name: AGPL-3.0-only
@@ -38,6 +41,7 @@ tags:
   - name: media
   - name: blobs
   - name: playlists
+  - name: nodes
   - name: screens
   - name: pairing
   - name: device
@@ -487,12 +491,111 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/nodes:
+    get:
+      operationId: listNodes
+      tags: [nodes]
+      description: Viewer role. Nodes in teams the caller can see, with their reported outputs and screen ids.
+      parameters:
+        - name: team_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Nodes
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Node' }
+
+  /v1/nodes/{nodeId}:
+    parameters:
+      - { $ref: '#/components/parameters/NodeId' }
+    get:
+      operationId: getNode
+      tags: [nodes]
+      description: Viewer role.
+      responses:
+        '200':
+          description: Node
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/nodes/{nodeId}/assignments:
+    parameters:
+      - { $ref: '#/components/parameters/NodeId' }
+    get:
+      operationId: getNodeAssignments
+      tags: [nodes]
+      description: Viewer role. What each output of the node should do, with the version Studio compares against `Node.applied_assignments_version`.
+      responses:
+        '200':
+          description: Assignments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignments' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: putNodeAssignments
+      tags: [nodes]
+      description: |
+        Editor role. Full replace (`updated_by` is the user). `base_version` must equal the current
+        version, else 409 `version_conflict` with the current `Assignments` in `Error.current`. The
+        rules are the same as `putDeviceAssignments`. The node gets `assignments_changed`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentsInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignments' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/screens/{screenId}/move:
+    parameters:
+      - { $ref: '#/components/parameters/ScreenId' }
+    post:
+      operationId: moveScreen
+      tags: [screens]
+      description: |
+        Editor role. Makes `output_key` of `node_id` play this screen (the node must be a player in the
+        screen's team and report the output). The screen's previous output (if any) becomes `off` and its
+        settings move with the screen; mirrors of it on the old node are switched off; a screen that was on
+        the target output becomes unplaced. Affected nodes get `assignments_changed`. 422:
+        `target_not_in_team`, `job_not_allowed_in_mode`, `unknown_output`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MoveScreenInput' }
+      responses:
+        '200':
+          description: The moved screen
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Screen' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
   /v1/screens:
     parameters:
       - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: listScreens
       tags: [screens]
+      description: Includes unplaced screens (no `node_id` or `output_key`, because their output was released), which keep their schedule and placement.
       parameters:
         - name: team_id
           in: query
@@ -542,7 +645,10 @@ paths:
     delete:
       operationId: deleteScreen
       tags: [screens]
-      description: Unpairs; the device token is revoked and its socket closed.
+      description: |
+        Deletes the screen. Assignments that targeted it become off, and the node's reported
+        outputs drop that screen. If the node has no screens left it is unpaired: the device token
+        is revoked and its socket closed. A node that still has another screen keeps its token.
       responses:
         '204': { description: Deleted }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -555,7 +661,10 @@ paths:
     post:
       operationId: sendScreenCommand
       tags: [screens]
-      description: Remote-control a screen (editor role). 409 if the screen is offline.
+      description: |
+        Remote-control a screen (editor role). 409 if the screen is offline. `jump` requires
+        `item_index` (>= 0) and takes an optional `step_index` for sequence pages (400 otherwise).
+        The node receives it on its socket with `screen_id` set.
       requestBody:
         required: true
         content:
@@ -563,6 +672,7 @@ paths:
             schema: { $ref: '#/components/schemas/ScreenCommand' }
       responses:
         '202': { description: Delivered to the device socket }
+        '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
@@ -782,7 +892,12 @@ paths:
       operationId: startPairing
       tags: [pairing]
       security: []
-      description: Called by an unpaired device. Code expires after 10 minutes.
+      description: |
+        Called by an unpaired device. Code expires after 10 minutes. The body is optional: absent or
+        `kind: single` pairs a single-screen device (claiming creates the node and one screen);
+        `kind: node` pairs a multi-output node (claiming creates only the node). With `kind: node`,
+        `mode` (player, controller or stage; default player) is the device's mode; `mode` with
+        `kind: single` other than player is 400.
       requestBody:
         required: false
         content:
@@ -801,7 +916,10 @@ paths:
     post:
       operationId: claimPairing
       tags: [pairing]
-      description: Editor role in target team. Creates the Screen.
+      description: |
+        Editor role in target team. Creates the node. For a `single` pairing it also creates the node's
+        one Screen (output key `main`) and returns that Screen; for a `node` pairing it returns the Node
+        (no screens yet; the node creates them with `createDeviceScreen`).
       requestBody:
         required: true
         content:
@@ -809,10 +927,13 @@ paths:
             schema: { $ref: '#/components/schemas/PairingClaim' }
       responses:
         '201':
-          description: Screen created
+          description: Screen (single pairing) or Node (node pairing)
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Screen' }
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Screen'
+                  - $ref: '#/components/schemas/Node'
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
@@ -848,7 +969,12 @@ paths:
         holds every playlist it references, and `media`/`assets` cover all of them so the device can
         switch on schedule while offline. The ETag changes when the active playlist, a scheduled
         boundary, or a referenced playlist version changes; honors `If-None-Match` with 304.
+        `screen_id` selects the screen; it may be omitted when the node has exactly one screen
+        (422 `screen_id_required` otherwise). A screen that is not the node's is 404, unless the node has a
+        control or confidence assignment for it (read-only access, so a remote controller can show
+        thumbnails). Blobs are readable by any authenticated principal.
       parameters:
+        - { $ref: '#/components/parameters/DeviceScreenIdQuery' }
         - name: If-None-Match
           in: header
           required: false
@@ -866,7 +992,9 @@ paths:
     get:
       operationId: listDevicePlaylists
       tags: [device]
-      description: Device token only. Playlists in the screen's team, for choosing on the device.
+      description: Device token only. Playlists in the screen's team, for choosing on the device. `screen_id` as for `getDeviceManifest`, except that only screens the node plays or holds a control assignment on are allowed (confidence-only is 403).
+      parameters:
+        - { $ref: '#/components/parameters/DeviceScreenIdQuery' }
       responses:
         '200':
           description: Playlist summaries
@@ -876,6 +1004,8 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/PlaylistSummary' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/device/playlist:
     put:
@@ -886,6 +1016,8 @@ paths:
         If the screen has a schedule in the next 14 days this is an override until the next scheduled
         change; otherwise it sets the screen's default playlist like `updateScreen`.
         The device gets `manifest_changed`; user sockets in the team get `screen_updated`.
+        This is the same whether chosen on a Control output or with a remote. `screen_id` in the body
+        may be omitted when the node has exactly one screen. It may also name a screen the node holds a control assignment on (a remote choice, same override semantics); a confidence-only target is 403 and any other screen is 404.
       requestBody:
         required: true
         content:
@@ -894,7 +1026,172 @@ paths:
       responses:
         '204': { description: Assigned }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/device/node:
+    get:
+      operationId: getDeviceNode
+      tags: [device]
+      description: Device token only. The calling node and every screen it plays.
+      responses:
+        '200':
+          description: Node and its screens
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceNode' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/device/outputs:
+    put:
+      operationId: putDeviceOutputs
+      tags: [device]
+      description: |
+        Device token only. Replaces the node's reported output map (the node is authoritative).
+        Never deletes screens: a screen whose output disappears stays in Studio. Output keys must be
+        unique and any `screen_id` must be one of the node's screens (422 `invalid_outputs`).
+        User sockets in the team get `node_updated`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/Output' }
+      responses:
+        '200':
+          description: The updated node
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/device/screens:
+    post:
+      operationId: createDeviceScreen
+      tags: [device]
+      description: |
+        Device token only. Creates a screen in the node's team, bound to one of the node's reported
+        outputs, with no Studio approval. 422 `unknown_output` if `output_key` is not in the node's
+        outputs; 409 `output_has_screen` if that output already has a screen. The matching output's
+        `screen_id` is filled in. User sockets in the team get `screen_updated` and `node_updated`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceScreenInput' }
+      responses:
+        '201':
+          description: Screen created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Screen' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/device/assignments:
+    get:
+      operationId: getDeviceAssignments
+      tags: [device]
+      description: Device token only. The server's desired assignments for this node, its mode and the version.
+      responses:
+        '200':
+          description: Assignments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignments' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      operationId: putDeviceAssignments
+      tags: [device]
+      description: |
+        Device token only. Full replace of the node's assignments; omitted outputs lose their job. The
+        device's own change counts as applied (`applied_assignments_version` follows). 409 `version_conflict`
+        (current `Assignments` in `Error.current`) when `base_version` is stale. 422 codes:
+        `job_not_allowed_in_mode` (controller and stage: only control, confidence, off),
+        `screen_has_output` (a screen already played by another output, or twice in the request),
+        `screen_must_be_local` (screen job for a screen played by another node), `mirror_must_be_local`,
+        `control_needs_input` (output kind decklink or virtual), `target_not_in_team`, `unknown_output`
+        (output not in the reported outputs; allowed only for job `off`), `screen_required` (mirror, control
+        and confidence need `screen_id`), `audio_conflict` (one audio-enabled assignment per screen across
+        the team), `invalid_assignments`. A screen job without `screen_id` is stored as is and the screen is
+        created with `createDeviceScreen`. Removing a screen job unplaces the screen (it is never deleted).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignmentsInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignments' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/device/mode:
+    put:
+      operationId: putDeviceMode
+      tags: [device]
+      description: |
+        Device token only. Changes what the device is for. Leaving player releases the node's screens
+        (they become unplaced, keeping schedule and placement) and drops its screen and mirror assignments.
+        Bumps the assignments version. Returns the new `Assignments`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceModeInput' }
+      responses:
+        '200':
+          description: Assignments after the change
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignments' }
+        '400': { description: Unknown mode, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/device/team-screens:
+    get:
+      operationId: listDeviceTeamScreens
+      tags: [device]
+      description: Device token only. Every screen in the node's team, for the control and confidence pickers.
+      responses:
+        '200':
+          description: Screens
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TeamScreen' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/device/screens/{screenId}/command:
+    parameters:
+      - { $ref: '#/components/parameters/ScreenId' }
+    post:
+      operationId: sendDeviceScreenCommand
+      tags: [device]
+      description: |
+        Device token only. Remote control of a screen played by another node, with the same body and
+        errors as `sendScreenCommand`. 403 unless this node has a `control` assignment targeting the screen.
+        409 `screen_offline` if the player is offline.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScreenCommand' }
+      responses:
+        '202': { description: Delivered to the player's socket }
+        '400': { $ref: '#/components/responses/Unprocessable' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
 
   /v1/ws:
     parameters:
@@ -905,8 +1202,9 @@ paths:
       description: |
         WebSocket upgrade. Devices and users. Text frames carry `WsServerMessage` (server→client) and
         `WsClientMessage` (client→server). Server pings every 20 s; clients reconnect with backoff
-        (1 s doubling, max 30 s) and refetch the manifest on reconnect.
-        User sockets may send `X-Organization` (checked like any org-scoped call); devices ignore it.
+        (1 s doubling, max 30 s) and refetch the manifests on reconnect. A device socket belongs to a
+        node and serves all of its screens, so device-facing messages carry `screen_id`; the server
+        announces `screen_online`/`screen_offline` for each screen of the node.
       parameters:
         - { $ref: '#/components/parameters/TokenQuery' }
       responses:
@@ -957,6 +1255,17 @@ components:
       name: floorPlanId
       in: path
       required: true
+      schema: { type: string, format: uuid }
+    NodeId:
+      name: nodeId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DeviceScreenIdQuery:
+      name: screen_id
+      in: query
+      required: false
+      description: Which of the node's screens. Optional when the node has exactly one screen.
       schema: { type: string, format: uuid }
     ScreenId:
       name: screenId
@@ -1017,8 +1326,12 @@ components:
           description: Stable machine code, e.g. `not_found`, `version_conflict`, `hash_mismatch`.
         message: { type: string }
         current:
-          $ref: '#/components/schemas/Playlist'
-          description: Present on playlist version_conflict.
+          description: |
+            Present on `version_conflict`. A playlist conflict returns the current Playlist.
+            An assignment conflict returns the current Assignments.
+          oneOf:
+            - { $ref: '#/components/schemas/Playlist' }
+            - { $ref: '#/components/schemas/Assignments' }
 
     ServerInfo:
       type: object
@@ -1131,7 +1444,8 @@ components:
         memberships:
           type: array
           items: { $ref: '#/components/schemas/Membership' }
-        screen_id: { type: string, format: uuid, description: Set for device principals }
+        node_id: { type: string, format: uuid, description: Set for device principals }
+        screen_id: { type: string, format: uuid, description: Set for device principals whose node has exactly one screen }
 
     Membership:
       type: object
@@ -1408,6 +1722,12 @@ components:
         os_version: { type: string }
         model: { type: string }
         message: { type: string, description: Human-readable error/detail }
+        step_index: { type: integer, description: Current page within a sequence item }
+        step_count: { type: integer, description: Pages in the current sequence item }
+        item_count: { type: integer, description: Items in the playing playlist }
+        position_ms: { type: integer, format: int64, description: Current video position; for timed images, the time left }
+        duration_ms: { type: integer, format: int64, description: Current video length }
+        blackout: { type: boolean }
         updated_at: { type: string, format: date-time }
 
     Screen:
@@ -1420,7 +1740,9 @@ components:
         playlist_id: { type: string, format: uuid, description: Default playlist (plays when nothing is scheduled) }
         override: { $ref: '#/components/schemas/ScreenOverride' }
         placement: { $ref: '#/components/schemas/ScreenPlacement' }
-        online: { type: boolean }
+        node_id: { type: string, format: uuid, description: The node that plays this screen }
+        output_key: { type: string, description: The node output that plays this screen }
+        online: { type: boolean, description: True while the screen's node has its socket open }
         status: { $ref: '#/components/schemas/ScreenStatus' }
         last_seen_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
@@ -1470,10 +1792,178 @@ components:
             id: { type: string, format: uuid }
             created_at: { type: string, format: date-time }
 
+    OutputKind:
+      type: string
+      enum: [display, external, built_in, decklink, virtual]
+
+    NodeMode:
+      type: string
+      enum: [player, controller, stage]
+      description: What the device is for. Controller and stage devices only use control, confidence and off.
+
+    AssignmentJob:
+      type: string
+      enum: [screen, mirror, control, confidence, off]
+
+    AssignmentView:
+      type: string
+      enum: [remote, operator]
+
+    AudioSettings:
+      type: object
+      required: [enabled]
+      properties:
+        enabled: { type: boolean }
+        device: { type: string }
+
+    AssignmentSettings:
+      type: object
+      properties:
+        audio: { $ref: '#/components/schemas/AudioSettings' }
+        view: { $ref: '#/components/schemas/AssignmentView' }
+        clock: { type: integer, enum: [12, 24] }
+        format: { type: string, description: Video format }
+
+    Assignment:
+      type: object
+      required: [output_key, job]
+      properties:
+        output_key: { type: string }
+        job: { $ref: '#/components/schemas/AssignmentJob' }
+        screen_id: { type: string, format: uuid, description: Target screen. Optional for a screen job whose screen is not created yet; required for mirror, control and confidence; ignored for off }
+        settings: { $ref: '#/components/schemas/AssignmentSettings' }
+        updated_by: { type: string, description: Server-set, ignored on input }
+        updated_at: { type: string, format: date-time, description: Server-set, ignored on input }
+
+    Assignments:
+      type: object
+      required: [version, mode, assignments]
+      properties:
+        version: { type: integer, format: int64 }
+        mode: { $ref: '#/components/schemas/NodeMode' }
+        assignments:
+          type: array
+          items: { $ref: '#/components/schemas/Assignment' }
+
+    AssignmentsInput:
+      type: object
+      required: [base_version, assignments]
+      properties:
+        base_version: { type: integer, format: int64 }
+        assignments:
+          type: array
+          items: { $ref: '#/components/schemas/Assignment' }
+
+    DeviceModeInput:
+      type: object
+      required: [mode]
+      properties:
+        mode: { $ref: '#/components/schemas/NodeMode' }
+
+    MoveScreenInput:
+      type: object
+      required: [node_id, output_key]
+      properties:
+        node_id: { type: string, format: uuid }
+        output_key: { type: string }
+
+    TeamScreen:
+      type: object
+      required: [id, name, online, placed]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        node_id: { type: string, format: uuid, description: Absent when the screen is unplaced }
+        node_name: { type: string }
+        node_mode: { $ref: '#/components/schemas/NodeMode' }
+        online: { type: boolean }
+        output_key: { type: string }
+        placed: { type: boolean, description: True when an output plays the screen }
+
+    OutputRole:
+      type: string
+      enum: [screen, mirror, control, confidence, none]
+
+    Output:
+      type: object
+      description: |
+        One output a node reports (a display, a DeckLink port, a virtual output...). This is hardware.
+        `role` and `screen_id` are server-maintained copies of the output's assignment; reports may omit them.
+      required: [key, kind, name]
+      properties:
+        key: { type: string, description: Stable identifier the node matches outputs by }
+        kind: { $ref: '#/components/schemas/OutputKind' }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/OutputRole' }
+        screen_id: { type: string, format: uuid, description: The screen this output plays (role=screen); server-maintained }
+        format: { type: string, description: 'Display mode, e.g. 1920x1080@59.94' }
+        audio_device: { type: string }
+
+    OutputStatus:
+      type: object
+      required: [key, connected]
+      properties:
+        key: { type: string }
+        connected: { type: boolean }
+        format: { type: string }
+        audio_device: { type: string }
+        dropped_frames: { type: integer, format: int64 }
+        late_frames: { type: integer, format: int64 }
+
+    NodeStatus:
+      type: object
+      required: [outputs, updated_at]
+      properties:
+        outputs:
+          type: array
+          items: { $ref: '#/components/schemas/OutputStatus' }
+        updated_at: { type: string, format: date-time }
+
+    Node:
+      type: object
+      required: [id, team_id, name, outputs, screen_ids, mode, assignments_version, applied_assignments_version, online, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
+        name: { type: string }
+        mode: { $ref: '#/components/schemas/NodeMode' }
+        assignments_version: { type: integer, format: int64, description: Desired assignments version; bumps on every change }
+        applied_assignments_version: { type: integer, format: int64, description: The version the device last reported (status messages) or applied itself; Pending while lower than assignments_version }
+        model: { type: string }
+        os_version: { type: string }
+        app_version: { type: string }
+        outputs:
+          type: array
+          items: { $ref: '#/components/schemas/Output' }
+        screen_ids:
+          type: array
+          items: { type: string, format: uuid }
+        online: { type: boolean }
+        status: { $ref: '#/components/schemas/NodeStatus' }
+        last_seen_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+
+    DeviceNode:
+      type: object
+      required: [node, screens]
+      properties:
+        node: { $ref: '#/components/schemas/Node' }
+        screens:
+          type: array
+          items: { $ref: '#/components/schemas/Screen' }
+
+    DeviceScreenInput:
+      type: object
+      required: [output_key, name]
+      properties:
+        output_key: { type: string }
+        name: { type: string }
+
     DevicePlaylistSelection:
       type: object
       required: [playlist_id]
       properties:
+        screen_id: { type: string, format: uuid, description: Optional when the node has exactly one screen }
         playlist_id:
           type: [string, 'null']
           format: uuid
@@ -1589,18 +2079,26 @@ components:
 
     CommandName:
       type: string
-      enum: [go, next, prev, blackout, reload, identify]
+      enum: [go, next, prev, blackout, reload, identify, jump]
 
     ScreenCommand:
       type: object
       required: [name]
       properties:
         name: { $ref: '#/components/schemas/CommandName' }
-        item_index: { type: integer, description: Optional jump target (with name=go) }
+        item_index: { type: integer, description: Target item (with name=go or jump; required for jump) }
+        step_index: { type: integer, description: Optional page within a sequence item (with name=jump) }
+
+    PairingKind:
+      type: string
+      enum: [single, node]
+      description: single (default) claims a node plus its one screen; node claims just a multi-output node
 
     PairingStartInput:
       type: object
       properties:
+        kind: { $ref: '#/components/schemas/PairingKind' }
+        mode: { $ref: '#/components/schemas/NodeMode' }
         model: { type: string }
         os_version: { type: string }
         app_version: { type: string }
@@ -1621,7 +2119,7 @@ components:
         code: { type: string }
         name: { type: string }
         team_id: { type: string, format: uuid }
-        playlist_id: { type: string, format: uuid }
+        playlist_id: { type: string, format: uuid, description: Single pairings only }
 
     PairingStatus:
       type: object
@@ -1630,7 +2128,8 @@ components:
         status:
           type: string
           enum: [pending, claimed, expired]
-        screen_id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        screen_id: { type: string, format: uuid, description: Only for single pairings }
         device_token: { type: string, description: Returned once }
 
     ManifestAsset:
@@ -1673,7 +2172,7 @@ components:
 
     WsServerMessageType:
       type: string
-      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, schedule_changed, floor_plans_changed, unpaired]
+      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, node_online, node_offline, node_updated, node_status, schedule_changed, floor_plans_changed, assignments_changed, unpaired]
 
     WsServerMessage:
       type: object
@@ -1682,19 +2181,31 @@ components:
       properties:
         type: { $ref: '#/components/schemas/WsServerMessageType' }
         server_id: { type: string, format: uuid, description: hello }
-        version: { type: integer, format: int64, description: manifest_changed (informational; devices refetch with If-None-Match) }
+        version: { type: integer, format: int64, description: 'manifest_changed (informational; devices refetch with If-None-Match) and assignments_changed (the new assignments version; refetch getDeviceAssignments)' }
         team_id: { type: string, format: uuid, description: schedule_changed / floor_plans_changed }
         command: { $ref: '#/components/schemas/ScreenCommand' }
-        screen_id: { type: string, format: uuid, description: screen_status / online / offline / updated }
+        screen_id: { type: string, format: uuid, description: 'manifest_changed / command (device-facing) and screen_status / online / offline / updated. A device also receives screen_status, manifest_changed, screen_online and screen_offline for screens it has a control or confidence assignment for (not played by itself)' }
+        node_id: { type: string, format: uuid, description: node_online / node_offline / node_updated / node_status }
         status: { $ref: '#/components/schemas/ScreenStatus' }
+        outputs:
+          type: array
+          description: node_status
+          items: { $ref: '#/components/schemas/OutputStatus' }
+        updated_at: { type: string, format: date-time, description: node_status }
 
     WsClientMessageType:
       type: string
-      enum: [status, ping]
+      enum: [status, node_status, ping]
 
     WsClientMessage:
       type: object
       required: [type]
       properties:
         type: { $ref: '#/components/schemas/WsClientMessageType' }
+        screen_id: { type: string, format: uuid, description: status; optional when the node has exactly one screen }
+        assignments_version: { type: integer, format: int64, description: 'Optional on any message: the assignments version the device is running. The server stores it as applied_assignments_version and sends node_updated to users when it changes.' }
         status: { $ref: '#/components/schemas/ScreenStatus' }
+        outputs:
+          type: array
+          description: node_status
+          items: { $ref: '#/components/schemas/OutputStatus' }
