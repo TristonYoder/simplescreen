@@ -196,6 +196,13 @@ pub async fn manifest(
             playlists.push(pl);
         }
     }
+    let missing: Vec<(String,)> = sqlx::query_as("SELECT id FROM media WHERE missing_at IS NOT NULL").fetch_all(&s.db).await?;
+    let missing: HashSet<String> = missing.into_iter().map(|(m,)| m).collect();
+    if !missing.is_empty() {
+        for pl in playlists.iter_mut() {
+            prune_missing(pl, &missing);
+        }
+    }
     // Download order: the active playlist, later timeline playlists by start, then the rest by name.
     let mut order: Vec<String> = vec![];
     for seg in &timeline {
@@ -256,13 +263,13 @@ pub async fn manifest(
     let mut assets = vec![];
     if !playlists.is_empty() {
         let all: Vec<Media> = sqlx::query_as(&format!(
-            "SELECT {MEDIA_COLUMNS} FROM media WHERE id IN (SELECT media_id FROM playlist_media WHERE playlist_id IN \
+            "SELECT {MEDIA_COLUMNS} FROM media WHERE missing_at IS NULL AND id IN (SELECT media_id FROM playlist_media WHERE playlist_id IN \
              (SELECT value FROM json_each(?)))"
         ))
         .bind(serde_json::to_string(&available)?)
         .fetch_all(&s.db)
         .await?;
-        let by_id: HashMap<String, Media> = all.into_iter().map(|m| (m.id.clone(), m)).collect();
+        let by_id: HashMap<String, Media> = all.into_iter().map(|m| (m.id.clone(), m.with_access("view"))).collect();
         let mut seen_media: HashSet<String> = HashSet::new();
         let mut seen_blob: HashSet<String> = HashSet::new();
         let mut add = |id: &str, index: usize, media: &mut Vec<Media>, assets: &mut Vec<serde_json::Value>| {
@@ -321,6 +328,41 @@ pub async fn manifest(
         body["playlist"] = serde_json::to_value(pl)?;
     }
     Ok(([(header::ETAG, etag_value)], Json(body)).into_response())
+}
+
+/// Leaves out items and bed tracks whose file is missing. A bed keeps its range over the items
+/// that remain, and is dropped when none do or it has no tracks left.
+fn prune_missing(pl: &mut Playlist, missing: &HashSet<String>) {
+    let gone = |m: &uuid::Uuid| missing.contains(&m.to_string());
+    let old: Vec<Option<uuid::Uuid>> = pl.items.iter().map(|i| i.id).collect();
+    pl.items.retain_mut(|item| match item.kind {
+        ItemKind::Video | ItemKind::Image => !item.media_id.as_ref().is_some_and(gone),
+        ItemKind::Sequence => {
+            if let Some(pages) = item.pages.as_mut() {
+                pages.retain(|m| !gone(m));
+            }
+            item.pages.as_ref().is_some_and(|p| !p.is_empty())
+        }
+    });
+    let kept: HashSet<uuid::Uuid> = pl.items.iter().filter_map(|i| i.id).collect();
+    pl.beds.retain_mut(|bed| {
+        bed.tracks.retain(|t| !gone(t));
+        let (Some(a), Some(b)) = (
+            old.iter().position(|i| *i == Some(bed.start_item_id)),
+            old.iter().position(|i| *i == Some(bed.end_item_id)),
+        ) else {
+            return false;
+        };
+        let range: Vec<uuid::Uuid> = old[a..=b.max(a)].iter().flatten().filter(|i| kept.contains(i)).copied().collect();
+        match (range.first(), range.last()) {
+            (Some(first), Some(last)) if !bed.tracks.is_empty() => {
+                bed.start_item_id = *first;
+                bed.end_item_id = *last;
+                true
+            }
+            _ => false,
+        }
+    });
 }
 
 // MARK: Node

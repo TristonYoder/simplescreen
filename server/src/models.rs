@@ -38,11 +38,11 @@ impl MediaKind {
 
 #[derive(Deserialize)]
 pub struct MediaInput {
-    pub team_id: String,
+    pub folder_id: String,
+    pub name: String,
     pub kind: MediaKind,
     pub sha256: String,
     pub mime: String,
-    pub title: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -55,17 +55,21 @@ pub struct MediaInput {
 
 #[derive(Deserialize)]
 pub struct MediaPatch {
-    pub title: Option<String>,
+    pub name: Option<String>,
+    pub folder_id: Option<String>,
 }
 
 #[derive(Serialize, FromRow, Clone, Debug)]
 pub struct Media {
     pub id: String,
-    pub team_id: String,
+    pub library_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    pub name: String,
+    pub path: String,
     pub kind: String,
     pub sha256: String,
     pub mime: String,
-    pub title: String,
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub duration_ms: Option<i64>,
@@ -75,11 +79,25 @@ pub struct Media {
     pub source_filename: Option<String>,
     pub thumbnail_sha256: Option<String>,
     pub size: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_at: Option<String>,
     pub created_by: Option<String>,
     pub created_at: String,
+    #[sqlx(skip)]
+    pub missing: bool,
+    #[sqlx(skip)]
+    pub access: &'static str,
 }
 
-pub const MEDIA_COLUMNS: &str = "id, team_id, kind, sha256, mime, title, width, height, duration_ms, codec, hdr, frame_rate, source_filename, thumbnail_sha256, size, created_by, created_at";
+impl Media {
+    pub fn with_access(mut self, access: &'static str) -> Self {
+        self.missing = self.missing_at.is_some();
+        self.access = access;
+        self
+    }
+}
+
+pub const MEDIA_COLUMNS: &str = "id, library_id, folder_id, name, path, kind, sha256, mime, width, height, duration_ms, codec, hdr, frame_rate, source_filename, thumbnail_sha256, size, missing_at, created_by, created_at";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]

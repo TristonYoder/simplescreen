@@ -14,11 +14,13 @@ pub struct ApiError {
     pub message: String,
     pub current: Option<Value>,
     pub conflicts: Option<Value>,
+    /// Extra top-level fields for the body.
+    pub extra: Option<Value>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), current: None, conflicts: None }
+        Self { status, code, message: message.into(), current: None, conflicts: None, extra: None }
     }
     pub fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token")
@@ -58,6 +60,11 @@ impl IntoResponse for ApiError {
         }
         if let Some(c) = self.conflicts {
             body["conflicts"] = c;
+        }
+        if let Some(Value::Object(extra)) = self.extra {
+            for (k, v) in extra {
+                body[k] = v;
+            }
         }
         (self.status, Json(body)).into_response()
     }

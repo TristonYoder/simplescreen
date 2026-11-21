@@ -234,6 +234,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_teams.sql"),
     include_str!("../migrations/0006_nodes.sql"),
     include_str!("../migrations/0007_screen_tags.sql"),
+    include_str!("../migrations/0008_libraries.sql"),
 ];
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {

@@ -64,6 +64,22 @@ pub async fn create(
     Ok(())
 }
 
+/// A `media_missing` notice to one user, keyed by the media so it can resolve later.
+pub async fn create_media(s: &AppState, user_sub: &str, media_id: &str, detail: Value) -> ApiResult<()> {
+    let id = new_id();
+    sqlx::query("INSERT INTO notices (id, user_sub, kind, media_id, detail, created_at) VALUES (?, ?, 'media_missing', ?, ?, ?)")
+        .bind(&id)
+        .bind(user_sub)
+        .bind(media_id)
+        .bind(detail.to_string())
+        .bind(now())
+        .execute(&s.db)
+        .await?;
+    let n: Notice = sqlx::query_as(&format!("SELECT {NOTICE_COLUMNS} FROM notices WHERE id = ?")).bind(&id).fetch_one(&s.db).await?;
+    s.hub.send_user(Some(user_sub), &json!({ "type": "notice", "notice": n.to_json() }));
+    Ok(())
+}
+
 pub async fn resolve_entry(s: &AppState, entry_id: &str) -> ApiResult<()> {
     sqlx::query("UPDATE notices SET resolved_at = ? WHERE entry_id = ? AND kind = 'schedule_conflict' AND resolved_at IS NULL")
         .bind(now())

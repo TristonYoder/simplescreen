@@ -200,16 +200,18 @@ fn invalid(msg: impl Into<String>) -> ApiError {
 async fn validate(
     s: &AppState,
     team_id: &str,
+    existing: &HashSet<String>,
     defaults: &PlaylistDefaults,
     items: &mut [PlaylistItem],
     beds: &mut [Bed],
 ) -> ApiResult<()> {
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, kind FROM media WHERE team_id = ?").bind(team_id).fetch_all(&s.db).await?;
-    let media: HashMap<String, String> = rows.into_iter().collect();
+    let usable = super::media::usable_by_team(s, team_id).await?;
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, kind FROM media").fetch_all(&s.db).await?;
+    let media: HashMap<String, String> =
+        rows.into_iter().filter(|(id, _)| usable.contains(id) || existing.contains(id)).collect();
     let check = |id: &Uuid, kind: &str| -> ApiResult<()> {
         match media.get(&id.to_string()) {
-            None => Err(invalid(format!("media {id} does not exist in this team"))),
+            None => Err(invalid(format!("media {id} is not in a folder this team reaches"))),
             Some(k) if k == kind => Ok(()),
             Some(k) => Err(invalid(format!("media {id} is {k}, expected {kind}"))),
         }
@@ -298,7 +300,7 @@ pub async fn create(
         return Err(ApiError::bad_request("name must not be empty"));
     }
     let defaults = input.defaults.take().unwrap_or_default();
-    validate(&s, &input.team_id, &defaults, &mut input.items, &mut input.beds).await?;
+    validate(&s, &input.team_id, &HashSet::new(), &defaults, &mut input.items, &mut input.beds).await?;
     check_folder(&s, &input.team_id, input.folder_id.as_deref()).await?;
     let id = new_id();
     let mut tx = s.db.begin().await?;
@@ -348,7 +350,10 @@ pub async fn update(
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
-    validate(&s, &current.team_id, &input.defaults, &mut input.items, &mut input.beds).await?;
+    let existing: Vec<(String,)> =
+        sqlx::query_as("SELECT media_id FROM playlist_media WHERE playlist_id = ?").bind(&id).fetch_all(&s.db).await?;
+    let existing: HashSet<String> = existing.into_iter().map(|(m,)| m).collect();
+    validate(&s, &current.team_id, &existing, &input.defaults, &mut input.items, &mut input.beds).await?;
 
     let mut tx = s.db.begin().await?;
     let res = sqlx::query(
@@ -379,6 +384,7 @@ pub async fn update(
             .await?;
     }
     tx.commit().await?;
+    crate::library::sweep_missing(&s).await?;
     let updated = fetch(&s, &id).await?;
     s.notify_screens_for_playlist(&updated.id, updated.version).await;
     Ok(Json(updated))
@@ -394,6 +400,7 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
         .execute(&s.db)
         .await?;
     sqlx::query("DELETE FROM playlists WHERE id = ?").bind(&id).execute(&s.db).await?;
+    crate::library::sweep_missing(&s).await?;
     schedule::refresh_clashes(&s, Some(&p)).await?;
     schedule::notify_screens(&s).await;
     schedule::broadcast_changed(&s, &current.team_id);

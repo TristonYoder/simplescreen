@@ -25,6 +25,8 @@ pub struct Config {
     pub listen: Option<String>,
     /// Externally reachable base URL (behind a reverse proxy or gateway).
     pub public_url: Option<String>,
+    /// Directories local libraries may live under (`<SLUG>_LIBRARY_ROOTS`, comma-separated).
+    pub library_roots: Vec<PathBuf>,
 }
 
 impl Config {
@@ -44,6 +46,7 @@ impl Config {
             org_name: None,
             org_timezone: None,
             listen: None,
+            library_roots: vec![],
             public_url: None,
             default_timezone: iana_time_zone::get_timezone().ok().filter(|t| t.parse::<chrono_tz::Tz>().is_ok()).unwrap_or_else(|| "UTC".into()),
         }
@@ -122,6 +125,13 @@ impl Config {
             cfg.listen = Some(l);
         }
         cfg.public_url = get("public_url").map(|u| u.trim_end_matches('/').to_string());
+        if let Some(r) = get("library_roots") {
+            for root in r.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let p = PathBuf::from(root);
+                anyhow::ensure!(p.is_absolute(), "library_roots entries must be absolute paths: {root}");
+                cfg.library_roots.push(p);
+            }
+        }
         Ok(cfg)
     }
 }

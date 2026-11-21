@@ -1,55 +1,168 @@
+use std::collections::HashSet;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::{
     auth::{Principal, Role},
     error::{ApiError, ApiJson, ApiResult},
+    library::{self, Access, Tree},
     models::{Media, MediaInput, MediaPatch, MEDIA_COLUMNS},
+    reach::World,
     state::AppState,
+    storage::{Backend, S3_SINGLE_PUT_LIMIT},
     util::{is_sha256, new_id, now},
 };
 
 #[derive(Deserialize)]
 pub struct ListQuery {
+    folder_id: Option<String>,
     team_id: Option<String>,
     kind: Option<String>,
 }
 
 pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Media>>> {
+    super::assignments::require_user(&p)?;
+    let (w, tree) = (World::load(&s).await?, Tree::load(&s).await?);
+    if let Some(t) = &q.team_id {
+        s.require_team(&p, t, Role::Viewer).await?;
+    }
+    if let Some(f) = &q.folder_id {
+        tree.get(f)?;
+        tree.require(&p, &w, f, Access::View)?;
+    }
+    let teams: Vec<String> = match &q.team_id {
+        Some(t) => vec![t.clone()],
+        None => p.memberships.iter().map(|m| m.team_id.clone()).collect(),
+    };
+    let used = library::used_by_teams(&s, &teams).await?;
     let rows: Vec<Media> = sqlx::query_as(&format!(
-        "SELECT {MEDIA_COLUMNS} FROM media WHERE (?1 IS NULL OR team_id = ?1) AND (?2 IS NULL OR kind = ?2)
-         ORDER BY created_at DESC"
+        "SELECT {MEDIA_COLUMNS} FROM media WHERE (?1 IS NULL OR folder_id = ?1) AND (?2 IS NULL OR kind = ?2)
+         ORDER BY path COLLATE NOCASE"
     ))
-    .bind(&q.team_id)
+    .bind(&q.folder_id)
     .bind(&q.kind)
     .fetch_all(&s.db)
     .await?;
-    Ok(Json(rows.into_iter().filter(|m| p.can_view(&m.team_id)).collect()))
+    let mut out = vec![];
+    for m in rows {
+        let folder_access = match (&m.folder_id, &q.team_id) {
+            (Some(f), Some(t)) if tree.team_reaches(&w, t, f) => {
+                if p.role_in(t).is_some_and(|r| r >= Role::Editor) { Access::Edit } else { Access::View }
+            }
+            (Some(_), Some(_)) | (None, _) => Access::None,
+            (Some(f), None) => tree.access(&p, &w, f),
+        };
+        let access = match folder_access {
+            Access::Edit => "edit",
+            Access::View => "view",
+            Access::None if used.contains(&m.id) => "playlist",
+            Access::None if q.team_id.is_none() && p.server_admin && q.folder_id.is_none() => "playlist",
+            Access::None => continue,
+        };
+        out.push(m.with_access(access));
+    }
+    Ok(Json(out))
 }
 
-pub async fn fetch(s: &AppState, id: &str) -> ApiResult<Media> {
-    sqlx::query_as(&format!("SELECT {MEDIA_COLUMNS} FROM media WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(&s.db)
-        .await?
-        .ok_or_else(ApiError::not_found)
+async fn visible(s: &AppState, p: &Principal, id: &str) -> ApiResult<(Media, &'static str)> {
+    super::assignments::require_user(p)?;
+    let m = library::fetch_media(s, id).await?;
+    let (w, tree) = (World::load(s).await?, Tree::load(s).await?);
+    let access = library::media_access(s, p, &w, &tree, &m).await?.ok_or_else(ApiError::not_found)?;
+    Ok((m, access))
 }
 
 pub async fn get(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Media>> {
-    let m = fetch(&s, &id).await?;
-    p.require(&m.team_id, Role::Viewer)?;
-    Ok(Json(m))
+    let (m, access) = visible(&s, &p, &id).await?;
+    Ok(Json(m.with_access(access)))
 }
 
-async fn blob_size(s: &AppState, sha: &str) -> ApiResult<Option<i64>> {
-    if !is_sha256(sha) {
-        return Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters"));
+pub async fn usage(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let (m, _) = visible(&s, &p, &id).await?;
+    Ok(Json(library::usage(&s, &p, &[m.id]).await?))
+}
+
+async fn name_free(s: &AppState, folder_id: &str, name: &str, except: Option<&str>) -> ApiResult<()> {
+    let taken: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM media WHERE folder_id = ? AND name = ? COLLATE NOCASE AND id != COALESCE(?, '')")
+            .bind(folder_id)
+            .bind(name)
+            .bind(except)
+            .fetch_optional(&s.db)
+            .await?;
+    match taken {
+        Some(_) => Err(ApiError::conflict("name_taken", "the folder already has a file with that name")),
+        None => Ok(()),
     }
-    Ok(tokio::fs::metadata(s.blob_path(sha)).await.ok().map(|m| m.len() as i64))
+}
+
+fn check_sha(sha: &str) -> ApiResult<()> {
+    if is_sha256(sha) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters"))
+    }
+}
+
+/// The folder (with Edit access) and the file's path in its library.
+async fn target(s: &AppState, p: &Principal, folder_id: &str, name: &str) -> ApiResult<(library::LibraryRow, String, String)> {
+    super::assignments::require_user(p)?;
+    let name = library::check_name(name)?;
+    let (w, tree) = (World::load(s).await?, Tree::load(s).await?);
+    let folder = tree.get(folder_id)?;
+    tree.require(p, &w, folder_id, Access::Edit)?;
+    let lib = library::library(s, &folder.library_id).await?;
+    let path = format!("{}/{name}", tree.path(folder_id));
+    Ok((lib, name, path))
+}
+
+#[derive(Deserialize)]
+pub struct UploadInput {
+    folder_id: String,
+    name: String,
+    sha256: String,
+    size: i64,
+    #[allow(dead_code)]
+    mime: String,
+}
+
+pub async fn upload(State(s): State<AppState>, p: Principal, ApiJson(input): ApiJson<UploadInput>) -> ApiResult<Json<Value>> {
+    check_sha(&input.sha256)?;
+    let (lib, name, path) = target(&s, &p, &input.folder_id, &input.name).await?;
+    name_free(&s, &input.folder_id, &name, None).await?;
+    if input.size < 0 {
+        return Err(ApiError::bad_request("size must not be negative"));
+    }
+    let backend = lib.backend()?;
+    let in_store = tokio::fs::metadata(s.blob_path(&input.sha256)).await.is_ok();
+    if !(in_store && matches!(backend, Backend::Managed)) {
+        library::ensure_space(&s, &lib, input.size).await?;
+    }
+    Ok(Json(match &backend {
+        Backend::Managed | Backend::Local(_) => json!({
+            "already_present": in_store, "method": "PUT",
+            "url": format!("/v1/blobs/{}", input.sha256), "headers": {},
+        }),
+        Backend::S3(b) => {
+            if input.size > S3_SINGLE_PUT_LIMIT {
+                return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large", "S3 uploads are limited to 5 GiB"));
+            }
+            let present = b.head(&path).await?.is_some_and(|(_, sha)| sha.as_deref() == Some(input.sha256.as_str()));
+            let (url, headers) = b.put_url(&path, &input.sha256)?;
+            let headers: serde_json::Map<String, Value> = headers.into_iter().map(|(k, v)| (k, json!(v))).collect();
+            let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+            json!({
+                "already_present": present, "method": "PUT", "url": url, "headers": headers,
+                "expires_at": expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            })
+        }
+    }))
 }
 
 pub async fn create(
@@ -57,30 +170,51 @@ pub async fn create(
     p: Principal,
     ApiJson(input): ApiJson<MediaInput>,
 ) -> ApiResult<(StatusCode, Json<Media>)> {
-    s.require_team(&p, &input.team_id, Role::Editor).await?;
-    if input.title.trim().is_empty() || input.mime.trim().is_empty() {
-        return Err(ApiError::bad_request("title and mime are required"));
+    check_sha(&input.sha256)?;
+    if input.mime.trim().is_empty() {
+        return Err(ApiError::bad_request("mime is required"));
     }
-    let size = blob_size(&s, &input.sha256)
-        .await?
-        .ok_or_else(|| ApiError::unprocessable("blob_missing", "blob has not been uploaded"))?;
+    let (lib, name, path) = target(&s, &p, &input.folder_id, &input.name).await?;
+    name_free(&s, &input.folder_id, &name, None).await?;
     if let Some(t) = &input.thumbnail_sha256 {
-        if blob_size(&s, t).await?.is_none() {
+        check_sha(t)?;
+        if tokio::fs::metadata(s.blob_path(t)).await.is_err() {
             return Err(ApiError::unprocessable("blob_missing", "thumbnail blob has not been uploaded"));
         }
     }
+    let staged = s.blob_path(&input.sha256);
+    let backend = lib.backend()?;
+    let size = match &backend {
+        Backend::Managed | Backend::Local(_) => {
+            let meta = tokio::fs::metadata(&staged)
+                .await
+                .map_err(|_| ApiError::unprocessable("blob_missing", "the file has not been uploaded"))?;
+            if matches!(backend, Backend::Local(_)) {
+                library::ensure_space(&s, &lib, meta.len() as i64).await?;
+                backend.put_from(&s, &staged, &path, &input.sha256).await?;
+            }
+            meta.len() as i64
+        }
+        Backend::S3(b) => match b.head(&path).await? {
+            None => return Err(ApiError::unprocessable("blob_missing", "the file has not been uploaded to S3")),
+            Some((size, sha)) if sha.as_deref() == Some(input.sha256.as_str()) => size,
+            Some(_) => return Err(ApiError::unprocessable("hash_mismatch", "the object in S3 does not match sha256")),
+        },
+    };
     let id = new_id();
-    sqlx::query(
-        "INSERT INTO media (id, team_id, kind, sha256, mime, title, width, height, duration_ms, codec, hdr,
+    let res = sqlx::query(
+        "INSERT INTO media (id, library_id, folder_id, name, path, kind, sha256, mime, width, height, duration_ms, codec, hdr,
             frame_rate, source_filename, thumbnail_sha256, size, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(&input.team_id)
+    .bind(&lib.id)
+    .bind(&input.folder_id)
+    .bind(&name)
+    .bind(&path)
     .bind(input.kind.as_str())
     .bind(&input.sha256)
-    .bind(&input.mime)
-    .bind(&input.title)
+    .bind(input.mime.trim())
     .bind(input.width)
     .bind(input.height)
     .bind(input.duration_ms)
@@ -93,45 +227,98 @@ pub async fn create(
     .bind(&p.subject)
     .bind(now())
     .execute(&s.db)
-    .await?;
-    Ok((StatusCode::CREATED, Json(fetch(&s, &id).await?)))
+    .await;
+    if let Err(e) = res {
+        return Err(match &e {
+            sqlx::Error::Database(d) if d.is_unique_violation() => ApiError::conflict("name_taken", "the folder already has a file with that name"),
+            _ => e.into(),
+        });
+    }
+    if !matches!(backend, Backend::Managed) {
+        library::gc_blob(&s, &input.sha256).await?;
+    }
+    library::changed(&s, Some(&input.folder_id));
+    Ok((StatusCode::CREATED, Json(library::fetch_media(&s, &id).await?.with_access("edit"))))
+}
+
+async fn editable(s: &AppState, p: &Principal, id: &str) -> ApiResult<(Media, Tree, World)> {
+    super::assignments::require_user(p)?;
+    let m = library::fetch_media(s, id).await?;
+    let (w, tree) = (World::load(s).await?, Tree::load(s).await?);
+    match &m.folder_id {
+        Some(f) => tree.require(p, &w, f, Access::Edit)?,
+        None => {
+            library::media_access(s, p, &w, &tree, &m).await?.ok_or_else(ApiError::not_found)?;
+            return Err(ApiError::unprocessable("media_missing", "the file was deleted"));
+        }
+    }
+    Ok((m, tree, w))
 }
 
 pub async fn patch(
     State(s): State<AppState>,
     p: Principal,
     Path(id): Path<String>,
-    ApiJson(patch): ApiJson<MediaPatch>,
+    ApiJson(input): ApiJson<MediaPatch>,
 ) -> ApiResult<Json<Media>> {
-    let m = fetch(&s, &id).await?;
-    p.require(&m.team_id, Role::Editor)?;
-    if let Some(title) = patch.title {
-        if title.trim().is_empty() {
-            return Err(ApiError::bad_request("title must not be empty"));
-        }
-        sqlx::query("UPDATE media SET title = ? WHERE id = ?").bind(title).bind(&id).execute(&s.db).await?;
+    let (m, tree, w) = editable(&s, &p, &id).await?;
+    let old_folder = m.folder_id.clone().unwrap_or_default();
+    let folder = input.folder_id.clone().unwrap_or_else(|| old_folder.clone());
+    let name = match &input.name {
+        Some(n) => library::check_name(n)?,
+        None => m.name.clone(),
+    };
+    if folder == old_folder && name == m.name {
+        return Ok(Json(m.with_access("edit")));
     }
-    Ok(Json(fetch(&s, &id).await?))
+    let dest = tree.get(&folder)?;
+    tree.require(&p, &w, &folder, Access::Edit)?;
+    name_free(&s, &folder, &name, Some(&m.id)).await?;
+    let path = format!("{}/{name}", tree.path(&folder));
+    let src_lib = library::library(&s, &m.library_id).await?;
+    if dest.library_id == m.library_id {
+        src_lib.backend()?.rename_file(&m.path, &path).await?;
+    } else {
+        let dst_lib = library::library(&s, &dest.library_id).await?;
+        library::ensure_space(&s, &dst_lib, m.size).await?;
+        let (src, dst) = (src_lib.backend()?, dst_lib.backend()?);
+        let (file, temp) = src.fetch_local(&s, &m.path, &m.sha256).await?;
+        let put = dst.put_from(&s, &file, &path, &m.sha256).await;
+        if temp {
+            let _ = tokio::fs::remove_file(&file).await;
+        }
+        put?;
+        src.delete_file(&m.path).await?;
+    }
+    sqlx::query("UPDATE media SET library_id = ?, folder_id = ?, name = ?, path = ? WHERE id = ?")
+        .bind(&dest.library_id)
+        .bind(&folder)
+        .bind(&name)
+        .bind(&path)
+        .bind(&m.id)
+        .execute(&s.db)
+        .await?;
+    if m.library_id == "managed" && dest.library_id != "managed" {
+        library::gc_blob(&s, &m.sha256).await?;
+    }
+    library::changed(&s, Some(&old_folder));
+    if folder != old_folder {
+        library::changed(&s, Some(&folder));
+    }
+    Ok(Json(library::fetch_media(&s, &id).await?.with_access("edit")))
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    let m = fetch(&s, &id).await?;
-    p.require(&m.team_id, Role::Editor)?;
-    let (refs,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM playlist_media WHERE media_id = ?").bind(&id).fetch_one(&s.db).await?;
-    if refs > 0 {
-        return Err(ApiError::conflict("media_in_use", "media is referenced by a playlist"));
-    }
-    sqlx::query("DELETE FROM media WHERE id = ?").bind(&id).execute(&s.db).await?;
-    for sha in [Some(m.sha256), m.thumbnail_sha256].into_iter().flatten() {
-        let (n,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM media WHERE sha256 = ?1 OR thumbnail_sha256 = ?1")
-                .bind(&sha)
-                .fetch_one(&s.db)
-                .await?;
-        if n == 0 {
-            let _ = tokio::fs::remove_file(s.blob_path(&sha)).await;
-        }
-    }
+    let (m, _, _) = editable(&s, &p, &id).await?;
+    library::delete_media(&s, &p, &m).await?;
+    library::changed(&s, m.folder_id.as_deref());
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Media ids a team may add to its playlists: files in folders it reaches.
+pub async fn usable_by_team(s: &AppState, team: &str) -> ApiResult<HashSet<String>> {
+    let (w, tree) = (World::load(s).await?, Tree::load(s).await?);
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, folder_id FROM media WHERE folder_id IS NOT NULL").fetch_all(&s.db).await?;
+    Ok(rows.into_iter().filter(|(_, f)| tree.team_reaches(&w, team, f)).map(|(id, _)| id).collect())
 }

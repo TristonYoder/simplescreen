@@ -5,7 +5,9 @@ mod folders;
 mod notices;
 mod tags;
 mod teams;
+mod libraries;
 mod media;
+mod media_folders;
 mod org;
 pub mod nodes;
 mod assignments;
@@ -46,8 +48,21 @@ pub fn router(state: AppState) -> Router {
             "/v1/blobs/{sha}",
             get(blobs::get).head(blobs::get).put(blobs::put).layer(DefaultBodyLimit::disable()),
         )
+        .route("/v1/libraries", get(libraries::list).post(libraries::create))
+        .route("/v1/libraries/test", post(libraries::test))
+        .route("/v1/libraries/{id}", get(libraries::get).patch(libraries::patch).delete(libraries::delete))
+        .route("/v1/media-folders", get(media_folders::list).post(media_folders::create))
+        .route(
+            "/v1/media-folders/{id}",
+            get(media_folders::get).patch(media_folders::patch).delete(media_folders::delete),
+        )
+        .route("/v1/media-folders/{id}/tags", put(media_folders::put_tags))
+        .route("/v1/media-folders/{id}/grants", put(media_folders::put_grants))
+        .route("/v1/media-folders/{id}/usage", get(media_folders::usage))
         .route("/v1/media", get(media::list).post(media::create))
+        .route("/v1/media/uploads", post(media::upload))
         .route("/v1/media/{id}", get(media::get).patch(media::patch).delete(media::delete))
+        .route("/v1/media/{id}/usage", get(media::usage))
         .route("/v1/playlists", get(playlists::list).post(playlists::create))
         .route(
             "/v1/playlists/{id}",

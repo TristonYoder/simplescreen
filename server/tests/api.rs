@@ -14,6 +14,8 @@ struct App {
     token: String,
     state: AppState,
     tags: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    folders: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    files: std::sync::atomic::AtomicUsize,
     _dir: tempfile::TempDir,
 }
 
@@ -41,7 +43,7 @@ impl App {
         tweak(&mut cfg);
         let state = build_state(cfg).await.unwrap();
         let token = state.bootstrap.clone().unwrap();
-        Self { router: router(state.clone()), token, state, tags: Default::default(), _dir: dir }
+        Self { router: router(state.clone()), token, state, tags: Default::default(), folders: Default::default(), files: Default::default(), _dir: dir }
     }
 
     async fn send(&self, method: &str, uri: &str, token: Option<&str>, headers: &[(&str, &str)], body: Body, json: bool) -> Resp {
@@ -111,10 +113,34 @@ impl App {
         sha
     }
 
+    /// A top-level managed-library folder granted to `team`.
+    async fn folder(&self, team: &str) -> String {
+        if let Some(f) = self.folders.lock().unwrap().get(team) {
+            return f.clone();
+        }
+        let r = self.call("POST", "/v1/media-folders", Some(json!({ "library_id": "managed", "name": format!("f-{team}") }))).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+        let f = r.json()["id"].as_str().unwrap().to_string();
+        let r = self.call("PUT", &format!("/v1/media-folders/{f}/grants"), Some(json!({ "team_ids": [team] }))).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        self.folders.lock().unwrap().insert(team.to_string(), f.clone());
+        f
+    }
+
     async fn media(&self, team: &str, kind: &str, mime: &str, data: &[u8]) -> (String, String) {
+        let folder = self.folder(team).await;
+        self.media_in(&folder, kind, mime, data).await
+    }
+
+    async fn media_in(&self, folder: &str, kind: &str, mime: &str, data: &[u8]) -> (String, String) {
         let sha = self.upload(data).await;
+        let n = self.files.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let r = self
-            .call("POST", "/v1/media", Some(json!({ "team_id": team, "kind": kind, "sha256": sha, "mime": mime, "title": "t" })))
+            .call(
+                "POST",
+                "/v1/media",
+                Some(json!({ "folder_id": folder, "name": format!("file {n}"), "kind": kind, "sha256": sha, "mime": mime })),
+            )
             .await;
         assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
         (r.json()["id"].as_str().unwrap().to_string(), sha)
@@ -153,7 +179,7 @@ async fn teams() {
         .await;
     assert_eq!(r.json()["oidc_bindings"][0]["role"], "editor");
     assert!(r.json().get("timezone").is_none());
-    app.media(&id, "image", "image/png", b"png").await;
+    app.call("POST", "/v1/playlists", Some(json!({ "team_id": id, "name": "P", "items": [] }))).await;
     let r = app.call("DELETE", &format!("/v1/teams/{id}"), None).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
 }
@@ -399,18 +425,21 @@ async fn blobs() {
 async fn media_lifecycle_and_delete_conflict() {
     let app = App::new().await;
     let g = app.team().await;
+    let folder = app.folder(&g).await;
 
     let missing = "a".repeat(64);
     let r = app
-        .call("POST", "/v1/media", Some(json!({ "team_id": g, "kind": "video", "sha256": missing, "mime": "video/mp4", "title": "x" })))
+        .call("POST", "/v1/media", Some(json!({ "folder_id": folder, "name": "x.mp4", "kind": "video", "sha256": missing, "mime": "video/mp4" })))
         .await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json()["code"], "blob_missing");
 
     let (media_id, sha) = app.media(&g, "video", "video/mp4", b"video-bytes").await;
     let r = app.call("GET", &format!("/v1/blobs/{sha}"), None).await;
     assert_eq!(r.headers[header::CONTENT_TYPE], "video/mp4");
-    let r = app.call("PATCH", &format!("/v1/media/{media_id}"), Some(json!({ "title": "Renamed" }))).await;
-    assert_eq!(r.json()["title"], "Renamed");
+    let r = app.call("PATCH", &format!("/v1/media/{media_id}"), Some(json!({ "name": "Renamed.mp4" }))).await;
+    assert_eq!(r.json()["name"], "Renamed.mp4");
+    assert_eq!(r.json()["path"], format!("f-{g}/Renamed.mp4"));
     assert_eq!(r.json()["size"], 11);
     let r = app.call("GET", &format!("/v1/media?team_id={g}&kind=video"), None).await;
     assert_eq!(r.json().as_array().unwrap().len(), 1);
@@ -421,14 +450,26 @@ async fn media_lifecycle_and_delete_conflict() {
     assert_eq!(r.status, StatusCode::CREATED);
     let pid = r.json()["id"].as_str().unwrap().to_string();
 
-    let r = app.call("DELETE", &format!("/v1/media/{media_id}"), None).await;
-    assert_eq!(r.status, StatusCode::CONFLICT);
-    assert_eq!(r.json()["code"], "media_in_use");
+    let r = app.call("GET", &format!("/v1/media/{media_id}/usage"), None).await;
+    assert_eq!(r.json()["playlists"][0]["id"], pid.as_str());
+    assert_eq!(r.json()["playlists"][0]["items"], 1);
 
-    app.call("DELETE", &format!("/v1/playlists/{pid}"), None).await;
+    // Deleting a file in use keeps it as missing; the playlist keeps the item.
     let r = app.call("DELETE", &format!("/v1/media/{media_id}"), None).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call("GET", &format!("/v1/media/{media_id}"), None).await;
+    assert_eq!(r.json()["missing"], true);
+    assert!(r.json().get("folder_id").is_none());
     let r = app.call("HEAD", &format!("/v1/blobs/{sha}"), None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    let r = app.call("GET", &format!("/v1/playlists/{pid}"), None).await;
+    assert_eq!(r.json()["version"], 2);
+    let r = app.call("DELETE", &format!("/v1/media/{media_id}"), None).await;
+    assert_eq!(r.json()["code"], "media_missing");
+
+    // Once no playlist uses it, the record goes too.
+    app.call("DELETE", &format!("/v1/playlists/{pid}"), None).await;
+    let r = app.call("GET", &format!("/v1/media/{media_id}"), None).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
@@ -605,7 +646,7 @@ async fn pairing_and_manifest() {
     let r = app.call_as(&token, "GET", &format!("/v1/blobs/{sha_v1}"), None).await;
     assert_eq!(r.status, StatusCode::OK);
     let r = app.call_as(&token, "GET", "/v1/media", None).await;
-    assert_eq!(r.json().as_array().unwrap().len(), 0);
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
     let r = app.call("GET", "/v1/device/manifest", None).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 
@@ -1510,7 +1551,7 @@ async fn org() -> Org {
     cfg.oidc_issuer = Some(idp.issuer.clone());
     cfg.oidc_admin_groups = vec!["admins".into()];
     let state = build_state(cfg).await.unwrap();
-    let app = App { router: router(state.clone()), token: idp.token("u-admin", &["admins"]), state, tags: Default::default(), _dir: dir };
+    let app = App { router: router(state.clone()), token: idp.token("u-admin", &["admins"]), state, tags: Default::default(), folders: Default::default(), files: Default::default(), _dir: dir };
     let team = |name: &str, ed: &str, view: &str| {
         json!({ "name": name, "oidc_bindings": [{ "claim_value": ed, "role": "editor" }, { "claim_value": view, "role": "viewer" }] })
     };
