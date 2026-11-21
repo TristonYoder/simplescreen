@@ -14,15 +14,26 @@ info:
     - Org-scoped requests (user calls, including `GET /v1/ws`) may send `X-Organization: <id>`.
       If present it must equal this server's org id, else `404 organization_not_found`.
       Absent is accepted. Device tokens and unauthenticated endpoints ignore it.
-    - Schedules use wall-clock times in the org's IANA `timezone` (`HH:MM`, `YYYY-MM-DDTHH:MM`).
-      Resolved segments are UTC timestamps.
+    - Screens, nodes, floor plans and tags belong to the org. Teams own content (media, playlist
+      folders, playlists, schedule entries). A team reaches a screen when its `screen_access` is `all`
+      or the screen carries one of the team's tags. A playlist is available on a screen when they
+      share a tag; an untagged playlist shows nowhere, and an untagged screen plays nothing.
+    - Screen permissions: admins manage tags, team reach, screen tags, floor plans, node name and
+      mode, and delete screens. Editors of a team that reaches a screen operate it (rename, place,
+      fallback, timezone, override, commands, assignments that target it). Viewers of a reaching
+      team see it. A screen the caller does not reach is 404.
+    - Nodes are hardware only: they have no team and no tags, and grant nothing. An assignment
+      (one output's job) is the node's whole grant to its target screen.
+    - Schedules use wall-clock times in the screen's zone (`Screen.timezone`, else the org's
+      `timezone`) (`HH:MM`, `YYYY-MM-DDTHH:MM`). Resolved segments are UTC timestamps.
     - Media blobs are content-addressed by lowercase hex SHA-256 and immutable.
     - Errors always use the `Error` schema.
     - Auth: `Authorization: Bearer <token>`. Token is an OIDC JWT (users), the
       bootstrap token (server admin), or a device token (paired screens).
       Blob GET and the WebSocket also accept `?token=` for clients that cannot set headers.
     - A node is a paired device (an Apple TV, or a Mac/iPad that drives several outputs). A node owns the
-      device token and one WebSocket, and plays one or more Screens, each bound to one of its outputs.
+      device token and one WebSocket, and plays one or more Screens through `program` outputs (every
+      program output of a Screen shows identical frames, and all of them are on one node).
       An Apple TV is a single-screen node: device endpoints without `screen_id` use its only screen.
     - WebSocket message schemas are `WsServerMessage` / `WsClientMessage` (JSON text frames).
   license:
@@ -47,6 +58,8 @@ tags:
   - name: device
   - name: schedule
   - name: floor-plans
+  - name: tags
+  - name: notices
 
 paths:
   /v1/info:
@@ -86,6 +99,25 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Me' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      operationId: updateMe
+      tags: [auth]
+      description: |
+        Users and the bootstrap admin. `timezone` is a display preference only (IANA zone; null = the
+        org's zone). Schedule times are always venue time. 422 `invalid_timezone`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MePatch' }
+      responses:
+        '200':
+          description: Current principal
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
   /v1/me/organizations:
     get:
@@ -234,7 +266,7 @@ paths:
     put:
       operationId: updateTeam
       tags: [teams]
-      description: Server admin or team admin.
+      description: Server admin or team admin. Renames the team and replaces its sign-in groups; reach is set with `putTeamTags`.
       requestBody:
         required: true
         content:
@@ -251,12 +283,144 @@ paths:
     delete:
       operationId: deleteTeam
       tags: [teams]
-      description: Server admin only. Fails with 409 if the team still owns resources.
+      description: Server admin only. Fails with 409 if the team still owns media or playlists.
       responses:
         '204': { description: Deleted }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/teams/{teamId}/tags:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/TeamId' }
+    put:
+      operationId: putTeamTags
+      tags: [teams]
+      description: |
+        Server admin only. Sets the team's reach: the tags it holds and, optionally, `screen_access`
+        (`all` reaches every screen). A change that makes two existing one-off entries overlap on a
+        screen still goes through: `clashes` lists them, both entries get `needs_resolution`, and their
+        creators and the caller get a `schedule_conflict` notice. The newer entry plays until fixed.
+        422 `invalid_tag`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TeamTagsInput' }
+      responses:
+        '200':
+          description: The team and any clashes the change caused
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TeamChange' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/teams/reach:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: getTeamReach
+      tags: [teams]
+      description: Server admin only. Which screens each team reaches, for the Teams and Tags settings.
+      responses:
+        '200':
+          description: Reach matrix
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TeamReach' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/tags:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: listTags
+      tags: [tags]
+      description: Any signed-in user. Every tag in the org, by name.
+      responses:
+        '200':
+          description: Tags
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Tag' }
+    post:
+      operationId: createTag
+      tags: [tags]
+      description: Server admin only. Names are unique ignoring case (409 `tag_exists`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tag' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/tags/{tagId}:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/TagId' }
+    patch:
+      operationId: updateTag
+      tags: [tags]
+      description: Server admin only. Rename or recolor.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tag' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      operationId: deleteTag
+      tags: [tags]
+      description: |
+        Server admin only. Removes the tag from every screen, team, playlist and schedule entry. Like
+        any retag, the change goes through even if it makes one-off entries clash; `clashes` lists them.
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChangeResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/tags/{tagId}/usage:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/TagId' }
+    get:
+      operationId: getTagUsage
+      tags: [tags]
+      description: Server admin only. What carries the tag.
+      responses:
+        '200':
+          description: Usage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TagUsage' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/blobs/{sha256}:
     parameters:
@@ -414,11 +578,19 @@ paths:
     get:
       operationId: listPlaylists
       tags: [playlists]
+      description: |
+        `scope=mine` (default): playlists of the caller's teams (all teams for admins). `scope=visible`:
+        also every other team's playlist that is available on a screen the caller reaches, read-only
+        ("On my screens"). `team_id` narrows either scope to one team.
       parameters:
         - name: team_id
           in: query
           required: false
           schema: { type: string, format: uuid }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string, enum: [mine, visible], default: mine }
       responses:
         '200':
           description: Playlist summaries
@@ -452,6 +624,7 @@ paths:
     get:
       operationId: getPlaylist
       tags: [playlists]
+      description: Viewers of the owning team, and anyone who reaches a screen the playlist is available on (read-only).
       responses:
         '200':
           description: Full playlist
@@ -482,10 +655,127 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+    patch:
+      operationId: movePlaylist
+      tags: [playlists]
+      description: Editor of the owning team. Moves the playlist to a folder of the same team (null = team root). Does not bump `version`. 422 `invalid_folder`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaylistPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Playlist' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
     delete:
       operationId: deletePlaylist
       tags: [playlists]
-      description: Screens assigned to it are unassigned (and notified).
+      description: Screens that used it as fallback fall back to the home menu; overrides showing it are cleared. Affected screens are notified.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/playlists/{playlistId}/tags:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/PlaylistId' }
+    put:
+      operationId: putPlaylistTags
+      tags: [playlists]
+      description: |
+        Editor of the owning team. Replaces the playlist's tags, separately from the `base_version`
+        autosave (the version does not change). An editor may only use tags the team holds (any tag for
+        a team with `screen_access: all`, or for admins); 422 `invalid_tag` otherwise. Screens that gain or
+        lose the playlist get `manifest_changed`. Clashes the change causes between one-off entries are
+        allowed and flagged, as for `putTeamTags`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagIdsInput' }
+      responses:
+        '200':
+          description: The playlist and any clashes
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlaylistChange' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/playlist-folders:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: listPlaylistFolders
+      tags: [playlists]
+      description: Folders of the caller's teams (all for admins), or of one team with `team_id` (viewer role).
+      parameters:
+        - name: team_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Folders, by position then name
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PlaylistFolder' }
+    post:
+      operationId: createPlaylistFolder
+      tags: [playlists]
+      description: Editor of the team. `parent_id` must be a folder of the same team (422 `invalid_folder`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaylistFolderInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlaylistFolder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/playlist-folders/{folderId}:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/FolderId' }
+    patch:
+      operationId: updatePlaylistFolder
+      tags: [playlists]
+      description: Editor of the team. Rename, reorder or move; a folder can't move into itself or a descendant (422 `invalid_folder`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PlaylistFolderPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PlaylistFolder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      operationId: deletePlaylistFolder
+      tags: [playlists]
+      description: Editor of the team. Its folders and playlists move to its parent.
       responses:
         '204': { description: Deleted }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -495,12 +785,7 @@ paths:
     get:
       operationId: listNodes
       tags: [nodes]
-      description: Viewer role. Nodes in teams the caller can see, with their reported outputs and screen ids.
-      parameters:
-        - name: team_id
-          in: query
-          required: false
-          schema: { type: string, format: uuid }
+      description: Any signed-in user. Every node in the org, with its reported outputs and the screens it plays.
       responses:
         '200':
           description: Nodes
@@ -516,13 +801,34 @@ paths:
     get:
       operationId: getNode
       tags: [nodes]
-      description: Viewer role.
+      description: Any signed-in user.
       responses:
         '200':
           description: Node
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Node' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateNode
+      tags: [nodes]
+      description: |
+        Server admin only: a node edit that touches no screen. Renames the node and/or changes its mode
+        (as `putDeviceMode`: leaving player releases its screens, which become unplaced). The node gets
+        `assignments_changed` on a mode change.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodePatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/nodes/{nodeId}/assignments:
@@ -531,7 +837,7 @@ paths:
     get:
       operationId: getNodeAssignments
       tags: [nodes]
-      description: Viewer role. What each output of the node should do, with the version Studio compares against `Node.applied_assignments_version`.
+      description: Any signed-in user. What each output of the node should do, with the version Studio compares against `Node.applied_assignments_version`.
       responses:
         '200':
           description: Assignments
@@ -543,9 +849,14 @@ paths:
       operationId: putNodeAssignments
       tags: [nodes]
       description: |
-        Editor role. Full replace (`updated_by` is the user). `base_version` must equal the current
-        version, else 409 `version_conflict` with the current `Assignments` in `Error.current`. The
-        rules are the same as `putDeviceAssignments`. The node gets `assignments_changed`.
+        Full replace (`updated_by` is the user). This is how a node gets new targets. Each output whose
+        job, screen or settings change needs the caller to operate every screen it targeted before and
+        after (an admin, or an editor of a team that reaches the screen), else 403. A changed output
+        that targets no screen before or after (for example a program job waiting for its screen) is
+        admin only. Unchanged outputs need nothing. `base_version` must equal the current version, else
+        409 `version_conflict` with the current `Assignments` in `Error.current`. The validation rules
+        are those of `putDeviceAssignments` (without its `target_not_assigned` limit). The node gets
+        `assignments_changed`.
       requestBody:
         required: true
         content:
@@ -569,11 +880,12 @@ paths:
       operationId: moveScreen
       tags: [screens]
       description: |
-        Editor role. Makes `output_key` of `node_id` play this screen (the node must be a player in the
-        screen's team and report the output). The screen's previous output (if any) becomes `off` and its
-        settings move with the screen; mirrors of it on the old node are switched off; a screen that was on
-        the target output becomes unplaced. Affected nodes get `assignments_changed`. 422:
-        `target_not_in_team`, `job_not_allowed_in_mode`, `unknown_output`.
+        Operate role on the screen (and on any screen the target output played). Makes `output_key` of
+        `node_id` (any player node in the org that reports the output) the screen's only program output.
+        Its previous program outputs become `off` and the settings of the first one (the audio one if
+        any) move with it; a screen that was on the target output loses that output (unplaced if it was
+        its last). Affected nodes get `assignments_changed`. 422: `unknown_node`,
+        `job_not_allowed_in_mode`, `unknown_output`.
       requestBody:
         required: true
         content:
@@ -595,7 +907,10 @@ paths:
     get:
       operationId: listScreens
       tags: [screens]
-      description: Includes unplaced screens (no `node_id` or `output_key`, because their output was released), which keep their schedule and placement.
+      description: |
+        The screens the caller reaches (every screen for admins). `team_id` narrows it to the screens
+        that team reaches. Includes unplaced screens (no `node_id`, because their program outputs were
+        released), which keep their schedule and placement.
       parameters:
         - name: team_id
           in: query
@@ -627,7 +942,12 @@ paths:
     patch:
       operationId: updateScreen
       tags: [screens]
-      description: Rename, assign a playlist (same team), or place on a floor plan (same team). Assigning notifies the device; user sockets in the team get `screen_updated`.
+      description: |
+        Operate role. Rename, place on a floor plan, set the nothing-scheduled `fallback_playlist_id`
+        (a playlist of a team the caller edits that is available on the screen, else 422
+        `playlist_unavailable`; null = home menu), or set `timezone` (IANA, null = the org zone; 422
+        `invalid_timezone`). Tags are set with `putScreenTags`. Each change is written to the activity
+        log. The device gets `manifest_changed`; reaching users get `screen_updated` and `screen_activity`.
       requestBody:
         required: true
         content:
@@ -646,7 +966,7 @@ paths:
       operationId: deleteScreen
       tags: [screens]
       description: |
-        Deletes the screen. Assignments that targeted it become off, and the node's reported
+        Server admin only. Deletes the screen. Assignments that targeted it become off, and the node's reported
         outputs drop that screen. If the node has no screens left it is unpaired: the device token
         is revoked and its socket closed. A node that still has another screen keeps its token.
       responses:
@@ -662,7 +982,7 @@ paths:
       operationId: sendScreenCommand
       tags: [screens]
       description: |
-        Remote-control a screen (editor role). 409 if the screen is offline. `jump` requires
+        Remote-control a screen (operate role; logged to the activity log). 409 if the screen is offline. `jump` requires
         `item_index` (>= 0) and takes an optional `step_index` for sequence pages (400 otherwise).
         The node receives it on its socket with `screen_id` set.
       requestBody:
@@ -685,9 +1005,11 @@ paths:
       operationId: setScreenOverride
       tags: [screens]
       description: |
-        Editor role. Plays a playlist (null = nothing) on this screen above every schedule entry
-        until `until`, the next scheduled change (`until_next_change`), or until cleared.
-        The device gets `manifest_changed`; user sockets in the team get `screen_updated`.
+        Operate role. Plays a playlist (null = blank) on this screen above every schedule entry
+        until `until`, the next scheduled change (`until_next_change`), or until cleared. The playlist
+        must belong to a team the caller edits and be available on the screen (422
+        `playlist_unavailable`). The last override wins. The device gets `manifest_changed`; reaching
+        users get `screen_updated` and `screen_activity`.
       requestBody:
         required: true
         content:
@@ -705,7 +1027,7 @@ paths:
     delete:
       operationId: clearScreenOverride
       tags: [screens]
-      description: Editor role. Returns the screen to its schedule.
+      description: Operate role. Returns the screen to its schedule. Any reaching editor may clear any override.
       responses:
         '200':
           description: Updated screen
@@ -715,18 +1037,102 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/screens/{screenId}/tags:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/ScreenId' }
+    put:
+      operationId: putScreenTags
+      tags: [screens]
+      description: |
+        Server admin only. Replaces the screen's tags, which decide which teams reach it and which
+        playlists it caches. `warnings` flags a fallback or override that is no longer available
+        (`fallback_unavailable` plays the home menu instead; `override_unavailable` is skipped).
+        Clashes between one-off entries are allowed and flagged as for `putTeamTags`. An untagged
+        screen plays nothing and gets an `untagged_screen` notice (to admins). Logged to the activity log.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagIdsInput' }
+      responses:
+        '200':
+          description: The screen, clashes and warnings
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScreenChange' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/screens/{screenId}/events:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/ScreenId' }
+    get:
+      operationId: listScreenEvents
+      tags: [screens]
+      description: Viewer of a reaching team. The screen's activity log, newest first.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScreenEvent' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/screens/overrides:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    post:
+      operationId: setScreenOverrides
+      tags: [screens]
+      description: |
+        Sets (or with `clear: true` clears) overrides on many screens: those in `screen_ids` plus those
+        carrying any of `tag_ids`. Every named screen must be one the caller operates (403 otherwise);
+        screens matched by tag that the caller doesn't operate are left out. The playlist must belong to
+        a team the caller edits; screens it isn't available on are skipped with an
+        `override_unavailable` warning. 422 `no_screens` when nothing matches.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BulkOverrideInput' }
+      responses:
+        '200':
+          description: The screens changed, and warnings for those skipped
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BulkOverrideResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
   /v1/schedule:
     parameters:
       - { $ref: '#/components/parameters/OrganizationHeader' }
     get:
       operationId: listSchedule
       tags: [schedule]
-      description: Viewer role. Every schedule entry in a team, plus the org timezone.
+      description: |
+        Schedule entries plus the org timezone. `scope=mine` (default): entries of the caller's teams
+        (or of `team_id`, viewer role). `scope=visible`: also other teams' entries that apply to a screen
+        the caller reaches, read-only.
       parameters:
         - name: team_id
           in: query
-          required: true
+          required: false
           schema: { type: string, format: uuid }
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string, enum: [mine, visible], default: mine }
       responses:
         '200':
           description: Entries
@@ -738,7 +1144,12 @@ paths:
     post:
       operationId: createScheduleEntry
       tags: [schedule]
-      description: Editor role. Affected devices get `manifest_changed`; user sockets get `schedule_changed`.
+      description: |
+        Editor role in `team_id`. `playlist_id` must be the team's; `screen_ids` must be screens the team
+        reaches and `tag_ids` tags the team holds (422 `invalid_schedule`). A one-off entry that would
+        play at the same time as another enabled one-off entry (of any team) on some screen is refused
+        with 409 `schedule_conflict`, listing the clashes in `Error.conflicts`. Affected devices get
+        `manifest_changed`; user sockets get `schedule_changed`.
       requestBody:
         required: true
         content:
@@ -751,6 +1162,33 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ScheduleEntry' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/schedule/preview:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    post:
+      operationId: previewScheduleEntry
+      tags: [schedule]
+      description: |
+        Editor role in `team_id`. Validates an entry as `createScheduleEntry` would and, without saving,
+        reports for each screen it applies to: the ranges it wins, the ranges another entry covers it,
+        the entries it covers, and any blocking one-off clash. Weekly entries are previewed for the next
+        14 days, one-off entries over their own range (at most 14 days). `entry_id` names the entry being
+        edited, so it is left out of the comparison. Overrides are ignored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SchedulePreviewInput' }
+      responses:
+        '200':
+          description: Preview
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SchedulePreview' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '422': { $ref: '#/components/responses/Unprocessable' }
 
   /v1/schedule/{entryId}:
@@ -760,7 +1198,7 @@ paths:
     put:
       operationId: updateScheduleEntry
       tags: [schedule]
-      description: Editor role. Replaces the entry (`team_id` must not change).
+      description: Editor role. Replaces the entry (`team_id` must not change). Same rules and 409 `schedule_conflict` as `createScheduleEntry`; saving a flagged entry without a clash clears `needs_resolution`.
       requestBody:
         required: true
         content:
@@ -774,6 +1212,7 @@ paths:
               schema: { $ref: '#/components/schemas/ScheduleEntry' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
     delete:
       operationId: deleteScheduleEntry
@@ -790,13 +1229,15 @@ paths:
       operationId: getScheduleTimeline
       tags: [schedule]
       description: |
-        Viewer role. What each screen in the team plays between `from` and `to` (at most 14 days),
-        with overrides, one-off events, weekly entries and default playlists resolved.
-        Segments are contiguous and cover the whole range.
+        What each screen the caller reaches (or that `team_id` reaches, viewer role) plays between
+        `from` and `to` (at most 14 days), resolved across every team: override > once > weekly >
+        nothing-scheduled (the fallback playlist, else the home menu). Within a tier: screen match > tag
+        match > team-wide, then the newest entry. Entries whose playlist isn't available on the screen
+        are skipped. Segments are contiguous and cover the whole range.
       parameters:
         - name: team_id
           in: query
-          required: true
+          required: false
           schema: { type: string, format: uuid }
         - name: from
           in: query
@@ -822,11 +1263,7 @@ paths:
     get:
       operationId: listFloorPlans
       tags: [floor-plans]
-      parameters:
-        - name: team_id
-          in: query
-          required: true
-          schema: { type: string, format: uuid }
+      description: Any signed-in user. Floor plans belong to the org.
       responses:
         '200':
           description: Floor plans in display order
@@ -839,7 +1276,7 @@ paths:
     post:
       operationId: createFloorPlan
       tags: [floor-plans]
-      description: Editor role. Upload the image with `PUT /v1/blobs/{sha256}` first. User sockets in the team get `floor_plans_changed`.
+      description: Server admin only. Upload the image with `PUT /v1/blobs/{sha256}` first. User sockets get `floor_plans_changed`.
       requestBody:
         required: true
         content:
@@ -862,7 +1299,7 @@ paths:
     put:
       operationId: updateFloorPlan
       tags: [floor-plans]
-      description: Editor role. `team_id` must match. User sockets in the team get `floor_plans_changed`.
+      description: Server admin only. User sockets get `floor_plans_changed`.
       requestBody:
         required: true
         content:
@@ -881,7 +1318,7 @@ paths:
     delete:
       operationId: deleteFloorPlan
       tags: [floor-plans]
-      description: Editor role. Screens placed on it become unplaced. User sockets get `floor_plans_changed`.
+      description: Server admin only. Screens placed on it lose their placement. User sockets get `floor_plans_changed`.
       responses:
         '204': { description: Deleted }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -917,9 +1354,13 @@ paths:
       operationId: claimPairing
       tags: [pairing]
       description: |
-        Editor role in target team. Creates the node. For a `single` pairing it also creates the node's
-        one Screen (output key `main`) and returns that Screen; for a `node` pairing it returns the Node
-        (no screens yet; the node creates them with `createDeviceScreen`).
+        Server admin or an editor of any team. Creates the node (nodes have no team). For a `single`
+        pairing it also creates the node's one Screen (program output `main`) with `tag_ids` and returns
+        that Screen. An editor must give it at least one tag a team they edit holds, and only such tags,
+        so it lands in their reach (422 `tag_required` / `invalid_tag`); an admin may leave it untagged.
+        `playlist_id` sets the fallback and follows `updateScreen`'s rule. For a `node` pairing it returns
+        the Node (no screens yet; the node creates untagged screens with `createDeviceScreen`);
+        `tag_ids` and `playlist_id` are 400 there.
       requestBody:
         required: true
         content:
@@ -992,7 +1433,10 @@ paths:
     get:
       operationId: listDevicePlaylists
       tags: [device]
-      description: Device token only. Playlists in the screen's team, for choosing on the device. `screen_id` as for `getDeviceManifest`, except that only screens the node plays or holds a control assignment on are allowed (confidence-only is 403).
+      description: |
+        Device token only. The screen's picker tree (the same as `Manifest.picker`), for choosing on the
+        device. `screen_id` as for `getDeviceManifest`, except that only screens the node plays or holds
+        a control assignment on are allowed (confidence-only is 403).
       parameters:
         - { $ref: '#/components/parameters/DeviceScreenIdQuery' }
       responses:
@@ -1002,7 +1446,7 @@ paths:
             application/json:
               schema:
                 type: array
-                items: { $ref: '#/components/schemas/PlaylistSummary' }
+                items: { $ref: '#/components/schemas/PickerNode' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -1012,10 +1456,11 @@ paths:
       operationId: selectDevicePlaylist
       tags: [device]
       description: |
-        Device token only. Picks a playlist from the screen's team (null = nothing).
-        If the screen has a schedule in the next 14 days this is an override until the next scheduled
-        change; otherwise it sets the screen's default playlist like `updateScreen`.
-        The device gets `manifest_changed`; user sockets in the team get `screen_updated`.
+        Device token only. Picks a playlist available on the screen (null = home menu; 422
+        `playlist_unavailable` otherwise). If the screen has a schedule in the next 14 days this is an
+        override until the next scheduled change; otherwise it sets the screen's fallback. Logged to the
+        activity log with the node as the actor. The device gets `manifest_changed`; reaching users get
+        `screen_updated`.
         This is the same whether chosen on a Control output or with a remote. `screen_id` in the body
         may be omitted when the node has exactly one screen. It may also name a screen the node holds a control assignment on (a remote choice, same override semantics); a confidence-only target is 403 and any other screen is 404.
       requestBody:
@@ -1073,10 +1518,12 @@ paths:
       operationId: createDeviceScreen
       tags: [device]
       description: |
-        Device token only. Creates a screen in the node's team, bound to one of the node's reported
-        outputs, with no Studio approval. 422 `unknown_output` if `output_key` is not in the node's
-        outputs; 409 `output_has_screen` if that output already has a screen. The matching output's
-        `screen_id` is filled in. User sockets in the team get `screen_updated` and `node_updated`.
+        Device token only, player mode. Creates a new untagged screen on one of the node's reported
+        outputs (as its program output), with no Studio approval. It grants nothing and plays nothing
+        until an admin tags it; admins get an `untagged_screen` notice. 422 `unknown_output` if
+        `output_key` is not in the node's outputs; 409 `output_has_screen` if that output already plays
+        a screen. The matching output's `screen_id` is filled in. Admins get `screen_updated` and
+        everyone gets `node_updated`.
       requestBody:
         required: true
         content:
@@ -1109,16 +1556,19 @@ paths:
       tags: [device]
       description: |
         Device token only. Full replace of the node's assignments; omitted outputs lose their job. The
-        device's own change counts as applied (`applied_assignments_version` follows). 409 `version_conflict`
-        (current `Assignments` in `Error.current`) when `base_version` is stale. 422 codes:
-        `job_not_allowed_in_mode` (controller and stage: only control, confidence, off),
-        `screen_has_output` (a screen already played by another output, or twice in the request),
-        `screen_must_be_local` (screen job for a screen played by another node), `mirror_must_be_local`,
-        `control_needs_input` (output kind decklink or virtual), `target_not_in_team`, `unknown_output`
-        (output not in the reported outputs; allowed only for job `off`), `screen_required` (mirror, control
-        and confidence need `screen_id`), `audio_conflict` (one audio-enabled assignment per screen across
-        the team), `invalid_assignments`. A screen job without `screen_id` is stored as is and the screen is
-        created with `createDeviceScreen`. Removing a screen job unplaces the screen (it is never deleted).
+        device's own change counts as applied (`applied_assignments_version` follows). A change made on
+        the device can only rearrange the screens the node is already assigned to (any job): move them
+        between its outputs, swap them, change their settings, or turn outputs off. Any other
+        `screen_id` is 403 `target_not_assigned`; new targets come from Studio (`putNodeAssignments`),
+        and new screens from `createDeviceScreen`. 409 `version_conflict` (current `Assignments` in
+        `Error.current`) when `base_version` is stale. 422 codes: `job_not_allowed_in_mode` (controller and
+        stage: only control, confidence, off), `screen_must_be_local` (program job for a screen whose
+        program outputs are on another node), `control_needs_input` (output kind decklink or virtual),
+        `unknown_screen`, `unknown_output` (output not in the reported outputs; allowed only for job
+        `off`), `screen_required` (control and confidence need `screen_id`), `audio_conflict` (one
+        audio-enabled assignment per screen across the org), `invalid_assignments`. A program job without
+        `screen_id` is stored as is and the screen is created with `createDeviceScreen`. Removing a
+        screen's last program job unplaces the screen (it is never deleted).
       requestBody:
         required: true
         content:
@@ -1131,6 +1581,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Assignments' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
 
@@ -1140,7 +1591,7 @@ paths:
       tags: [device]
       description: |
         Device token only. Changes what the device is for. Leaving player releases the node's screens
-        (they become unplaced, keeping schedule and placement) and drops its screen and mirror assignments.
+        (they become unplaced, keeping schedule and placement) and drops its program assignments.
         Bumps the assignments version. Returns the new `Assignments`.
       requestBody:
         required: true
@@ -1154,21 +1605,6 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Assignments' }
         '400': { description: Unknown mode, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-
-  /v1/device/team-screens:
-    get:
-      operationId: listDeviceTeamScreens
-      tags: [device]
-      description: Device token only. Every screen in the node's team, for the control and confidence pickers.
-      responses:
-        '200':
-          description: Screens
-          content:
-            application/json:
-              schema:
-                type: array
-                items: { $ref: '#/components/schemas/TeamScreen' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /v1/device/screens/{screenId}/command:
@@ -1192,6 +1628,42 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/notices:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: listNotices
+      tags: [notices]
+      description: |
+        The caller's notices (admins also get notices addressed to every admin), newest first. By
+        default only open ones (not resolved, not dismissed); `all=true` includes the rest. A notice
+        resolves itself when its cause goes away (a clash is fixed, a screen gets a tag).
+      parameters:
+        - name: all
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Notices
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Notice' }
+
+  /v1/notices/{noticeId}/dismiss:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/NoticeId' }
+    post:
+      operationId: dismissNotice
+      tags: [notices]
+      description: Hides the notice. A notice addressed to every admin is dismissed for all of them.
+      responses:
+        '204': { description: Dismissed }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/ws:
     parameters:
@@ -1258,6 +1730,21 @@ components:
       schema: { type: string, format: uuid }
     NodeId:
       name: nodeId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TagId:
+      name: tagId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    FolderId:
+      name: folderId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    NoticeId:
+      name: noticeId
       in: path
       required: true
       schema: { type: string, format: uuid }
@@ -1332,6 +1819,10 @@ components:
           oneOf:
             - { $ref: '#/components/schemas/Playlist' }
             - { $ref: '#/components/schemas/Assignments' }
+        conflicts:
+          type: array
+          description: Present on `schedule_conflict`. The one-off entries the saved entry would clash with.
+          items: { $ref: '#/components/schemas/ScheduleClash' }
 
     ServerInfo:
       type: object
@@ -1446,6 +1937,12 @@ components:
           items: { $ref: '#/components/schemas/Membership' }
         node_id: { type: string, format: uuid, description: Set for device principals }
         screen_id: { type: string, format: uuid, description: Set for device principals whose node has exactly one screen }
+        timezone: { type: [string, 'null'], description: 'Display zone (IANA); null = the org zone. Users only.' }
+
+    MePatch:
+      type: object
+      properties:
+        timezone: { type: [string, 'null'], description: IANA zone; null = the org zone }
 
     Membership:
       type: object
@@ -1475,16 +1972,147 @@ components:
             `claim_value` must be non-empty and appear at most once.
           items: { $ref: '#/components/schemas/OidcBinding' }
 
+    ScreenAccess:
+      type: string
+      enum: [all, tags]
+      description: '`all` reaches every screen; `tags` (default) reaches screens carrying one of the team''s tags.'
+
     Team:
       type: object
-      required: [id, name, oidc_bindings, created_at]
+      required: [id, name, oidc_bindings, screen_access, tag_ids, created_at]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
         oidc_bindings:
           type: array
           items: { $ref: '#/components/schemas/OidcBinding' }
+        screen_access: { $ref: '#/components/schemas/ScreenAccess' }
+        tag_ids:
+          type: array
+          description: Tags the team holds
+          items: { type: string, format: uuid }
         created_at: { type: string, format: date-time }
+
+    TeamTagsInput:
+      type: object
+      required: [tag_ids]
+      properties:
+        tag_ids:
+          type: array
+          items: { type: string, format: uuid }
+        screen_access: { $ref: '#/components/schemas/ScreenAccess' }
+
+    TeamChange:
+      type: object
+      required: [team, clashes, warnings]
+      properties:
+        team: { $ref: '#/components/schemas/Team' }
+        clashes:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleClash' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/ChangeWarning' }
+
+    TeamReach:
+      type: object
+      required: [teams]
+      properties:
+        teams:
+          type: array
+          items:
+            type: object
+            required: [team_id, team_name, screen_access, tag_ids, screen_ids]
+            properties:
+              team_id: { type: string, format: uuid }
+              team_name: { type: string }
+              screen_access: { $ref: '#/components/schemas/ScreenAccess' }
+              tag_ids:
+                type: array
+                items: { type: string, format: uuid }
+              screen_ids:
+                type: array
+                description: Screens the team reaches
+                items: { type: string, format: uuid }
+
+    Tag:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, description: Unique ignoring case }
+        color: { type: string, description: 'Display color, e.g. #FF9500' }
+        created_at: { type: string, format: date-time }
+
+    TagInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1 }
+        color: { type: [string, 'null'] }
+
+    TagPatch:
+      type: object
+      properties:
+        name: { type: string, minLength: 1 }
+        color: { type: [string, 'null'] }
+
+    TagUsage:
+      type: object
+      required: [screen_ids, team_ids, playlist_ids, entry_ids]
+      properties:
+        screen_ids: { type: array, items: { type: string, format: uuid } }
+        team_ids: { type: array, items: { type: string, format: uuid } }
+        playlist_ids: { type: array, items: { type: string, format: uuid } }
+        entry_ids: { type: array, description: Schedule entries targeting the tag, items: { type: string, format: uuid } }
+
+    TagIdsInput:
+      type: object
+      required: [tag_ids]
+      properties:
+        tag_ids:
+          type: array
+          items: { type: string, format: uuid }
+
+    ScheduleClash:
+      type: object
+      description: Two one-off entries that would both play on a screen over the same time.
+      required: [entry_ids, screen_id, starts_at, ends_at]
+      properties:
+        entry_ids:
+          type: array
+          minItems: 2
+          maxItems: 2
+          description: Older entry first
+          items: { type: string, format: uuid }
+        screen_id: { type: string, format: uuid }
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+
+    ChangeWarningCode:
+      type: string
+      enum: [fallback_unavailable, override_unavailable]
+
+    ChangeWarning:
+      type: object
+      required: [code, message]
+      properties:
+        code: { $ref: '#/components/schemas/ChangeWarningCode' }
+        message: { type: string }
+        screen_id: { type: string, format: uuid }
+        playlist_id: { type: string, format: uuid }
+
+    ChangeResult:
+      type: object
+      required: [clashes, warnings]
+      properties:
+        clashes:
+          type: array
+          description: One-off clashes this change newly caused (allowed and flagged)
+          items: { $ref: '#/components/schemas/ScheduleClash' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/ChangeWarning' }
 
     BlobInfo:
       type: object
@@ -1640,6 +2268,7 @@ components:
       properties:
         team_id: { type: string, format: uuid }
         name: { type: string, minLength: 1 }
+        folder_id: { type: [string, 'null'], format: uuid, description: A folder of the same team; null = team root }
         loop: { type: boolean, default: true, description: Restart at item 1 after the last item }
         defaults: { $ref: '#/components/schemas/PlaylistDefaults' }
         items:
@@ -1666,10 +2295,14 @@ components:
 
     PlaylistSummary:
       type: object
-      required: [id, team_id, name, version, item_count, updated_at]
+      required: [id, team_id, name, version, item_count, tag_ids, updated_at]
       properties:
         id: { type: string, format: uuid }
         team_id: { type: string, format: uuid }
+        folder_id: { type: string, format: uuid }
+        tag_ids:
+          type: array
+          items: { type: string, format: uuid }
         name: { type: string }
         version: { type: integer, format: int64 }
         item_count: { type: integer }
@@ -1678,10 +2311,15 @@ components:
 
     Playlist:
       type: object
-      required: [id, team_id, name, version, loop, defaults, items, beds, updated_at]
+      required: [id, team_id, name, version, loop, defaults, items, beds, tag_ids, updated_at]
       properties:
         id: { type: string, format: uuid }
         team_id: { type: string, format: uuid }
+        folder_id: { type: string, format: uuid, description: Absent = team root }
+        tag_ids:
+          type: array
+          description: The playlist shows on screens sharing one of these tags; empty = nowhere
+          items: { type: string, format: uuid }
         name: { type: string }
         version: { type: integer, format: int64 }
         loop: { type: boolean }
@@ -1694,6 +2332,51 @@ components:
           items: { $ref: '#/components/schemas/Bed' }
         updated_at: { type: string, format: date-time }
         updated_by: { type: string }
+
+    PlaylistPatch:
+      type: object
+      required: [folder_id]
+      properties:
+        folder_id: { type: [string, 'null'], format: uuid }
+
+    PlaylistChange:
+      type: object
+      required: [playlist, clashes, warnings]
+      properties:
+        playlist: { $ref: '#/components/schemas/Playlist' }
+        clashes:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleClash' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/ChangeWarning' }
+
+    PlaylistFolder:
+      type: object
+      required: [id, team_id, name, position, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
+        parent_id: { type: string, format: uuid, description: Absent = top level }
+        name: { type: string }
+        position: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    PlaylistFolderInput:
+      type: object
+      required: [team_id, name]
+      properties:
+        team_id: { type: string, format: uuid }
+        parent_id: { type: [string, 'null'], format: uuid }
+        name: { type: string, minLength: 1 }
+        position: { type: integer, description: Defaults to last }
+
+    PlaylistFolderPatch:
+      type: object
+      properties:
+        parent_id: { type: [string, 'null'], format: uuid }
+        name: { type: string, minLength: 1 }
+        position: { type: integer }
 
     ScreenState:
       type: string
@@ -1732,16 +2415,27 @@ components:
 
     Screen:
       type: object
-      required: [id, team_id, name, online, status, created_at]
+      required: [id, name, tag_ids, team_ids, output_keys, online, status, created_at]
       properties:
         id: { type: string, format: uuid }
-        team_id: { type: string, format: uuid }
         name: { type: string }
-        playlist_id: { type: string, format: uuid, description: Default playlist (plays when nothing is scheduled) }
+        tag_ids:
+          type: array
+          description: Empty = untagged (plays nothing, flagged in notices)
+          items: { type: string, format: uuid }
+        team_ids:
+          type: array
+          description: Teams that reach this screen
+          items: { type: string, format: uuid }
+        fallback_playlist_id: { type: string, format: uuid, description: 'Plays when nothing is scheduled; absent = the home menu' }
+        timezone: { type: string, description: 'IANA zone for this screen''s schedule; absent = the org zone' }
         override: { $ref: '#/components/schemas/ScreenOverride' }
         placement: { $ref: '#/components/schemas/ScreenPlacement' }
-        node_id: { type: string, format: uuid, description: The node that plays this screen }
-        output_key: { type: string, description: The node output that plays this screen }
+        node_id: { type: string, format: uuid, description: The node whose program outputs play this screen; absent = unplaced }
+        output_keys:
+          type: array
+          description: The node's program outputs for this screen (identical frames)
+          items: { type: string }
         online: { type: boolean, description: True while the screen's node has its socket open }
         status: { $ref: '#/components/schemas/ScreenStatus' }
         last_seen_at: { type: string, format: date-time }
@@ -1751,15 +2445,71 @@ components:
       type: object
       properties:
         name: { type: string }
-        playlist_id:
+        fallback_playlist_id:
           type: [string, 'null']
           format: uuid
-          description: null unassigns
+          description: null = the home menu
+        timezone:
+          type: [string, 'null']
+          description: IANA zone; null = the org zone
         placement:
           oneOf:
             - $ref: '#/components/schemas/ScreenPlacement'
             - type: 'null'
           description: null removes the screen from its floor plan
+
+    ScreenChange:
+      type: object
+      required: [screen, clashes, warnings]
+      properties:
+        screen: { $ref: '#/components/schemas/Screen' }
+        clashes:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleClash' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/ChangeWarning' }
+
+    ScreenEventKind:
+      type: string
+      enum: [created, renamed, placed, fallback, timezone, tags, override, override_cleared, command]
+
+    ScreenEvent:
+      type: object
+      required: [id, screen_id, kind, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        screen_id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/ScreenEventKind' }
+        user_sub: { type: string, description: 'Who did it: a user subject, `bootstrap`, or a node id for device changes' }
+        user_name: { type: string }
+        team_id: { type: string, format: uuid, description: The team the actor acted for, when there is one }
+        detail: { type: object, additionalProperties: true, description: 'Kind-specific, e.g. {"name": ...}, {"playlist_id": ...}, {"command": ...}' }
+        created_at: { type: string, format: date-time }
+
+    BulkOverrideInput:
+      type: object
+      properties:
+        screen_ids:
+          type: array
+          items: { type: string, format: uuid }
+        tag_ids:
+          type: array
+          items: { type: string, format: uuid }
+        playlist_id: { type: [string, 'null'], format: uuid, description: null = blank }
+        until: { type: [string, 'null'], format: date-time }
+        clear: { type: boolean, default: false, description: Clear the overrides instead }
+
+    BulkOverrideResult:
+      type: object
+      required: [screens, warnings]
+      properties:
+        screens:
+          type: array
+          items: { $ref: '#/components/schemas/Screen' }
+        warnings:
+          type: array
+          items: { $ref: '#/components/schemas/ChangeWarning' }
 
     ScreenPlacement:
       type: object
@@ -1771,9 +2521,8 @@ components:
 
     FloorPlanInput:
       type: object
-      required: [team_id, name]
+      required: [name]
       properties:
-        team_id: { type: string, format: uuid }
         name: { type: string }
         image_sha256:
           type: [string, 'null']
@@ -1803,7 +2552,10 @@ components:
 
     AssignmentJob:
       type: string
-      enum: [screen, mirror, control, confidence, off]
+      enum: [program, control, confidence, off]
+      description: |
+        `program` shows the screen (a screen may have several program outputs, all on one node, all
+        identical; at most one with audio). `control` and `confidence` target a screen on any node.
 
     AssignmentView:
       type: string
@@ -1830,7 +2582,7 @@ components:
       properties:
         output_key: { type: string }
         job: { $ref: '#/components/schemas/AssignmentJob' }
-        screen_id: { type: string, format: uuid, description: Target screen. Optional for a screen job whose screen is not created yet; required for mirror, control and confidence; ignored for off }
+        screen_id: { type: string, format: uuid, description: Target screen. Optional for a program job whose screen is not created yet; required for control and confidence; ignored for off }
         settings: { $ref: '#/components/schemas/AssignmentSettings' }
         updated_by: { type: string, description: Server-set, ignored on input }
         updated_at: { type: string, format: date-time, description: Server-set, ignored on input }
@@ -1867,22 +2619,9 @@ components:
         node_id: { type: string, format: uuid }
         output_key: { type: string }
 
-    TeamScreen:
-      type: object
-      required: [id, name, online, placed]
-      properties:
-        id: { type: string, format: uuid }
-        name: { type: string }
-        node_id: { type: string, format: uuid, description: Absent when the screen is unplaced }
-        node_name: { type: string }
-        node_mode: { $ref: '#/components/schemas/NodeMode' }
-        online: { type: boolean }
-        output_key: { type: string }
-        placed: { type: boolean, description: True when an output plays the screen }
-
     OutputRole:
       type: string
-      enum: [screen, mirror, control, confidence, none]
+      enum: [program, control, confidence, none]
 
     Output:
       type: object
@@ -1895,7 +2634,7 @@ components:
         kind: { $ref: '#/components/schemas/OutputKind' }
         name: { type: string }
         role: { $ref: '#/components/schemas/OutputRole' }
-        screen_id: { type: string, format: uuid, description: The screen this output plays (role=screen); server-maintained }
+        screen_id: { type: string, format: uuid, description: The screen this output plays (role=program); server-maintained }
         format: { type: string, description: 'Display mode, e.g. 1920x1080@59.94' }
         audio_device: { type: string }
 
@@ -1921,10 +2660,10 @@ components:
 
     Node:
       type: object
-      required: [id, team_id, name, outputs, screen_ids, mode, assignments_version, applied_assignments_version, online, created_at]
+      description: Hardware only. A node has no team and no tags; permissions follow the screens it serves.
+      required: [id, name, outputs, screen_ids, mode, assignments_version, applied_assignments_version, online, created_at]
       properties:
         id: { type: string, format: uuid }
-        team_id: { type: string, format: uuid }
         name: { type: string }
         mode: { $ref: '#/components/schemas/NodeMode' }
         assignments_version: { type: integer, format: int64, description: Desired assignments version; bumps on every change }
@@ -1942,6 +2681,12 @@ components:
         status: { $ref: '#/components/schemas/NodeStatus' }
         last_seen_at: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
+
+    NodePatch:
+      type: object
+      properties:
+        name: { type: string, minLength: 1 }
+        mode: { $ref: '#/components/schemas/NodeMode' }
 
     DeviceNode:
       type: object
@@ -1967,15 +2712,18 @@ components:
         playlist_id:
           type: [string, 'null']
           format: uuid
-          description: null unassigns
+          description: null = the home menu
 
     ScreenOverride:
       type: object
       required: [set_at]
       properties:
-        playlist_id: { type: [string, 'null'], format: uuid, description: null = show nothing }
+        playlist_id: { type: [string, 'null'], format: uuid, description: null = blank }
         until: { type: string, format: date-time, description: Absent = until cleared }
         set_at: { type: string, format: date-time }
+        set_by: { type: string, description: 'Subject of whoever set it (a node id when set on the device)' }
+        set_by_name: { type: string }
+        team_id: { type: string, format: uuid, description: 'The team it was set for ("Overridden by Sam (Facilities)")' }
 
     ScreenOverrideInput:
       type: object
@@ -1998,16 +2746,23 @@ components:
         `weekly`: `days` + `start_time`/`end_time`; an end at or before the start runs past midnight
         (equal = 24 h). Optional `starts_on`/`ends_on` (inclusive) bound the recurrence, and
         `skip_dates` lists occurrence start dates that don't run (one-off edits pair a skip with a `once` entry).
-        `once`: `starts_at`/`ends_at`, end after start.
-        Precedence: override > once > weekly > default playlist. Within a tier, entries naming
-        screens beat team-wide ones, then the newest entry wins.
+        `once`: `starts_at`/`ends_at`, end after start. Times are wall clock in each screen's zone.
+        Targets: `screen_ids` and `tag_ids` both empty = team-wide (every screen the team reaches);
+        otherwise the named screens plus the screens carrying any of the tags (only those the team reaches).
+        Precedence: override > once > weekly > nothing-scheduled. Within a tier: screen match > tag match
+        > team-wide, then the newest entry wins. An entry is skipped on a screen its playlist isn't
+        available on. A null playlist plays black (`display: blank`).
       properties:
         team_id: { type: string, format: uuid }
-        playlist_id: { type: [string, 'null'], format: uuid, description: null = show nothing }
+        playlist_id: { type: [string, 'null'], format: uuid, description: null = blank }
         title: { type: string }
         screen_ids:
           type: array
-          description: Empty or absent = every screen in the team
+          description: Screens the team reaches
+          items: { type: string, format: uuid }
+        tag_ids:
+          type: array
+          description: Tags the team holds
           items: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/ScheduleEntryKind' }
         enabled: { type: boolean, default: true }
@@ -2030,9 +2785,11 @@ components:
       allOf:
         - $ref: '#/components/schemas/ScheduleEntryInput'
         - type: object
-          required: [id, screen_ids, enabled, created_at, updated_at]
+          required: [id, screen_ids, tag_ids, enabled, needs_resolution, created_at, updated_at]
           properties:
             id: { type: string, format: uuid }
+            created_by: { type: string, description: Subject of the creator }
+            needs_resolution: { type: boolean, description: 'A one-off that clashes with another one-off after an admin retag or reach change; the newer one plays' }
             created_at: { type: string, format: date-time }
             updated_at: { type: string, format: date-time }
 
@@ -2048,16 +2805,76 @@ components:
     SegmentSource:
       type: string
       enum: [override, once, weekly, default]
+      description: '`default` = nothing scheduled (the fallback playlist, or the home menu)'
+
+    SegmentDisplay:
+      type: string
+      enum: [playlist, home, blank]
+      description: '`home` = the home menu with Choose Playlist (nothing scheduled and no fallback); `blank` = black (an entry or override with no playlist)'
 
     ScheduleSegment:
       type: object
-      required: [starts_at, ends_at, source]
+      required: [starts_at, ends_at, source, display]
       properties:
         starts_at: { type: string, format: date-time }
         ends_at: { type: string, format: date-time }
-        playlist_id: { type: [string, 'null'], format: uuid, description: Absent or null = nothing plays }
+        playlist_id: { type: [string, 'null'], format: uuid, description: Set when display is playlist }
         source: { $ref: '#/components/schemas/SegmentSource' }
+        display: { $ref: '#/components/schemas/SegmentDisplay' }
         entry_id: { type: string, format: uuid, description: Schedule entry for once/weekly }
+        team_id: { type: string, format: uuid, description: Team of the entry or override }
+
+    SchedulePreviewInput:
+      allOf:
+        - $ref: '#/components/schemas/ScheduleEntryInput'
+        - type: object
+          properties:
+            entry_id: { type: string, format: uuid, description: The entry being edited, left out of the comparison }
+
+    TimeRange:
+      type: object
+      required: [starts_at, ends_at]
+      properties:
+        starts_at: { type: string, format: date-time }
+        ends_at: { type: string, format: date-time }
+
+    EntryRanges:
+      type: object
+      required: [entry_id, team_id, ranges]
+      properties:
+        entry_id: { type: string, format: uuid }
+        team_id: { type: string, format: uuid }
+        ranges:
+          type: array
+          items: { $ref: '#/components/schemas/TimeRange' }
+
+    SchedulePreview:
+      type: object
+      required: [screens]
+      properties:
+        screens:
+          type: array
+          items:
+            type: object
+            required: [screen_id, wins, covered_by, covers, clashes]
+            properties:
+              screen_id: { type: string, format: uuid }
+              wins:
+                type: array
+                description: Ranges this entry plays
+                items: { $ref: '#/components/schemas/TimeRange' }
+              covered_by:
+                type: array
+                description: Entries that play instead of this one, and when
+                items: { $ref: '#/components/schemas/EntryRanges' }
+              covers:
+                type: array
+                description: Entries this one would play over, and when
+                items: { $ref: '#/components/schemas/EntryRanges' }
+              clashes:
+                type: array
+                description: Blocking one-off clashes (saving would be 409)
+                items: { $ref: '#/components/schemas/ScheduleClash' }
 
     ScreenTimeline:
       type: object
@@ -2114,12 +2931,15 @@ components:
 
     PairingClaim:
       type: object
-      required: [code, name, team_id]
+      required: [code, name]
       properties:
         code: { type: string }
         name: { type: string }
-        team_id: { type: string, format: uuid }
-        playlist_id: { type: string, format: uuid, description: Single pairings only }
+        tag_ids:
+          type: array
+          description: Single pairings only. The new screen's tags.
+          items: { type: string, format: uuid }
+        playlist_id: { type: string, format: uuid, description: Single pairings only. The screen's fallback. }
 
     PairingStatus:
       type: object
@@ -2142,12 +2962,40 @@ components:
         path: { type: string, description: 'Relative URL, e.g. /v1/blobs/<sha256>' }
         first_use_index: { type: integer, description: Index of the first item that needs it }
 
+    PickerNode:
+      type: object
+      description: |
+        One level of the on-TV picker: Team → folder → playlist, holding only branches with a playlist
+        available on the screen. Teams are always the top level; a folder with a single child is
+        replaced by that child.
+      required: [kind, id, name]
+      properties:
+        kind: { type: string, enum: [team, folder, playlist] }
+        id: { type: string, format: uuid }
+        name: { type: string }
+        children:
+          type: array
+          description: Teams and folders only
+          items: { $ref: '#/components/schemas/PickerNode' }
+
     Manifest:
       type: object
-      required: [screen_id, screen_name, organization_id, organization_name, assets, media]
+      required: [screen_id, screen_name, organization_id, organization_name, timezone, tags, available_playlist_ids, picker, assets, media]
       properties:
         screen_id: { type: string, format: uuid }
         screen_name: { type: string }
+        timezone: { type: string, description: The screen's zone (its own, else the org's) }
+        tags:
+          type: array
+          description: The screen's tags; empty = untagged, which plays nothing
+          items: { $ref: '#/components/schemas/Tag' }
+        available_playlist_ids:
+          type: array
+          description: Every playlist (of any team) sharing a tag with the screen; all of them are cached
+          items: { type: string, format: uuid }
+        picker:
+          type: array
+          items: { $ref: '#/components/schemas/PickerNode' }
         organization_id: { type: string, description: 'The org this screen is paired to (self-hosted: server_id)' }
         organization_name: { type: string, description: 'Shown on the TV, e.g. "Paired to Grace Church"' }
         playlist:
@@ -2159,7 +3007,7 @@ components:
           items: { $ref: '#/components/schemas/ScheduleSegment' }
         playlists:
           type: array
-          description: Every playlist the timeline references
+          description: Every available playlist (the timeline only references these)
           items: { $ref: '#/components/schemas/Playlist' }
         media:
           type: array
@@ -2167,12 +3015,12 @@ components:
           items: { $ref: '#/components/schemas/Media' }
         assets:
           type: array
-          description: Unique blobs in download-priority order (the active playlist first, then later ones by start time; within a playlist by first use, bed tracks with their start item)
+          description: Unique blobs in download-priority order (the active playlist first, then later timeline playlists by start time, then the remaining available playlists by name; within a playlist by first use, bed tracks with their start item)
           items: { $ref: '#/components/schemas/ManifestAsset' }
 
     WsServerMessageType:
       type: string
-      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, node_online, node_offline, node_updated, node_status, schedule_changed, floor_plans_changed, assignments_changed, unpaired]
+      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, screen_activity, node_online, node_offline, node_updated, node_status, schedule_changed, floor_plans_changed, tags_changed, notice, assignments_changed, unpaired]
 
     WsServerMessage:
       type: object
@@ -2182,9 +3030,9 @@ components:
         type: { $ref: '#/components/schemas/WsServerMessageType' }
         server_id: { type: string, format: uuid, description: hello }
         version: { type: integer, format: int64, description: 'manifest_changed (informational; devices refetch with If-None-Match) and assignments_changed (the new assignments version; refetch getDeviceAssignments)' }
-        team_id: { type: string, format: uuid, description: schedule_changed / floor_plans_changed }
+        team_id: { type: string, format: uuid, description: schedule_changed }
         command: { $ref: '#/components/schemas/ScreenCommand' }
-        screen_id: { type: string, format: uuid, description: 'manifest_changed / command (device-facing) and screen_status / online / offline / updated. A device also receives screen_status, manifest_changed, screen_online and screen_offline for screens it has a control or confidence assignment for (not played by itself)' }
+        screen_id: { type: string, format: uuid, description: 'manifest_changed / command (device-facing) and screen_status / online / offline / updated / activity (users who reach the screen). A device also receives screen_status, manifest_changed, screen_online and screen_offline for screens it has a control or confidence assignment for (not played by itself)' }
         node_id: { type: string, format: uuid, description: node_online / node_offline / node_updated / node_status }
         status: { $ref: '#/components/schemas/ScreenStatus' }
         outputs:
@@ -2192,6 +3040,28 @@ components:
           description: node_status
           items: { $ref: '#/components/schemas/OutputStatus' }
         updated_at: { type: string, format: date-time, description: node_status }
+        event: { $ref: '#/components/schemas/ScreenEvent' }
+        notice: { $ref: '#/components/schemas/Notice' }
+
+    NoticeKind:
+      type: string
+      enum: [schedule_conflict, untagged_screen]
+
+    Notice:
+      type: object
+      required: [id, kind, created_at]
+      description: |
+        `schedule_conflict`: `entry_id` needs resolution (it clashes with another one-off; `detail.clashes`).
+        `untagged_screen`: `screen_id` has no tags and plays nothing (addressed to every admin).
+      properties:
+        id: { type: string, format: uuid }
+        kind: { $ref: '#/components/schemas/NoticeKind' }
+        screen_id: { type: string, format: uuid }
+        entry_id: { type: string, format: uuid }
+        detail: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+        dismissed_at: { type: string, format: date-time }
 
     WsClientMessageType:
       type: string
