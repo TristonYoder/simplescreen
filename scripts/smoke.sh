@@ -44,8 +44,14 @@ req GET "/v1/blobs/$sha" 206 "${auth[@]}" -H "Range: bytes=0-9" | wc -c | tr -d 
 echo "blob:     $sha (uploaded, deduped, ranged)"
 rm -f "$file"
 
+folder="$(req POST /v1/media-folders 201 "${auth[@]}" "${json[@]}" \
+  -d '{"library_id":"managed","name":"Smoke '"$RANDOM"'"}' | jq -r .id)"
+req PUT "/v1/media-folders/$folder/tags" 200 "${auth[@]}" "${json[@]}" -d '{"tag_ids":["'"$tag"'"]}' >/dev/null
+echo "folder:   $folder"
+req POST /v1/media/uploads 200 "${auth[@]}" "${json[@]}" \
+  -d '{"folder_id":"'"$folder"'","name":"smoke.png","sha256":"'"$sha"'","size":4096,"mime":"image/png"}' | jq -e '.already_present == true' >/dev/null
 media="$(req POST /v1/media 201 "${auth[@]}" "${json[@]}" \
-  -d '{"team_id":"'"$team"'","kind":"image","sha256":"'"$sha"'","mime":"image/png","title":"Smoke image"}' | jq -r .id)"
+  -d '{"folder_id":"'"$folder"'","name":"smoke.png","kind":"image","sha256":"'"$sha"'","mime":"image/png"}' | jq -r .id)"
 echo "media:    $media"
 
 playlist="$(req POST /v1/playlists 201 "${auth[@]}" "${json[@]}" \
@@ -75,6 +81,7 @@ req GET /v1/device/manifest 304 -H "Authorization: Bearer $device_token" -H "If-
 req DELETE "/v1/screens/$screen" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/playlists/$playlist" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/media/$media" 204 "${auth[@]}" >/dev/null
+req DELETE "/v1/media-folders/$folder" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/teams/$team" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/tags/$tag" 200 "${auth[@]}" >/dev/null
 echo "smoke OK"
