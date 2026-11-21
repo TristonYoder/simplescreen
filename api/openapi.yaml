@@ -858,7 +858,7 @@ paths:
               schema: { $ref: '#/components/schemas/MediaUpload' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '413': { description: Too large for the library, code `file_too_large` }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '507': { $ref: '#/components/responses/InsufficientStorage' }
 
   /v1/media/{mediaId}:
@@ -2164,6 +2164,11 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     Unprocessable:
       description: Semantically invalid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PayloadTooLarge:
+      description: Too large for the library (code `file_too_large`)
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
