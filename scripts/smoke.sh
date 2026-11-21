@@ -64,7 +64,9 @@ manifest="$(req GET /v1/device/manifest 200 -H "Authorization: Bearer $device_to
 jq -e '.assets | length == 1' <<<"$manifest" >/dev/null
 echo "manifest: $(jq -c '{screen_name, version: .playlist.version, assets: [.assets[].path]}' <<<"$manifest")"
 
-etag="$(curl -sS -o /dev/null -D - -H "Authorization: Bearer $device_token" "$BASE/v1/device/manifest" | tr -d '\r' | sed -n 's/^[Ee][Tt][Aa][Gg]: //p')"
+etag="$(curl -sS -o /dev/null -D - "$BASE/v1/device/manifest" -H "Authorization: Bearer $device_token" \
+  | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2 }')"
+[ -n "$etag" ] || { echo "FAIL no ETag on /v1/device/manifest" >&2; exit 1; }
 req GET /v1/device/manifest 304 -H "Authorization: Bearer $device_token" -H "If-None-Match: $etag" >/dev/null
 req DELETE "/v1/screens/$screen" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/playlists/$playlist" 204 "${auth[@]}" >/dev/null
