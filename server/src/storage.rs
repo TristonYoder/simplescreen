@@ -8,7 +8,9 @@ use std::{
 use base64::Engine;
 use futures_util::StreamExt;
 use rusty_s3::{
-    actions::{DeleteObject, GetObject, HeadObject, ListObjectsV2, PutObject},
+    actions::{
+        AbortMultipartUpload, CreateMultipartUpload, DeleteObject, GetObject, HeadObject, ListObjectsV2, PutObject, UploadPart,
+    },
     Bucket, Credentials, S3Action, UrlStyle,
 };
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,12 @@ use crate::{
     util::new_id,
 };
 
-pub const S3_SINGLE_PUT_LIMIT: i64 = 5 * 1024 * 1024 * 1024;
-const PRESIGN_TTL: Duration = Duration::from_secs(3600);
+const MIB: i64 = 1024 * 1024;
+pub const S3_MAX_OBJECT: i64 = 5 * 1024 * 1024 * MIB;
+pub const DEFAULT_PART_SIZE_MIB: i64 = 64;
+const MAX_PARTS: i64 = 10_000;
+const COPY_CONCURRENCY: usize = 8;
+pub const PRESIGN_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct S3Settings {
@@ -36,6 +42,8 @@ pub struct S3Settings {
     pub access_key_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdn_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_size_mib: Option<i64>,
 }
 
 pub struct S3 {
@@ -43,7 +51,49 @@ pub struct S3 {
     creds: Credentials,
     prefix: String,
     cdn: Option<String>,
+    part_size: i64,
     http: reqwest::Client,
+}
+
+pub struct ObjectInfo {
+    pub size: i64,
+    /// `x-amz-checksum-sha256`: the object's hash, or `<hash of part hashes>-<parts>` after a multipart upload.
+    pub checksum: Option<String>,
+    /// `x-amz-meta-sha256`, set on objects assembled from parts.
+    pub meta_sha: Option<String>,
+}
+
+impl ObjectInfo {
+    /// SHA-256 (hex) of the whole object, if known.
+    pub fn sha(&self) -> Option<String> {
+        let full = self
+            .checksum
+            .as_deref()
+            .and_then(|c| base64::engine::general_purpose::STANDARD.decode(c).ok())
+            .filter(|b| b.len() == 32)
+            .map(hex::encode);
+        full.or_else(|| self.meta_sha.clone())
+    }
+}
+
+/// The checksum S3 reports for an object joined from parts with these SHA-256s (hex).
+pub fn composite_checksum(part_shas: &[String]) -> ApiResult<String> {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for sha in part_shas {
+        h.update(hex::decode(sha).map_err(|_| ApiError::internal("bad part hash"))?);
+    }
+    Ok(format!("{}-{}", base64::engine::general_purpose::STANDARD.encode(h.finalize()), part_shas.len()))
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn xml_field(body: &str, tag: &str) -> Option<String> {
+    let start = body.find(&format!("<{tag}>"))? + tag.len() + 2;
+    let end = body[start..].find(&format!("</{tag}>"))? + start;
+    Some(body[start..end].replace("&quot;", "\"").replace("&#34;", "\"").replace("&amp;", "&"))
 }
 
 pub enum Backend {
@@ -72,6 +122,7 @@ impl S3 {
             creds: Credentials::new(cfg.access_key_id.clone(), secret.to_string()),
             prefix: if prefix.is_empty() { String::new() } else { format!("{prefix}/") },
             cdn: cfg.cdn_base_url.as_ref().map(|c| c.trim_end_matches('/').to_string()),
+            part_size: cfg.part_size_mib.unwrap_or(DEFAULT_PART_SIZE_MIB) * MIB,
             http: reqwest::Client::new(),
         })
     }
@@ -97,8 +148,86 @@ impl S3 {
         Ok((action.sign(PRESIGN_TTL).to_string(), vec![("x-amz-checksum-sha256".into(), checksum)]))
     }
 
-    /// Size and SHA-256 (hex) of an object, if it exists and S3 has its checksum.
+    /// Part size and count for a file of `size` bytes, or None when it goes up in one PUT.
+    pub fn plan(&self, size: i64) -> Option<(i64, i64)> {
+        if size <= self.part_size {
+            return None;
+        }
+        let min = (size + MAX_PARTS - 1) / MAX_PARTS;
+        let part = self.part_size.max((min + MIB - 1) / MIB * MIB);
+        Some((part, (size + part - 1) / part))
+    }
+
+    /// Starts a multipart upload of an object whose SHA-256 is `sha`. With `checksums`, every
+    /// part must carry its own SHA-256.
+    pub async fn create_multipart(&self, path: &str, sha: &str, checksums: bool) -> ApiResult<String> {
+        let key = self.key(path);
+        let mut action = CreateMultipartUpload::new(&self.bucket, Some(&self.creds), &key);
+        action.headers_mut().insert("x-amz-meta-sha256", sha.to_string());
+        if checksums {
+            action.headers_mut().insert("x-amz-checksum-algorithm", "SHA256");
+        }
+        let mut req = self.http.post(action.sign(PRESIGN_TTL)).header("x-amz-meta-sha256", sha).header(reqwest::header::CONTENT_LENGTH, 0);
+        if checksums {
+            req = req.header("x-amz-checksum-algorithm", "SHA256");
+        }
+        let resp = req.send().await.map_err(s3_err)?;
+        if !resp.status().is_success() {
+            return Err(s3_err(format!("start multipart upload of {key}: {}", resp.status())));
+        }
+        let text = resp.text().await.map_err(s3_err)?;
+        let parsed = CreateMultipartUpload::parse_response(&text).map_err(s3_err)?;
+        Ok(parsed.upload_id().to_string())
+    }
+
+    /// A presigned PUT for one part, which S3 only accepts with these bytes.
+    pub fn part_url(&self, path: &str, upload_id: &str, number: u16, sha: &str) -> ApiResult<(String, Vec<(String, String)>)> {
+        let key = self.key(path);
+        let checksum = sha_b64(sha)?;
+        let mut action = UploadPart::new(&self.bucket, Some(&self.creds), &key, number, upload_id);
+        action.headers_mut().insert("x-amz-checksum-sha256", checksum.clone());
+        Ok((action.sign(PRESIGN_TTL).to_string(), vec![("x-amz-checksum-sha256".into(), checksum)]))
+    }
+
+    /// Joins the parts, given as (number, ETag, base64 SHA-256 if the upload has checksums).
+    pub async fn complete_multipart(&self, path: &str, upload_id: &str, parts: &[(u16, String, Option<String>)]) -> ApiResult<()> {
+        let key = self.key(path);
+        let action = rusty_s3::actions::CompleteMultipartUpload::new(&self.bucket, Some(&self.creds), &key, upload_id, std::iter::empty());
+        let mut body = String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+        for (n, etag, checksum) in parts {
+            body.push_str(&format!("<Part><PartNumber>{n}</PartNumber><ETag>{}</ETag>", xml_escape(etag)));
+            if let Some(c) = checksum {
+                body.push_str(&format!("<ChecksumSHA256>{c}</ChecksumSHA256>"));
+            }
+            body.push_str("</Part>");
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        let resp = self.http.post(action.sign(PRESIGN_TTL)).body(body).send().await.map_err(s3_err)?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(s3_err)?;
+        if !status.is_success() || text.contains("<Error>") {
+            let code = xml_field(&text, "Code").unwrap_or_else(|| status.to_string());
+            return Err(ApiError::unprocessable("upload_incomplete", format!("S3 refused to join the parts: {code}")));
+        }
+        Ok(())
+    }
+
+    pub async fn abort_multipart(&self, path: &str, upload_id: &str) -> ApiResult<()> {
+        let key = self.key(path);
+        let url = AbortMultipartUpload::new(&self.bucket, Some(&self.creds), &key, upload_id).sign(PRESIGN_TTL);
+        let resp = self.http.delete(url).send().await.map_err(s3_err)?;
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NOT_FOUND {
+            return Err(s3_err(format!("abort upload of {key}: {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Size and SHA-256 (hex) of an object, if it exists and its hash is known.
     pub async fn head(&self, path: &str) -> ApiResult<Option<(i64, Option<String>)>> {
+        Ok(self.head_info(path).await?.map(|i| (i.size, i.sha())))
+    }
+
+    pub async fn head_info(&self, path: &str) -> ApiResult<Option<ObjectInfo>> {
         let key = self.key(path);
         let mut action = HeadObject::new(&self.bucket, Some(&self.creds), &key);
         action.headers_mut().insert("x-amz-checksum-mode", "ENABLED");
@@ -116,19 +245,21 @@ impl S3 {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let sha = resp
-            .headers()
-            .get("x-amz-checksum-sha256")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| base64::engine::general_purpose::STANDARD.decode(v).ok())
-            .map(hex::encode);
-        Ok(Some((size, sha)))
+        let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(String::from);
+        Ok(Some(ObjectInfo {
+            size,
+            checksum: header("x-amz-checksum-sha256"),
+            meta_sha: header("x-amz-meta-sha256").filter(|s| crate::util::is_sha256(s)),
+        }))
     }
 
     pub async fn put_file(&self, path: &str, file: &Path, sha: &str) -> ApiResult<()> {
-        let (url, headers) = self.put_url(path, sha)?;
         let f = tokio::fs::File::open(file).await?;
         let len = f.metadata().await?.len();
+        if let Some((part, count)) = self.plan(len as i64) {
+            return self.put_file_multipart(path, file, sha, part, count).await;
+        }
+        let (url, headers) = self.put_url(path, sha)?;
         let mut req = self.http.put(url).header(reqwest::header::CONTENT_LENGTH, len);
         for (k, v) in headers {
             req = req.header(k, v);
@@ -139,6 +270,43 @@ impl S3 {
             return Err(s3_err(format!("PUT {path}: {}", resp.status())));
         }
         Ok(())
+    }
+
+    async fn put_file_multipart(&self, path: &str, file: &Path, sha: &str, part: i64, count: i64) -> ApiResult<()> {
+        use sha2::Digest;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let upload_id = self.create_multipart(path, sha, true).await?;
+        let put_part = |n: i64| {
+            let upload_id = &upload_id;
+            async move {
+                let mut f = tokio::fs::File::open(file).await?;
+                f.seek(std::io::SeekFrom::Start(((n - 1) * part) as u64)).await?;
+                let mut buf = Vec::with_capacity(part as usize);
+                f.take(part as u64).read_to_end(&mut buf).await?;
+                let part_sha = hex::encode(sha2::Sha256::digest(&buf));
+                let (url, headers) = self.part_url(path, upload_id, n as u16, &part_sha)?;
+                let mut req = self.http.put(url);
+                for (k, v) in &headers {
+                    req = req.header(k, v);
+                }
+                let resp = req.body(buf).send().await.map_err(s3_err)?;
+                let etag = resp.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()).map(String::from);
+                match etag {
+                    Some(etag) if resp.status().is_success() => Ok((n as u16, etag, Some(headers[0].1.clone()))),
+                    _ => Err(s3_err(format!("PUT part {n} of {path}: {}", resp.status()))),
+                }
+            }
+        };
+        let parts: ApiResult<Vec<_>> =
+            futures_util::stream::iter(1..=count).map(put_part).buffered(2).collect::<Vec<_>>().await.into_iter().collect();
+        let result = match parts {
+            Ok(parts) => self.complete_multipart(path, &upload_id, &parts).await,
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            let _ = self.abort_multipart(path, &upload_id).await;
+        }
+        result
     }
 
     pub async fn download(&self, path: &str, to: &Path) -> ApiResult<()> {
@@ -157,9 +325,18 @@ impl S3 {
         Ok(())
     }
 
+    fn copy_source(&self, key: &str) -> String {
+        format!("/{}/{}", self.bucket.name(), key.split('/').map(|c| urlencode(c)).collect::<Vec<_>>().join("/"))
+    }
+
     pub async fn copy(&self, from: &str, to: &str) -> ApiResult<()> {
+        let info = self.head_info(from).await?.ok_or_else(|| s3_err(format!("copy {from}: not found")))?;
+        if let Some((part, count)) = self.plan(info.size) {
+            let sha = info.sha().ok_or_else(|| s3_err(format!("copy {from}: its SHA-256 is unknown")))?;
+            return self.copy_multipart(from, to, &sha, info.size, part, count).await;
+        }
         let (src, dst) = (self.key(from), self.key(to));
-        let source = format!("/{}/{}", self.bucket.name(), src.split('/').map(|c| urlencode(c)).collect::<Vec<_>>().join("/"));
+        let source = self.copy_source(&src);
         let mut action = PutObject::new(&self.bucket, Some(&self.creds), &dst);
         action.headers_mut().insert("x-amz-copy-source", source.clone());
         let resp = self
@@ -174,6 +351,50 @@ impl S3 {
             return Err(s3_err(format!("copy {src} to {dst}: {}", resp.status())));
         }
         Ok(())
+    }
+
+    async fn copy_multipart(&self, from: &str, to: &str, sha: &str, size: i64, part: i64, count: i64) -> ApiResult<()> {
+        let upload_id = self.create_multipart(to, sha, false).await?;
+        let (dst, source) = (self.key(to), self.copy_source(&self.key(from)));
+        let copy_part = |n: i64| {
+            let (dst, source, upload_id) = (&dst, &source, &upload_id);
+            async move {
+                let range = format!("bytes={}-{}", (n - 1) * part, (n * part).min(size) - 1);
+                let mut action = UploadPart::new(&self.bucket, Some(&self.creds), dst, n as u16, upload_id);
+                action.headers_mut().insert("x-amz-copy-source", source.clone());
+                action.headers_mut().insert("x-amz-copy-source-range", range.clone());
+                let resp = self
+                    .http
+                    .put(action.sign(PRESIGN_TTL))
+                    .header("x-amz-copy-source", source.as_str())
+                    .header("x-amz-copy-source-range", range)
+                    .header(reqwest::header::CONTENT_LENGTH, 0)
+                    .send()
+                    .await
+                    .map_err(s3_err)?;
+                let status = resp.status();
+                let text = resp.text().await.map_err(s3_err)?;
+                match xml_field(&text, "ETag") {
+                    Some(etag) if status.is_success() => Ok((n as u16, etag, None)),
+                    _ => Err(s3_err(format!("copy part {n} of {from}: {status}"))),
+                }
+            }
+        };
+        let parts: ApiResult<Vec<_>> = futures_util::stream::iter(1..=count)
+            .map(copy_part)
+            .buffered(COPY_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect();
+        let result = match parts {
+            Ok(parts) => self.complete_multipart(to, &upload_id, &parts).await,
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            let _ = self.abort_multipart(to, &upload_id).await;
+        }
+        result
     }
 
     pub async fn delete(&self, path: &str) -> ApiResult<()> {

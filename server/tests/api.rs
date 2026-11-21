@@ -2045,15 +2045,28 @@ async fn local_library_paths_moves_and_quota() {
     assert_eq!(code(r, StatusCode::CONFLICT).await, "library_managed");
 }
 
-/// A tiny path-style S3: PUT (with checksum check and copy), GET, HEAD, DELETE and ListObjectsV2.
+/// A tiny path-style S3: PUT (with checksum check and copy), GET, HEAD, DELETE, ListObjectsV2 and
+/// multipart uploads (with part checksums and part copies).
 async fn fake_s3() -> (String, std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>) {
     use axum::{extract::Request as AxReq, response::IntoResponse};
     use base64::Engine;
     type Store = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>;
+    type Meta = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>>;
+    struct Upload {
+        key: String,
+        meta_sha: Option<String>,
+        checksums: bool,
+        parts: std::collections::BTreeMap<u32, (Vec<u8>, String)>,
+    }
+    type Uploads = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Upload>>>;
     let store: Store = Default::default();
     let s2 = store.clone();
+    let meta: Meta = Default::default();
+    let uploads: Uploads = Default::default();
     let handler = move |req: AxReq| {
         let store = s2.clone();
+        let meta = meta.clone();
+        let uploads = uploads.clone();
         async move {
             let method = req.method().clone();
             let uri = req.uri().clone();
@@ -2064,6 +2077,73 @@ async fn fake_s3() -> (String, std::sync::Arc<std::sync::Mutex<std::collections:
             let query = uri.query().unwrap_or_default().to_string();
             let body = req.into_body().collect().await.unwrap().to_bytes().to_vec();
             let b64 = |d: &[u8]| base64::engine::general_purpose::STANDARD.encode(Sha256::digest(d));
+            let param = |name: &str| query.split('&').find_map(|kv| kv.strip_prefix(&format!("{name}="))).map(percent_decode);
+            let header = |name: &str| headers.get(name).map(|v| v.to_str().unwrap().to_string());
+            let source = |src: String| {
+                let src = percent_decode(src.trim_start_matches('/'));
+                src.split_once('/').unwrap().1.to_string()
+            };
+            let xml_ns = "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"";
+            if method == "POST" && query.split('&').any(|kv| kv.starts_with("uploads")) {
+                let id = uuid::Uuid::new_v4().simple().to_string();
+                let up = Upload { key: key.clone(), meta_sha: header("x-amz-meta-sha256"), checksums: header("x-amz-checksum-algorithm").is_some(), parts: Default::default() };
+                uploads.lock().unwrap().insert(id.clone(), up);
+                return format!("<?xml version=\"1.0\"?><InitiateMultipartUploadResult {xml_ns}><Bucket>media</Bucket><Key>{key}</Key><UploadId>{id}</UploadId></InitiateMultipartUploadResult>").into_response();
+            }
+            if let Some(upload_id) = param("uploadId") {
+                let mut ups = uploads.lock().unwrap();
+                match method.as_str() {
+                    "PUT" => {
+                        let Some(up) = ups.get_mut(&upload_id) else { return StatusCode::NOT_FOUND.into_response() };
+                        let n: u32 = param("partNumber").unwrap().parse().unwrap();
+                        if let Some(src) = header("x-amz-copy-source") {
+                            let data = store.lock().unwrap().get(&source(src)).cloned().unwrap();
+                            let range = header("x-amz-copy-source-range").unwrap();
+                            let (a, b) = range.trim_start_matches("bytes=").split_once('-').unwrap();
+                            let part = data[a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap()].to_vec();
+                            let etag = format!("\"{}\"", hex::encode(&Sha256::digest(&part)[..16]));
+                            up.parts.insert(n, (part, etag.clone()));
+                            return format!("<?xml version=\"1.0\"?><CopyPartResult {xml_ns}><ETag>{}</ETag></CopyPartResult>", etag.replace('"', "&quot;")).into_response();
+                        }
+                        if header("x-amz-checksum-sha256").is_some_and(|c| c != b64(&body)) {
+                            return StatusCode::BAD_REQUEST.into_response();
+                        }
+                        let etag = format!("\"{}\"", hex::encode(&Sha256::digest(&body)[..16]));
+                        up.parts.insert(n, (body, etag.clone()));
+                        return ([(header::ETAG, etag)]).into_response();
+                    }
+                    "POST" => {
+                        let Some(up) = ups.remove(&upload_id) else { return StatusCode::NOT_FOUND.into_response() };
+                        let text = String::from_utf8(body).unwrap();
+                        let mut data = vec![];
+                        let mut digests = vec![];
+                        for chunk in text.split("<Part>").skip(1) {
+                            let field = |t: &str| chunk.split(&format!("<{t}>")).nth(1).and_then(|r| r.split(&format!("</{t}>")).next()).map(String::from);
+                            let n: u32 = field("PartNumber").unwrap().parse().unwrap();
+                            let Some((part, etag)) = up.parts.get(&n) else {
+                                return "<Error><Code>InvalidPart</Code></Error>".into_response();
+                            };
+                            if field("ETag").as_deref() != Some(etag.as_str()) {
+                                return "<Error><Code>InvalidPart</Code></Error>".into_response();
+                            }
+                            if up.checksums && field("ChecksumSHA256") != Some(b64(part)) {
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
+                            digests.extend_from_slice(&Sha256::digest(part));
+                            data.extend_from_slice(part);
+                        }
+                        let checksum = up.checksums.then(|| format!("{}-{}", b64(&digests), up.parts.len()));
+                        store.lock().unwrap().insert(up.key.clone(), data);
+                        meta.lock().unwrap().insert(up.key.clone(), (checksum, up.meta_sha.clone()));
+                        return format!("<?xml version=\"1.0\"?><CompleteMultipartUploadResult {xml_ns}><ETag>\"x\"</ETag></CompleteMultipartUploadResult>").into_response();
+                    }
+                    "DELETE" => {
+                        ups.remove(&upload_id);
+                        return StatusCode::NO_CONTENT.into_response();
+                    }
+                    _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                }
+            }
             match method.as_str() {
                 "GET" if query.contains("list-type=2") => {
                     let prefix = query
@@ -2076,16 +2156,17 @@ async fn fake_s3() -> (String, std::sync::Arc<std::sync::Mutex<std::collections:
                     format!("<?xml version=\"1.0\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><IsTruncated>false</IsTruncated>{items}</ListBucketResult>").into_response()
                 }
                 "PUT" => {
-                    let data = match headers.get("x-amz-copy-source") {
-                        Some(src) => {
-                            let src = percent_decode(src.to_str().unwrap().trim_start_matches('/'));
-                            let (_, src_key) = src.split_once('/').unwrap();
-                            match store.lock().unwrap().get(src_key) {
-                                Some(d) => d.clone(),
-                                None => return StatusCode::NOT_FOUND.into_response(),
-                            }
-                        }
+                    let copied_meta = header("x-amz-copy-source").and_then(|src| meta.lock().unwrap().get(&source(src)).map(|m| (None, m.1.clone())));
+                    let data = match header("x-amz-copy-source") {
+                        Some(src) => match store.lock().unwrap().get(&source(src)) {
+                            Some(d) => d.clone(),
+                            None => return StatusCode::NOT_FOUND.into_response(),
+                        },
                         None => body,
+                    };
+                    match copied_meta {
+                        Some(m) => meta.lock().unwrap().insert(key.clone(), m),
+                        None => meta.lock().unwrap().remove(&key),
                     };
                     if let Some(c) = headers.get("x-amz-checksum-sha256") {
                         if c.to_str().unwrap() != b64(&data) {
@@ -2096,7 +2177,18 @@ async fn fake_s3() -> (String, std::sync::Arc<std::sync::Mutex<std::collections:
                     StatusCode::OK.into_response()
                 }
                 "HEAD" => match store.lock().unwrap().get(&key) {
-                    Some(d) => ([(header::CONTENT_LENGTH, d.len().to_string()), (header::HeaderName::from_static("x-amz-checksum-sha256"), b64(d))]).into_response(),
+                    Some(d) => {
+                        let (checksum, meta_sha) = meta.lock().unwrap().get(&key).cloned().unwrap_or((Some(b64(d)), None));
+                        let mut h = axum::http::HeaderMap::new();
+                        h.insert(header::CONTENT_LENGTH, d.len().into());
+                        if let Some(c) = checksum {
+                            h.insert("x-amz-checksum-sha256", c.parse().unwrap());
+                        }
+                        if let Some(m) = meta_sha {
+                            h.insert("x-amz-meta-sha256", m.parse().unwrap());
+                        }
+                        h.into_response()
+                    }
                     None => StatusCode::NOT_FOUND.into_response(),
                 },
                 "GET" => match store.lock().unwrap().get(&key) {
@@ -2105,6 +2197,7 @@ async fn fake_s3() -> (String, std::sync::Arc<std::sync::Mutex<std::collections:
                 },
                 "DELETE" => {
                     store.lock().unwrap().remove(&key);
+                    meta.lock().unwrap().remove(&key);
                     StatusCode::NO_CONTENT.into_response()
                 }
                 _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -2190,4 +2283,97 @@ async fn s3_library_uploads_redirects_and_moves() {
     assert!(store.lock().unwrap().contains_key("signage/Foyer/Clouds.png"));
     app.call("DELETE", &format!("/v1/media-folders/{top}"), None).await;
     assert!(store.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn s3_multipart_uploads_copies_and_moves() {
+    let (endpoint, store) = fake_s3().await;
+    let o = org().await;
+    let app = &o.app;
+    let s3 = json!({ "endpoint": endpoint, "region": "us-east-1", "bucket": "media", "path_style": true,
+                     "access_key_id": "AKID", "secret_access_key": "SECRET", "part_size_mib": 5 });
+    let lib = id(&app.call("POST", "/v1/libraries", Some(json!({ "name": "Cloud", "kind": "s3", "s3": s3 }))).await);
+    let r = app.call("PATCH", &format!("/v1/libraries/{lib}"), Some(json!({ "s3": { "part_size_mib": 4 } }))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let top = id(&folder_as(app, &app.token, &lib, None, "Lobby").await);
+    app.call("PUT", &format!("/v1/media-folders/{top}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+
+    let mib = 1024 * 1024;
+    let data: Vec<u8> = (0..11 * mib + 7).map(|i| (i % 251) as u8).collect();
+    let sha = hex::encode(Sha256::digest(&data));
+    let input = json!({ "folder_id": top, "name": "Big.mov", "sha256": sha, "size": data.len(), "mime": "video/quicktime" });
+    let up = app.call_as(&o.le, "POST", "/v1/media/uploads", Some(input.clone())).await.json();
+    assert_eq!(up["already_present"], false, "{up}");
+    assert!(up.get("url").is_none());
+    let mp = &up["multipart"];
+    let (upload, part_size, count) = (mp["upload_id"].as_str().unwrap().to_string(), mp["part_size"].as_u64().unwrap() as usize, mp["part_count"].as_u64().unwrap());
+    assert_eq!((part_size, count), (5 * mib, 3));
+
+    // Only the uploader can touch it.
+    let r = app.call("POST", &format!("/v1/media/uploads/{upload}/parts"), Some(json!({ "parts": [{ "number": 1, "sha256": sha }] }))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = app.call_as(&o.le, "POST", &format!("/v1/media/uploads/{upload}/parts"), Some(json!({ "parts": [{ "number": 4, "sha256": sha }] }))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    let chunks: Vec<&[u8]> = data.chunks(part_size).collect();
+    let parts: Vec<Value> = chunks.iter().enumerate().map(|(i, c)| json!({ "number": i + 1, "sha256": hex::encode(Sha256::digest(c)) })).collect();
+    let signed = app.call_as(&o.le, "POST", &format!("/v1/media/uploads/{upload}/parts"), Some(json!({ "parts": parts }))).await.json();
+    let mut etags = vec![];
+    for (part, chunk) in signed.as_array().unwrap().iter().zip(&chunks) {
+        let mut req = reqwest::Client::new().put(part["url"].as_str().unwrap()).body(chunk.to_vec());
+        for (k, v) in part["headers"].as_object().unwrap() {
+            req = req.header(k.as_str(), v.as_str().unwrap());
+        }
+        let resp = req.send().await.unwrap();
+        assert!(resp.status().is_success());
+        etags.push(json!({ "number": part["number"], "etag": resp.headers()["etag"].to_str().unwrap() }));
+    }
+    // A part S3 refuses (wrong bytes for its hash).
+    let mut req = reqwest::Client::new().put(signed[0]["url"].as_str().unwrap()).body(b"wrong".to_vec());
+    for (k, v) in signed[0]["headers"].as_object().unwrap() {
+        req = req.header(k.as_str(), v.as_str().unwrap());
+    }
+    assert_eq!(req.send().await.unwrap().status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let r = app.call_as(&o.le, "POST", &format!("/v1/media/uploads/{upload}/complete"), Some(json!({ "parts": &etags[..2] }))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "upload_incomplete");
+    let r = app.call_as(&o.le, "POST", &format!("/v1/media/uploads/{upload}/complete"), Some(json!({ "parts": etags }))).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{:?}", r.body);
+    assert_eq!(store.lock().unwrap().get("Lobby/Big.mov").unwrap(), &data);
+    let r = app.call_as(&o.le, "POST", &format!("/v1/media/uploads/{upload}/complete"), Some(json!({ "parts": [] }))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    let r = app.call_as(&o.le, "POST", "/v1/media", Some(json!({ "folder_id": top, "name": "Big.mov", "kind": "video", "sha256": sha, "mime": "video/quicktime" }))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let media = id(&r);
+    assert_eq!(r.json()["size"], data.len());
+
+    // A second upload of the same bytes to the same path is already present.
+    let mut again = input.clone();
+    again["name"] = json!("Big.mov");
+    let r = app.call_as(&o.le, "POST", "/v1/media/uploads", Some(again)).await;
+    assert_eq!(code(r, StatusCode::CONFLICT).await, "name_taken");
+
+    // Renames copy in parts and keep the hash.
+    let r = app.call_as(&o.le, "PATCH", &format!("/v1/media/{media}"), Some(json!({ "name": "Bigger.mov" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(store.lock().unwrap().get("Lobby/Bigger.mov").unwrap(), &data);
+    assert!(!store.lock().unwrap().contains_key("Lobby/Big.mov"));
+
+    // Aborting frees the upload.
+    let mut other = input.clone();
+    other["name"] = json!("Other.mov");
+    let up = app.call_as(&o.le, "POST", "/v1/media/uploads", Some(other)).await.json();
+    let upload = up["multipart"]["upload_id"].as_str().unwrap().to_string();
+    let r = app.call_as(&o.le, "DELETE", &format!("/v1/media/uploads/{upload}"), None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    let r = app.call_as(&o.le, "DELETE", &format!("/v1/media/uploads/{upload}"), None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+
+    // Moving a large managed file in uploads it in parts.
+    let big: Vec<u8> = (0..6 * mib).map(|i| (i % 241) as u8).collect();
+    let (managed, _) = app.media(&o.lobby, "video", "video/quicktime", &big).await;
+    let r = app.call("PATCH", &format!("/v1/media/{managed}"), Some(json!({ "folder_id": top, "name": "Moved.mov" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(store.lock().unwrap().get("Lobby/Moved.mov").unwrap(), &big);
 }

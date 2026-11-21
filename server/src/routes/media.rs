@@ -15,7 +15,7 @@ use crate::{
     models::{Media, MediaInput, MediaPatch, MEDIA_COLUMNS},
     reach::World,
     state::AppState,
-    storage::{Backend, S3_SINGLE_PUT_LIMIT},
+    storage::{composite_checksum, sha_b64, Backend, S3_MAX_OBJECT},
     util::{is_sha256, new_id, now},
 };
 
@@ -150,10 +150,37 @@ pub async fn upload(State(s): State<AppState>, p: Principal, ApiJson(input): Api
             "url": format!("/v1/blobs/{}", input.sha256), "headers": {},
         }),
         Backend::S3(b) => {
-            if input.size > S3_SINGLE_PUT_LIMIT {
-                return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large", "S3 uploads are limited to 5 GiB"));
+            if input.size > S3_MAX_OBJECT {
+                return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large", "S3 objects are limited to 5 TiB"));
             }
             let present = b.head(&path).await?.is_some_and(|(_, sha)| sha.as_deref() == Some(input.sha256.as_str()));
+            if let Some((part_size, part_count)) = b.plan(input.size) {
+                if present {
+                    return Ok(Json(json!({ "already_present": true })));
+                }
+                let s3_upload_id = b.create_multipart(&path, &input.sha256, true).await?;
+                let id = new_id();
+                sqlx::query(
+                    "INSERT INTO media_uploads (id, s3_upload_id, library_id, path, sha256, size, part_size, part_count, created_by, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(&s3_upload_id)
+                .bind(&lib.id)
+                .bind(&path)
+                .bind(&input.sha256)
+                .bind(input.size)
+                .bind(part_size)
+                .bind(part_count)
+                .bind(&p.subject)
+                .bind(now())
+                .execute(&s.db)
+                .await?;
+                return Ok(Json(json!({
+                    "already_present": false,
+                    "multipart": { "upload_id": id, "part_size": part_size, "part_count": part_count },
+                })));
+            }
             let (url, headers) = b.put_url(&path, &input.sha256)?;
             let headers: serde_json::Map<String, Value> = headers.into_iter().map(|(k, v)| (k, json!(v))).collect();
             let expires = chrono::Utc::now() + chrono::Duration::hours(1);
@@ -163,6 +190,164 @@ pub async fn upload(State(s): State<AppState>, p: Principal, ApiJson(input): Api
             })
         }
     }))
+}
+
+#[derive(sqlx::FromRow)]
+struct UploadRow {
+    id: String,
+    s3_upload_id: String,
+    library_id: String,
+    path: String,
+    size: i64,
+    part_count: i64,
+    created_by: String,
+}
+
+/// The caller's multipart upload and its S3 library.
+async fn own_upload(s: &AppState, p: &Principal, id: &str) -> ApiResult<(UploadRow, Box<crate::storage::S3>)> {
+    super::assignments::require_user(p)?;
+    let row: UploadRow = sqlx::query_as(
+        "SELECT id, s3_upload_id, library_id, path, size, part_count, created_by FROM media_uploads WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&s.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+    if row.created_by != p.subject {
+        return Err(ApiError::forbidden());
+    }
+    match library::library(s, &row.library_id).await?.backend()? {
+        Backend::S3(b) => Ok((row, b)),
+        _ => Err(ApiError::internal("multipart upload outside an S3 library")),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PartSha {
+    number: i64,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+pub struct PartsInput {
+    parts: Vec<PartSha>,
+}
+
+pub async fn upload_parts(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<PartsInput>,
+) -> ApiResult<Json<Value>> {
+    let (row, b) = own_upload(&s, &p, &id).await?;
+    if input.parts.is_empty() || input.parts.len() > 100 {
+        return Err(ApiError::bad_request("sign between 1 and 100 parts at a time"));
+    }
+    let expires = (chrono::Utc::now() + chrono::Duration::from_std(crate::storage::PRESIGN_TTL).unwrap_or_default())
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut out = vec![];
+    for part in &input.parts {
+        check_sha(&part.sha256)?;
+        if part.number < 1 || part.number > row.part_count {
+            return Err(ApiError::bad_request(format!("part numbers run from 1 to {}", row.part_count)));
+        }
+        let (url, headers) = b.part_url(&row.path, &row.s3_upload_id, part.number as u16, &part.sha256)?;
+        sqlx::query("INSERT INTO media_upload_parts (upload_id, number, sha256) VALUES (?, ?, ?) ON CONFLICT DO UPDATE SET sha256 = excluded.sha256")
+            .bind(&row.id)
+            .bind(part.number)
+            .bind(&part.sha256)
+            .execute(&s.db)
+            .await?;
+        let headers: serde_json::Map<String, Value> = headers.into_iter().map(|(k, v)| (k, json!(v))).collect();
+        out.push(json!({ "number": part.number, "method": "PUT", "url": url, "headers": headers, "expires_at": expires }));
+    }
+    Ok(Json(Value::Array(out)))
+}
+
+#[derive(Deserialize)]
+pub struct PartEtag {
+    number: i64,
+    etag: String,
+}
+
+#[derive(Deserialize)]
+pub struct CompleteInput {
+    parts: Vec<PartEtag>,
+}
+
+pub async fn complete_upload(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<CompleteInput>,
+) -> ApiResult<StatusCode> {
+    let (row, b) = own_upload(&s, &p, &id).await?;
+    let signed: Vec<(i64, String)> = sqlx::query_as("SELECT number, sha256 FROM media_upload_parts WHERE upload_id = ? ORDER BY number")
+        .bind(&row.id)
+        .fetch_all(&s.db)
+        .await?;
+    let etags: std::collections::HashMap<i64, &str> = input.parts.iter().map(|p| (p.number, p.etag.as_str())).collect();
+    let mut parts = vec![];
+    let mut shas = vec![];
+    for n in 1..=row.part_count {
+        let sha = signed.iter().find(|(m, _)| *m == n).map(|(_, sha)| sha.clone());
+        let (Some(sha), Some(etag)) = (sha, etags.get(&n)) else {
+            return Err(ApiError::unprocessable("upload_incomplete", format!("part {n} was not signed or has no ETag")));
+        };
+        parts.push((n as u16, etag.to_string(), Some(sha_b64(&sha)?)));
+        shas.push(sha);
+    }
+    b.complete_multipart(&row.path, &row.s3_upload_id, &parts).await?;
+    let info = b.head_info(&row.path).await?.ok_or_else(|| ApiError::unprocessable("upload_incomplete", "the joined file is not in S3"))?;
+    let composite = composite_checksum(&shas)?;
+    let checksum_ok = info.checksum.as_deref().is_none_or(|c| c == composite);
+    if info.size != row.size || !checksum_ok {
+        b.delete(&row.path).await?;
+        sqlx::query("DELETE FROM media_uploads WHERE id = ?").bind(&row.id).execute(&s.db).await?;
+        return Err(ApiError::unprocessable("hash_mismatch", "the joined file does not match the declared size and part hashes"));
+    }
+    sqlx::query("DELETE FROM media_uploads WHERE id = ?").bind(&row.id).execute(&s.db).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn abort_upload(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    let (row, b) = own_upload(&s, &p, &id).await?;
+    b.abort_multipart(&row.path, &row.s3_upload_id).await?;
+    sqlx::query("DELETE FROM media_uploads WHERE id = ?").bind(&row.id).execute(&s.db).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Aborts multipart uploads older than a day, hourly.
+pub async fn sweep_uploads(s: AppState) {
+    loop {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let stale: Vec<(String,)> = sqlx::query_as("SELECT id FROM media_uploads WHERE created_at < ?")
+            .bind(&cutoff)
+            .fetch_all(&s.db)
+            .await
+            .unwrap_or_default();
+        for (id,) in stale {
+            let row: Option<UploadRow> = sqlx::query_as(
+                "SELECT id, s3_upload_id, library_id, path, size, part_count, created_by FROM media_uploads WHERE id = ?",
+            )
+            .bind(&id)
+            .fetch_optional(&s.db)
+            .await
+            .ok()
+            .flatten();
+            let Some(row) = row else { continue };
+            if let Ok(lib) = library::library(&s, &row.library_id).await {
+                if let Ok(Backend::S3(b)) = lib.backend() {
+                    if let Err(e) = b.abort_multipart(&row.path, &row.s3_upload_id).await {
+                        tracing::warn!("aborting stale upload {id}: {}", e.message);
+                        continue;
+                    }
+                }
+            }
+            let _ = sqlx::query("DELETE FROM media_uploads WHERE id = ?").bind(&id).execute(&s.db).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
 }
 
 pub async fn create(

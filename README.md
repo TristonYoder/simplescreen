@@ -45,7 +45,7 @@ Media lives in folders of **libraries**, which server admins add in Studio:
 
 - **Library** (managed): the server's own store in `<data dir>/blobs`. It always exists.
 - **Local:** a directory on the server, inside one of `SIMPLESCREEN_LIBRARY_ROOTS`. Folders and files are real, but change them only through the apps: the server doesn't watch the directory.
-- **S3:** a bucket (AWS or any S3-compatible store) with an optional key prefix and CDN URL. Players download from S3 or the CDN directly, so they need internet access to it. Studio uploads straight to the bucket (up to 5 GiB per file). The bucket's CORS settings don't matter (the apps aren't browsers). The access key needs `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket` on the prefix.
+- **S3:** a bucket (AWS or any S3-compatible store) with an optional key prefix and CDN URL. Players download from S3 or the CDN directly, so they need internet access to it. Studio uploads straight to the bucket, in parts for files over the part size (64 MiB by default, up to S3's 5 TiB per file). Add a lifecycle rule that aborts incomplete multipart uploads after a few days; the server also aborts its own after 24 hours. The bucket's CORS settings don't matter (the apps aren't browsers). The access key needs `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` and `s3:ListBucket` on the prefix.
 
 Upgrading to this release also drops existing media and empties playlists: upload the files again into library folders.
 

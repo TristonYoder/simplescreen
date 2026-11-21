@@ -69,6 +69,7 @@ pub struct S3Input {
     secret_access_key: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     cdn_base_url: Option<Option<String>>,
+    part_size_mib: Option<i64>,
 }
 
 impl S3Input {
@@ -95,6 +96,12 @@ impl S3Input {
         }
         if let Some(v) = &self.cdn_base_url {
             cfg.cdn_base_url = v.as_ref().map(|c| c.trim().trim_end_matches('/').to_string()).filter(|c| !c.is_empty());
+        }
+        if let Some(v) = self.part_size_mib {
+            if !(5..=5120).contains(&v) {
+                return Err(ApiError::bad_request("part_size_mib must be between 5 and 5120"));
+            }
+            cfg.part_size_mib = Some(v);
         }
         let secret = self.secret_access_key.clone().or(secret).unwrap_or_default();
         if cfg.bucket.is_empty() || cfg.region.is_empty() || cfg.access_key_id.is_empty() || secret.is_empty() {

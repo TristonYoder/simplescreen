@@ -7,6 +7,7 @@ mod tags;
 mod teams;
 mod libraries;
 mod media;
+pub use media::sweep_uploads;
 mod media_folders;
 mod org;
 pub mod nodes;
@@ -61,6 +62,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/media-folders/{id}/usage", get(media_folders::usage))
         .route("/v1/media", get(media::list).post(media::create))
         .route("/v1/media/uploads", post(media::upload))
+        .route("/v1/media/uploads/{id}", axum::routing::delete(media::abort_upload))
+        .route("/v1/media/uploads/{id}/parts", post(media::upload_parts))
+        .route("/v1/media/uploads/{id}/complete", post(media::complete_upload))
         .route("/v1/media/{id}", get(media::get).patch(media::patch).delete(media::delete))
         .route("/v1/media/{id}/usage", get(media::usage))
         .route("/v1/playlists", get(playlists::list).post(playlists::create))
