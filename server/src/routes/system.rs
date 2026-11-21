@@ -1,9 +1,10 @@
 use axum::{extract::State, Json};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
     auth::{Kind, Membership, Principal, Role},
-    error::ApiResult,
+    error::{ApiError, ApiJson, ApiResult},
     state::AppState,
     BRAND_NAME, BRAND_SLUG,
 };
@@ -62,6 +63,11 @@ pub async fn me(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Value
     if let Some(e) = &p.email {
         v["email"] = json!(e);
     }
+    let tz: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT timezone FROM users WHERE subject = ?").bind(&p.subject).fetch_optional(&s.db).await?;
+    if let Some((Some(z),)) = tz {
+        v["timezone"] = json!(z);
+    }
     if p.kind == Kind::Device {
         v["node_id"] = json!(p.node_id);
         if let Some(node_id) = &p.node_id {
@@ -72,4 +78,33 @@ pub async fn me(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Value
         }
     }
     Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+pub struct MePatch {
+    #[serde(default, deserialize_with = "crate::models::double_option")]
+    timezone: Option<Option<String>>,
+}
+
+pub async fn patch_me(State(s): State<AppState>, p: Principal, ApiJson(input): ApiJson<MePatch>) -> ApiResult<Json<Value>> {
+    if p.is_device() {
+        return Err(ApiError::forbidden());
+    }
+    if let Some(tz) = &input.timezone {
+        if tz.as_deref().is_some_and(|z| crate::schedule::parse_tz(z).is_none()) {
+            return Err(ApiError::unprocessable("invalid_timezone", "timezone must be an IANA zone"));
+        }
+        sqlx::query(
+            "INSERT INTO users (subject, display_name, email, last_seen_at, timezone) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(subject) DO UPDATE SET timezone = ?5",
+        )
+        .bind(&p.subject)
+        .bind(&p.display_name)
+        .bind(&p.email)
+        .bind(crate::util::now())
+        .bind(tz)
+        .execute(&s.db)
+        .await?;
+    }
+    me(State(s), p).await
 }

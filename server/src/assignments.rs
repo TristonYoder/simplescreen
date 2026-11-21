@@ -43,8 +43,7 @@ impl Mode {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum Job {
-    Screen,
-    Mirror,
+    Program,
     Control,
     Confidence,
     Off,
@@ -53,8 +52,7 @@ pub enum Job {
 impl Job {
     fn as_str(self) -> &'static str {
         match self {
-            Job::Screen => "screen",
-            Job::Mirror => "mirror",
+            Job::Program => "program",
             Job::Control => "control",
             Job::Confidence => "confidence",
             Job::Off => "off",
@@ -63,8 +61,7 @@ impl Job {
 
     fn parse(s: &str) -> Self {
         match s {
-            "screen" => Job::Screen,
-            "mirror" => Job::Mirror,
+            "program" => Job::Program,
             "control" => Job::Control,
             "confidence" => Job::Confidence,
             _ => Job::Off,
@@ -73,8 +70,7 @@ impl Job {
 
     fn role(self) -> OutputRole {
         match self {
-            Job::Screen => OutputRole::Screen,
-            Job::Mirror => OutputRole::Mirror,
+            Job::Program => OutputRole::Program,
             Job::Control => OutputRole::Control,
             Job::Confidence => OutputRole::Confidence,
             Job::Off => OutputRole::None,
@@ -229,11 +225,8 @@ async fn check(
 ) -> ApiResult<()> {
     let mode = Mode::parse(&node.mode);
     let outputs = crate::routes::nodes::outputs_of(node);
-    let in_set_screen: HashSet<&str> =
-        set.iter().filter(|a| a.job == Job::Screen).filter_map(|a| a.screen_id.as_deref()).collect();
 
     let mut keys = HashSet::new();
-    let mut screen_jobs = HashSet::new();
     for a in set {
         if a.output_key.trim().is_empty() {
             return Err(invalid("output_key must not be empty"));
@@ -260,37 +253,23 @@ async fn check(
             return Err(ApiError::unprocessable("control_needs_input", format!("output {} cannot take input", output.key)));
         }
         let Some(screen_id) = a.screen_id.as_deref() else {
-            if a.job == Job::Screen {
+            if a.job == Job::Program {
                 continue; // the device creates the screen through POST /v1/device/screens
             }
             return Err(ApiError::unprocessable("screen_required", "screen_id is required for this job"));
         };
-        let row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT team_id, node_id FROM screens WHERE id = ?").bind(screen_id).fetch_optional(&s.db).await?;
-        let Some((team_id, owner)) = row.filter(|(g, _)| *g == node.team_id) else {
-            return Err(ApiError::unprocessable("target_not_in_team", "screen does not exist in the node's team"));
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT node_id FROM screens WHERE id = ?").bind(screen_id).fetch_optional(&s.db).await?;
+        let Some((owner,)) = row else {
+            return Err(ApiError::unprocessable("unknown_screen", "screen does not exist"));
         };
-        let local = owner.as_deref() == Some(node.id.as_str());
-        match a.job {
-            // A mirror follows a screen job in this set. Owning the screen in the database is not enough:
-            // dropping that job in the same request would leave a mirror of a screen this node no longer plays.
-            Job::Mirror if !in_set_screen.contains(screen_id) => {
-                return Err(ApiError::unprocessable("mirror_must_be_local", "a mirror must target a screen played by this node"));
-            }
-            Job::Screen => {
-                if !screen_jobs.insert(screen_id) {
-                    return Err(ApiError::unprocessable("screen_has_output", "a screen can only be played by one output"));
-                }
-                if owner.is_some() && !local && !releasing.contains(screen_id) {
-                    return Err(ApiError::unprocessable("screen_must_be_local", "that screen is played by another node; move it instead"));
-                }
-            }
-            _ => {}
+        // Every program output of a screen is on one node.
+        if a.job == Job::Program && owner.as_deref().is_some_and(|o| o != node.id) && !releasing.contains(screen_id) {
+            return Err(ApiError::unprocessable("screen_must_be_local", "that screen is played by another node; move it instead"));
         }
-        let _ = team_id;
     }
 
-    // One audio-enabled assignment per screen, across the whole team.
+    // One audio-enabled assignment per screen, across the org.
     let mut audio: HashMap<&str, usize> = HashMap::new();
     for a in set.iter().filter(|a| a.settings.audio_on()) {
         if let Some(id) = a.screen_id.as_deref().filter(|_| a.job != Job::Off) {
@@ -320,15 +299,43 @@ async fn check(
     Ok(())
 }
 
-/// Turns off mirrors whose screen has no screen job left in `set`.
-pub fn drop_orphan_mirrors(set: &mut [Assignment]) {
-    let played: HashSet<String> = set.iter().filter(|a| a.job == Job::Screen).filter_map(|a| a.screen_id.clone()).collect();
-    for a in set.iter_mut() {
-        if a.job == Job::Mirror && a.screen_id.as_ref().is_some_and(|id| !played.contains(id)) {
-            let key = a.output_key.clone();
-            *a = Assignment::off(&key);
+/// The outputs whose job, screen or settings differ between `old` and `new`, each with every screen it
+/// targeted before or after.
+pub fn changes(old: &[Assignment], new: &[Assignment]) -> Vec<(String, HashSet<String>)> {
+    let shape = |a: Option<&Assignment>| {
+        a.filter(|a| a.job != Job::Off)
+            .map(|a| (a.job, a.screen_id.clone(), serde_json::to_value(&a.settings).unwrap_or_default()))
+    };
+    let mut keys: Vec<&str> = old.iter().chain(new).map(|a| a.output_key.as_str()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut out = vec![];
+    for key in keys {
+        let (o, n) = (old.iter().find(|a| a.output_key == key), new.iter().find(|a| a.output_key == key));
+        if shape(o) == shape(n) {
+            continue;
         }
+        let screens = [o, n]
+            .into_iter()
+            .flatten()
+            .filter(|a| a.job != Job::Off)
+            .filter_map(|a| a.screen_id.clone())
+            .collect();
+        out.push((key.to_string(), screens));
     }
+    out
+}
+
+/// Screens a node is assigned to (any job): all a change made on the device may reference.
+pub async fn assigned_screens(s: &AppState, node_id: &str) -> ApiResult<HashSet<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT screen_id FROM assignments WHERE node_id = ?1 AND screen_id IS NOT NULL AND job != 'off' \
+         UNION SELECT id FROM screens WHERE node_id = ?1",
+    )
+    .bind(node_id)
+    .fetch_all(&s.db)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
 /// Copies each output's job and screen onto the reported hardware. Client-sent role and screen_id are ignored.
@@ -336,7 +343,7 @@ pub fn overlay_outputs(outputs: &mut [Output], set: &[Assignment]) {
     for o in outputs {
         let a = set.iter().find(|a| a.output_key == o.key);
         o.role = a.map_or(OutputRole::None, |a| a.job.role());
-        o.screen_id = a.filter(|a| a.job == Job::Screen).and_then(|a| a.screen_id.clone());
+        o.screen_id = a.filter(|a| a.job == Job::Program).and_then(|a| a.screen_id.clone());
     }
 }
 
@@ -346,7 +353,7 @@ pub struct Applied {
     pub claimed: Vec<String>,
 }
 
-/// Replaces a node's assignments inside `tx` and makes screen ownership follow the screen jobs.
+/// Replaces a node's assignments inside `tx` and makes screen ownership follow the program jobs.
 /// Screens the node no longer plays become unplaced; they are never deleted.
 pub async fn apply_set(
     tx: &mut Transaction<'_, Sqlite>,
@@ -358,7 +365,7 @@ pub async fn apply_set(
     let stamp = now();
     let before: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE node_id = ?").bind(&node.id).fetch_all(&mut **tx).await?;
     sqlx::query("DELETE FROM assignments WHERE node_id = ?").bind(&node.id).execute(&mut **tx).await?;
-    sqlx::query("UPDATE screens SET node_id = NULL, output_key = NULL WHERE node_id = ?").bind(&node.id).execute(&mut **tx).await?;
+    sqlx::query("UPDATE screens SET node_id = NULL WHERE node_id = ?").bind(&node.id).execute(&mut **tx).await?;
     let mut claimed = vec![];
     for a in set {
         let screen_id = (a.job != Job::Off).then_some(a.screen_id.as_deref()).flatten();
@@ -374,21 +381,20 @@ pub async fn apply_set(
         .bind(&stamp)
         .execute(&mut **tx)
         .await?;
-        if let (Job::Screen, Some(id)) = (a.job, screen_id) {
+        if let (Job::Program, Some(id)) = (a.job, screen_id) {
             // Only an unplaced screen, or one this node already released above, can be claimed.
-            let res = sqlx::query(
-                "UPDATE screens SET node_id = ?, output_key = ? WHERE id = ? AND (node_id IS NULL OR node_id = ?)",
-            )
-            .bind(&node.id)
-            .bind(&a.output_key)
-            .bind(id)
-            .bind(&node.id)
-            .execute(&mut **tx)
-            .await?;
+            let res = sqlx::query("UPDATE screens SET node_id = ? WHERE id = ? AND (node_id IS NULL OR node_id = ?)")
+                .bind(&node.id)
+                .bind(id)
+                .bind(&node.id)
+                .execute(&mut **tx)
+                .await?;
             if res.rows_affected() == 0 {
                 return Err(ApiError::conflict("version_conflict", "assignments were modified; base_version is stale"));
             }
-            claimed.push(id.to_string());
+            if !claimed.iter().any(|c| c == id) {
+                claimed.push(id.to_string());
+            }
         }
     }
     let current: (String,) = sqlx::query_as("SELECT outputs FROM nodes WHERE id = ?").bind(&node.id).fetch_one(&mut **tx).await?;
@@ -411,9 +417,9 @@ pub async fn apply_set(
 /// Pushes the consequences of a committed change to the device, Studio and watching nodes.
 pub async fn announce(s: &AppState, node: &NodeRow, applied: &Applied) {
     s.hub.send_node(&node.id, &json!({ "type": "assignments_changed", "version": applied.version }));
-    s.hub.broadcast_team(&node.team_id, &json!({ "type": "node_updated", "node_id": node.id }));
+    s.hub.broadcast_all(&json!({ "type": "node_updated", "node_id": node.id }));
     for id in applied.released.iter().chain(&applied.claimed) {
-        s.hub.broadcast_team(&node.team_id, &json!({ "type": "screen_updated", "screen_id": id }));
+        s.broadcast_screen(id, &json!({ "type": "screen_updated", "screen_id": id })).await;
     }
     for id in &applied.released {
         let owner: Option<(Option<String>,)> =
@@ -425,7 +431,7 @@ pub async fn announce(s: &AppState, node: &NodeRow, applied: &Applied) {
         if unplaced {
             s.statuses.lock().remove(id);
             let msg = json!({ "type": "screen_offline", "screen_id": id });
-            s.hub.broadcast_team(&node.team_id, &msg);
+            s.broadcast_screen(id, &msg).await;
             s.hub.send_subscribers(id, Some(&node.id), &msg);
         }
     }
@@ -523,7 +529,7 @@ pub async fn replace(
     body(s, &node).await
 }
 
-/// Changes what a device is for. Leaving player releases its screens (unplaced) and drops its screen and mirror jobs.
+/// Changes what a device is for. Leaving player releases its screens (unplaced) and drops its program jobs.
 pub async fn set_mode(s: &AppState, node: NodeRow, mode: Mode, updated_by: &str, by_device: bool) -> ApiResult<()> {
     let version = node.assignments_version;
     let mut set = load(s, &node.id).await?;

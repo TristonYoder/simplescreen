@@ -6,6 +6,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
@@ -15,6 +16,8 @@ use crate::{
         Bed, ItemKind, Playlist, PlaylistDefaults, PlaylistInput, PlaylistItem, PlaylistRow, PlaylistUpdate,
         PLAYLIST_COLUMNS,
     },
+    reach::{self, World},
+    schedule,
     state::AppState,
     util::{new_id, now},
 };
@@ -22,17 +25,26 @@ use crate::{
 #[derive(Deserialize)]
 pub struct ListQuery {
     team_id: Option<String>,
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct Summary {
     id: String,
     team_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    folder_id: Option<String>,
+    tag_ids: Vec<String>,
     name: String,
     version: i64,
     item_count: i64,
     total_bytes: i64,
     updated_at: String,
+}
+
+/// Viewers of the owning team, and anyone who reaches a screen the playlist is available on.
+pub fn visible(p: &Principal, w: &World, playlist: &str, team: &str) -> bool {
+    p.can_view(team) || w.playlist_screens(playlist).iter().any(|s| p.sees_screen(w, s))
 }
 
 pub async fn list(
@@ -41,15 +53,32 @@ pub async fn list(
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Summary>>> {
     let all = summaries(&s, q.team_id.as_deref()).await?;
-    Ok(Json(all.into_iter().filter(|r| p.can_view(&r.team_id)).collect()))
+    let wide = match q.scope.as_deref() {
+        None | Some("mine") => false,
+        Some("visible") => true,
+        Some(_) => return Err(ApiError::bad_request("scope must be mine or visible")),
+    };
+    let w = if wide { Some(World::load(&s).await?) } else { None };
+    Ok(Json(
+        all.into_iter()
+            .filter(|r| p.can_view(&r.team_id) || w.as_ref().is_some_and(|w| visible(&p, w, &r.id, &r.team_id)))
+            .collect(),
+    ))
+}
+
+async fn tag_ids(s: &AppState, playlist: &str) -> ApiResult<Vec<String>> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT tag_id FROM playlist_tags WHERE playlist_id = ? ORDER BY tag_id").bind(playlist).fetch_all(&s.db).await?;
+    Ok(rows.into_iter().map(|(t,)| t).collect())
 }
 
 pub async fn summaries(s: &AppState, team_id: Option<&str>) -> ApiResult<Vec<Summary>> {
-    let rows: Vec<(String, String, String, i64, i64, i64, String)> = sqlx::query_as(
-        "SELECT p.id, p.team_id, p.name, p.version, json_array_length(p.items),
+    let rows: Vec<(String, String, Option<String>, String, i64, i64, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT p.id, p.team_id, p.folder_id, p.name, p.version, json_array_length(p.items),
                 COALESCE((SELECT SUM(m.size) FROM playlist_media pm JOIN media m ON m.id = pm.media_id
                           WHERE pm.playlist_id = p.id), 0),
-                p.updated_at
+                p.updated_at,
+                (SELECT json_group_array(tag_id) FROM (SELECT tag_id FROM playlist_tags WHERE playlist_id = p.id ORDER BY tag_id))
          FROM playlists p WHERE (?1 IS NULL OR p.team_id = ?1) ORDER BY p.name",
     )
     .bind(team_id)
@@ -57,9 +86,11 @@ pub async fn summaries(s: &AppState, team_id: Option<&str>) -> ApiResult<Vec<Sum
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, team_id, name, version, item_count, total_bytes, updated_at)| Summary {
+        .map(|(id, team_id, folder_id, name, version, item_count, total_bytes, updated_at, tags)| Summary {
             id,
             team_id,
+            folder_id,
+            tag_ids: tags.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(),
             name,
             version,
             item_count,
@@ -75,13 +106,91 @@ pub async fn fetch(s: &AppState, id: &str) -> ApiResult<Playlist> {
             .bind(id)
             .fetch_optional(&s.db)
             .await?;
-    Ok(row.ok_or_else(ApiError::not_found)?.into_playlist()?)
+    let row = row.ok_or_else(ApiError::not_found)?;
+    let tags = tag_ids(s, id).await?;
+    Ok(row.into_playlist(tags)?)
 }
 
 pub async fn get(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Playlist>> {
     let pl = fetch(&s, &id).await?;
-    p.require(&pl.team_id, Role::Viewer)?;
+    if !p.can_view(&pl.team_id) {
+        let w = World::load(&s).await?;
+        if !visible(&p, &w, &pl.id, &pl.team_id) {
+            return Err(ApiError::not_found());
+        }
+    }
     Ok(Json(pl))
+}
+
+async fn check_folder(s: &AppState, team_id: &str, folder: Option<&str>) -> ApiResult<()> {
+    let Some(f) = folder else { return Ok(()) };
+    let found: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM playlist_folders WHERE id = ? AND team_id = ?").bind(f).bind(team_id).fetch_optional(&s.db).await?;
+    found.map(|_| ()).ok_or_else(|| ApiError::unprocessable("invalid_folder", "folder does not exist in the team"))
+}
+
+#[derive(Deserialize)]
+pub struct PlaylistPatch {
+    folder_id: Option<String>,
+}
+
+pub async fn patch(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<PlaylistPatch>,
+) -> ApiResult<Json<Playlist>> {
+    let current = fetch(&s, &id).await?;
+    p.require(&current.team_id, Role::Editor)?;
+    check_folder(&s, &current.team_id, input.folder_id.as_deref()).await?;
+    sqlx::query("UPDATE playlists SET folder_id = ? WHERE id = ?").bind(&input.folder_id).bind(&id).execute(&s.db).await?;
+    s.notify_screens_for_playlist(&id, current.version).await;
+    Ok(Json(fetch(&s, &id).await?))
+}
+
+#[derive(Deserialize)]
+pub struct TagIds {
+    tag_ids: Vec<String>,
+}
+
+pub async fn put_tags(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<TagIds>,
+) -> ApiResult<Json<Value>> {
+    let current = fetch(&s, &id).await?;
+    p.require(&current.team_id, Role::Editor)?;
+    let tags = reach::check_tags(&s, &input.tag_ids).await?;
+    let w = World::load(&s).await?;
+    if !p.server_admin {
+        if let Some(t) = tags.iter().find(|t| !w.team_holds(&current.team_id, t)) {
+            return Err(ApiError::unprocessable("invalid_tag", format!("tag {t} is not held by the playlist's team")));
+        }
+    }
+    let before = w.playlist_screens(&id);
+    let mut tx = s.db.begin().await?;
+    sqlx::query("DELETE FROM playlist_tags WHERE playlist_id = ?").bind(&id).execute(&mut *tx).await?;
+    for t in &tags {
+        sqlx::query("INSERT INTO playlist_tags (playlist_id, tag_id) VALUES (?, ?)").bind(&id).bind(t).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let clashes = schedule::refresh_clashes(&s, Some(&p)).await?;
+    let w = World::load(&s).await?;
+    let mut warnings = vec![];
+    let mut touched: Vec<String> = before;
+    touched.extend(w.playlist_screens(&id));
+    touched.sort();
+    touched.dedup();
+    for screen in &touched {
+        let row = super::screens::fetch_row(&s, screen).await?;
+        if row.fallback_playlist_id.as_deref() == Some(id.as_str()) || row.override_playlist_id.as_deref() == Some(id.as_str()) {
+            warnings.extend(super::screens::availability_warnings(&w, &row));
+        }
+        s.notify_manifest(row.node_id.as_deref(), &row.id, current.version);
+    }
+    s.schedule_wake.notify_one();
+    Ok(Json(json!({ "playlist": fetch(&s, &id).await?, "clashes": clashes, "warnings": warnings })))
 }
 
 fn invalid(msg: impl Into<String>) -> ApiError {
@@ -190,14 +299,16 @@ pub async fn create(
     }
     let defaults = input.defaults.take().unwrap_or_default();
     validate(&s, &input.team_id, &defaults, &mut input.items, &mut input.beds).await?;
+    check_folder(&s, &input.team_id, input.folder_id.as_deref()).await?;
     let id = new_id();
     let mut tx = s.db.begin().await?;
     sqlx::query(
-        "INSERT INTO playlists (id, team_id, name, version, loop, defaults, items, beds, updated_at, updated_by)
-         VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO playlists (id, team_id, folder_id, name, version, loop, defaults, items, beds, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&input.team_id)
+    .bind(&input.folder_id)
     .bind(input.name.trim())
     .bind(input.looping.unwrap_or(true))
     .bind(serde_json::to_string(&defaults)?)
@@ -269,22 +380,25 @@ pub async fn update(
     }
     tx.commit().await?;
     let updated = fetch(&s, &id).await?;
-    s.notify_screens_for_playlist(&updated.team_id, updated.version).await;
+    s.notify_screens_for_playlist(&updated.id, updated.version).await;
     Ok(Json(updated))
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
     let current = fetch(&s, &id).await?;
     p.require(&current.team_id, Role::Editor)?;
-    sqlx::query(
-        "UPDATE screens SET override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL \
-         WHERE override_playlist_id = ?",
-    )
-    .bind(&id)
-    .execute(&s.db)
-    .await?;
+    let w = World::load(&s).await?;
+    let affected = w.playlist_screens(&id);
+    sqlx::query(&format!("UPDATE screens SET {} WHERE override_playlist_id = ?", schedule::CLEAR_OVERRIDE))
+        .bind(&id)
+        .execute(&s.db)
+        .await?;
     sqlx::query("DELETE FROM playlists WHERE id = ?").bind(&id).execute(&s.db).await?;
-    crate::schedule::notify_team(&s, &current.team_id).await;
-    crate::schedule::broadcast_changed(&s, &current.team_id);
+    schedule::refresh_clashes(&s, Some(&p)).await?;
+    schedule::notify_screens(&s).await;
+    schedule::broadcast_changed(&s, &current.team_id);
+    for screen in affected {
+        super::screens::broadcast_updated(&s, &screen).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }

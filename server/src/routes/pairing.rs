@@ -11,6 +11,8 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     auth::{Principal, Role},
+    notices::{self, Actor},
+    reach::{self, World},
     error::{ApiError, ApiJson, ApiResult},
     models::{Output, OutputKind, OutputRole},
     state::AppState,
@@ -94,7 +96,8 @@ pub async fn start(State(s): State<AppState>, body: Bytes) -> ApiResult<(StatusC
 pub struct Claim {
     code: String,
     name: String,
-    team_id: String,
+    #[serde(default)]
+    tag_ids: Option<Vec<String>>,
     playlist_id: Option<String>,
 }
 
@@ -103,7 +106,9 @@ pub async fn claim(
     p: Principal,
     ApiJson(input): ApiJson<Claim>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    s.require_team(&p, &input.team_id, Role::Editor).await?;
+    if !p.is_editor_anywhere() || p.is_device() {
+        return Err(ApiError::forbidden());
+    }
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
@@ -117,17 +122,29 @@ pub async fn claim(
     .await?;
     let (pairing_id, kind, mode) = pairing.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "pairing_not_found", "unknown or expired code"))?;
     let single = kind == "single";
-    if !single && input.playlist_id.is_some() {
-        return Err(ApiError::bad_request("playlist_id only applies to single-screen pairings"));
+    if !single && (input.playlist_id.is_some() || input.tag_ids.is_some()) {
+        return Err(ApiError::bad_request("tag_ids and playlist_id only apply to single-screen pairings"));
+    }
+    let tags = reach::check_tags(&s, input.tag_ids.as_deref().unwrap_or_default()).await?;
+    let w = World::load(&s).await?;
+    if single && !p.server_admin {
+        // An editor's new screen must land in their reach, with only tags their teams hold.
+        let held = |t: &String| p.memberships.iter().any(|m| m.role >= Role::Editor && w.team_holds(&m.team_id, t));
+        if let Some(t) = tags.iter().find(|t| !held(t)) {
+            return Err(ApiError::unprocessable("invalid_tag", format!("tag {t} is not held by a team you edit")));
+        }
+        let reached = p.memberships.iter().any(|m| {
+            m.role >= Role::Editor && w.teams.get(&m.team_id).is_some_and(|team| tags.iter().any(|t| team.tags.contains(t)) || (team.all && !tags.is_empty()))
+        });
+        if !reached {
+            return Err(ApiError::unprocessable("tag_required", "give the screen at least one tag a team you edit holds"));
+        }
     }
     if let Some(pid) = &input.playlist_id {
-        let found: Option<(String,)> = sqlx::query_as("SELECT id FROM playlists WHERE id = ? AND team_id = ?")
-            .bind(pid)
-            .bind(&input.team_id)
-            .fetch_optional(&s.db)
-            .await?;
-        if found.is_none() {
-            return Err(ApiError::unprocessable("invalid_playlist", "playlist does not exist in the team"));
+        let found: Option<(String,)> = sqlx::query_as("SELECT team_id FROM playlists WHERE id = ?").bind(pid).fetch_optional(&s.db).await?;
+        let shares = w.playlist_tags.get(pid).is_some_and(|pt| tags.iter().any(|t| pt.contains(t)));
+        if !found.is_some_and(|(team,)| p.edits_team(&team)) || !shares {
+            return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not one of your team's playlists available on this screen"));
         }
     }
 
@@ -141,16 +158,15 @@ pub async fn claim(
             key: "main".into(),
             kind: OutputKind::Display,
             name: "Main".into(),
-            role: OutputRole::Screen,
+            role: OutputRole::Program,
             screen_id: Some(sid.clone()),
             format: None,
             audio_device: None,
         }])?,
         None => "[]".into(),
     };
-    sqlx::query("INSERT INTO nodes (id, team_id, name, token_hash, outputs, single, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO nodes (id, name, token_hash, outputs, single, mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
         .bind(&node_id)
-        .bind(&input.team_id)
         .bind(input.name.trim())
         .bind(sha256_hex(token.as_bytes()))
         .bind(outputs)
@@ -160,19 +176,19 @@ pub async fn claim(
         .execute(&mut *tx)
         .await?;
     if let Some(sid) = &screen_id {
+        sqlx::query("INSERT INTO screens (id, name, fallback_playlist_id, node_id, created_at) VALUES (?, ?, ?, ?, ?)")
+            .bind(sid)
+            .bind(input.name.trim())
+            .bind(&input.playlist_id)
+            .bind(&node_id)
+            .bind(&created)
+            .execute(&mut *tx)
+            .await?;
+        for t in &tags {
+            sqlx::query("INSERT INTO screen_tags (screen_id, tag_id) VALUES (?, ?)").bind(sid).bind(t).execute(&mut *tx).await?;
+        }
         sqlx::query(
-            "INSERT INTO screens (id, team_id, name, playlist_id, node_id, output_key, created_at) VALUES (?, ?, ?, ?, ?, 'main', ?)",
-        )
-        .bind(sid)
-        .bind(&input.team_id)
-        .bind(input.name.trim())
-        .bind(&input.playlist_id)
-        .bind(&node_id)
-        .bind(&created)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "INSERT INTO assignments (node_id, output_key, job, screen_id, updated_by, updated_at) VALUES (?, 'main', 'screen', ?, 'pairing', ?)",
+            "INSERT INTO assignments (node_id, output_key, job, screen_id, updated_by, updated_at) VALUES (?, 'main', 'program', ?, 'pairing', ?)",
         )
         .bind(&node_id)
         .bind(sid)
@@ -192,10 +208,14 @@ pub async fn claim(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "pairing_not_found", "unknown or expired code"));
     }
     tx.commit().await?;
+    s.hub.broadcast_all(&serde_json::json!({ "type": "node_updated", "node_id": node_id }));
     let body = match screen_id {
         Some(sid) => {
+            let w = World::load(&s).await?;
+            notices::log(&s, &sid, "created", &Actor::of(&p, &w, &sid), serde_json::json!({ "name": input.name.trim(), "node_id": node_id })).await;
+            notices::sync_untagged(&s, &sid).await?;
             let row = super::screens::fetch_row(&s, &sid).await?;
-            serde_json::to_value(super::screens::to_screen(&s, row))?
+            serde_json::to_value(super::screens::to_screen(&s, row).await?)?
         }
         None => serde_json::to_value(super::nodes::to_node(&s, super::nodes::fetch_row(&s, &node_id).await?).await?)?,
     };

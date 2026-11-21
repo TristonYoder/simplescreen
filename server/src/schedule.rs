@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -7,8 +7,10 @@ use serde_json::json;
 use sqlx::FromRow;
 
 use crate::{
+    auth::Principal,
     error::{ApiError, ApiResult},
     models::{ScreenRow, SCREEN_COLUMNS},
+    reach::{Match, World},
     state::AppState,
 };
 
@@ -17,6 +19,8 @@ pub const DATE_FORMAT: &str = "%Y-%m-%d";
 pub const LOCAL_FORMAT: &str = "%Y-%m-%dT%H:%M";
 pub const DEVICE_HORIZON: Duration = Duration::hours(48);
 pub const MAX_RANGE: Duration = Duration::days(14);
+pub const CLEAR_OVERRIDE: &str = "override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL, \
+     override_set_by = NULL, override_set_by_name = NULL, override_team_id = NULL";
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +37,7 @@ pub struct Entry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub screen_ids: Vec<String>,
+    pub tag_ids: Vec<String>,
     pub kind: EntryKind,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -51,14 +56,11 @@ pub struct Entry {
     pub starts_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ends_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    pub needs_resolution: bool,
     pub created_at: String,
     pub updated_at: String,
-}
-
-impl Entry {
-    pub fn applies_to(&self, screen_id: &str) -> bool {
-        self.screen_ids.is_empty() || self.screen_ids.iter().any(|s| s == screen_id)
-    }
 }
 
 #[derive(FromRow)]
@@ -68,6 +70,7 @@ pub struct EntryRow {
     playlist_id: Option<String>,
     title: Option<String>,
     screen_ids: String,
+    tag_ids: String,
     kind: String,
     enabled: bool,
     days: String,
@@ -78,12 +81,14 @@ pub struct EntryRow {
     skip_dates: String,
     starts_at: Option<String>,
     ends_at: Option<String>,
+    created_by: Option<String>,
+    needs_resolution: bool,
     created_at: String,
     updated_at: String,
 }
 
-pub const ENTRY_COLUMNS: &str = "id, team_id, playlist_id, title, screen_ids, kind, enabled, days, start_time, end_time, \
-     starts_on, ends_on, skip_dates, starts_at, ends_at, created_at, updated_at";
+pub const ENTRY_COLUMNS: &str = "id, team_id, playlist_id, title, screen_ids, tag_ids, kind, enabled, days, start_time, end_time, \
+     starts_on, ends_on, skip_dates, starts_at, ends_at, created_by, needs_resolution, created_at, updated_at";
 
 impl EntryRow {
     pub fn into_entry(self) -> Entry {
@@ -93,6 +98,7 @@ impl EntryRow {
             playlist_id: self.playlist_id,
             title: self.title,
             screen_ids: serde_json::from_str(&self.screen_ids).unwrap_or_default(),
+            tag_ids: serde_json::from_str(&self.tag_ids).unwrap_or_default(),
             kind: if self.kind == "once" { EntryKind::Once } else { EntryKind::Weekly },
             enabled: self.enabled,
             days: serde_json::from_str(&self.days).unwrap_or_default(),
@@ -103,6 +109,8 @@ impl EntryRow {
             skip_dates: serde_json::from_str(&self.skip_dates).unwrap_or_default(),
             starts_at: self.starts_at,
             ends_at: self.ends_at,
+            created_by: self.created_by,
+            needs_resolution: self.needs_resolution,
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -119,20 +127,32 @@ pub enum Source {
     Override,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Display {
+    Playlist,
+    Home,
+    Blank,
+}
+
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Segment {
     pub starts_at: DateTime<Utc>,
     pub ends_at: DateTime<Utc>,
     pub playlist_id: Option<String>,
     pub source: Source,
+    pub display: Display,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Override {
     pub playlist_id: Option<String>,
     pub until: Option<DateTime<Utc>>,
+    pub team_id: Option<String>,
 }
 
 pub fn parse_time(s: &str) -> Option<NaiveTime> {
@@ -205,15 +225,17 @@ pub fn occurrences(e: &Entry, tz: &Tz, from: DateTime<Utc>, to: DateTime<Utc>) -
 struct Candidate<'a> {
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-    rank: (Source, bool, &'a str),
+    rank: (Source, Match, &'a str),
     playlist_id: Option<String>,
     entry_id: Option<String>,
+    team_id: Option<String>,
 }
 
-/// Contiguous segments covering `[from, to)` for one screen. `entries` must already apply to the screen.
+/// Contiguous segments covering `[from, to)` for one screen. `entries` must already apply to the screen,
+/// each with how it matches. `fallback` plays when nothing is scheduled; without one the home menu shows.
 pub fn resolve(
-    entries: &[&Entry],
-    default: Option<&str>,
+    entries: &[(&Entry, Match)],
+    fallback: Option<&str>,
     ovr: Option<&Override>,
     tz: &Tz,
     from: DateTime<Utc>,
@@ -223,7 +245,7 @@ pub fn resolve(
         return vec![];
     }
     let mut cands: Vec<Candidate> = vec![];
-    for e in entries {
+    for (e, m) in entries {
         let tier = match e.kind {
             EntryKind::Once => Source::Once,
             EntryKind::Weekly => Source::Weekly,
@@ -232,9 +254,10 @@ pub fn resolve(
             cands.push(Candidate {
                 start: s.max(from),
                 end: t.min(to),
-                rank: (tier, !e.screen_ids.is_empty(), &e.created_at),
+                rank: (tier, *m, &e.created_at),
                 playlist_id: e.playlist_id.clone(),
                 entry_id: Some(e.id.clone()),
+                team_id: Some(e.team_id.clone()),
             });
         }
     }
@@ -244,9 +267,10 @@ pub fn resolve(
             cands.push(Candidate {
                 start: from,
                 end,
-                rank: (Source::Override, true, ""),
+                rank: (Source::Override, Match::Screen, ""),
                 playlist_id: o.playlist_id.clone(),
                 entry_id: None,
+                team_id: o.team_id.clone(),
             });
         }
     }
@@ -268,14 +292,18 @@ pub fn resolve(
                 ends_at: b,
                 playlist_id: c.playlist_id.clone(),
                 source: c.rank.0,
+                display: if c.playlist_id.is_some() { Display::Playlist } else { Display::Blank },
                 entry_id: c.entry_id.clone(),
+                team_id: c.team_id.clone(),
             },
             None => Segment {
                 starts_at: a,
                 ends_at: b,
-                playlist_id: default.map(String::from),
+                playlist_id: fallback.map(String::from),
                 source: Source::Default,
+                display: if fallback.is_some() { Display::Playlist } else { Display::Home },
                 entry_id: None,
+                team_id: None,
             },
         };
         if let Some(last) = out.last_mut() {
@@ -309,6 +337,17 @@ pub async fn team_entries(s: &AppState, team_id: &str) -> ApiResult<Vec<Entry>> 
     Ok(rows.into_iter().map(EntryRow::into_entry).collect())
 }
 
+pub async fn all_entries(s: &AppState) -> ApiResult<Vec<Entry>> {
+    let rows: Vec<EntryRow> = sqlx::query_as(&format!("SELECT {ENTRY_COLUMNS} FROM schedule_entries ORDER BY created_at"))
+        .fetch_all(&s.db)
+        .await?;
+    Ok(rows.into_iter().map(EntryRow::into_entry).collect())
+}
+
+pub async fn all_screens(s: &AppState) -> ApiResult<Vec<ScreenRow>> {
+    Ok(sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens ORDER BY name, id")).fetch_all(&s.db).await?)
+}
+
 pub fn screen_override(row: &ScreenRow) -> Option<Override> {
     if !row.override_set {
         return None;
@@ -316,41 +355,48 @@ pub fn screen_override(row: &ScreenRow) -> Option<Override> {
     Some(Override {
         playlist_id: row.override_playlist_id.clone(),
         until: row.override_until.as_deref().and_then(|u| DateTime::parse_from_rfc3339(u).ok()).map(|d| d.to_utc()),
+        team_id: row.override_team_id.clone(),
     })
 }
 
+pub fn screen_tz(row: &ScreenRow, org: &Tz) -> Tz {
+    row.timezone.as_deref().and_then(parse_tz).unwrap_or(*org)
+}
+
+/// What applies to one screen: entries of teams that reach it whose playlist is available there, the
+/// fallback if available, and the override unless its playlist became unavailable.
 pub fn screen_segments(
+    w: &World,
     row: &ScreenRow,
     entries: &[Entry],
-    tz: &Tz,
+    org: &Tz,
     with_override: bool,
     from: DateTime<Utc>,
     to: DateTime<Utc>,
 ) -> Vec<Segment> {
-    let applying: Vec<&Entry> = entries.iter().filter(|e| e.applies_to(&row.id)).collect();
-    let ovr = if with_override { screen_override(row) } else { None };
-    resolve(&applying, row.playlist_id.as_deref(), ovr.as_ref(), tz, from, to)
+    let applying: Vec<(&Entry, Match)> = entries.iter().filter_map(|e| w.applies(e, &row.id).map(|m| (e, m))).collect();
+    let fallback = row.fallback_playlist_id.as_deref().filter(|p| w.available(p, &row.id));
+    let ovr = if with_override { screen_override(row) } else { None }
+        .filter(|o| o.playlist_id.as_deref().is_none_or(|p| w.available(p, &row.id)));
+    resolve(&applying, fallback, ovr.as_ref(), &screen_tz(row, org), from, to)
 }
 
 pub async fn screen_timeline(s: &AppState, row: &ScreenRow, from: DateTime<Utc>, to: DateTime<Utc>) -> ApiResult<Vec<Segment>> {
-    let tz = s.org_tz();
-    let entries = team_entries(s, &row.team_id).await?;
-    Ok(screen_segments(row, &entries, &tz, true, from, to))
+    let w = World::load(s).await?;
+    let entries = all_entries(s).await?;
+    Ok(screen_segments(&w, row, &entries, &s.org_tz(), true, from, to))
 }
 
 /// Schedule without the override for the next 14 days.
 pub async fn base_timeline(s: &AppState, row: &ScreenRow, now: DateTime<Utc>) -> ApiResult<Vec<Segment>> {
-    let tz = s.org_tz();
-    let entries = team_entries(s, &row.team_id).await?;
-    Ok(screen_segments(row, &entries, &tz, false, now, now + MAX_RANGE))
+    let w = World::load(s).await?;
+    let entries = all_entries(s).await?;
+    Ok(screen_segments(&w, row, &entries, &s.org_tz(), false, now, now + MAX_RANGE))
 }
 
-pub async fn notify_team(s: &AppState, team_id: &str) {
-    let ids: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, node_id FROM screens WHERE team_id = ?")
-        .bind(team_id)
-        .fetch_all(&s.db)
-        .await
-        .unwrap_or_default();
+/// Every device refetches (with If-None-Match, so unchanged manifests cost a 304).
+pub async fn notify_screens(s: &AppState) {
+    let ids: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, node_id FROM screens").fetch_all(&s.db).await.unwrap_or_default();
     for (id, node_id) in ids {
         s.notify_manifest(node_id.as_deref(), &id, 0);
     }
@@ -359,19 +405,110 @@ pub async fn notify_team(s: &AppState, team_id: &str) {
 
 /// Re-resolves every schedule (after an org timezone change): devices refetch, user sockets reload.
 pub async fn notify_all(s: &AppState) {
-    let ids: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, node_id FROM screens").fetch_all(&s.db).await.unwrap_or_default();
-    for (id, node_id) in ids {
-        s.notify_manifest(node_id.as_deref(), &id, 0);
-    }
-    let teams: Vec<(String,)> = sqlx::query_as("SELECT id FROM teams").fetch_all(&s.db).await.unwrap_or_default();
-    for (id,) in teams {
-        broadcast_changed(s, &id);
-    }
-    s.schedule_wake.notify_one();
+    notify_screens(s).await;
+    s.hub.broadcast_all(&json!({ "type": "schedule_changed" }));
 }
 
 pub fn broadcast_changed(s: &AppState, team_id: &str) {
-    s.hub.broadcast_team(team_id, &json!({ "type": "schedule_changed", "team_id": team_id }));
+    s.hub.broadcast_all(&json!({ "type": "schedule_changed", "team_id": team_id }));
+}
+
+// MARK: Clashes
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Clash {
+    /// Older entry first.
+    pub entry_ids: [String; 2],
+    pub screen_id: String,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+}
+
+fn once_span(e: &Entry, tz: &Tz) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let (Some(a), Some(b)) = (e.starts_at.as_deref().and_then(parse_local), e.ends_at.as_deref().and_then(parse_local)) else {
+        return None;
+    };
+    Some((local_to_utc(tz, a), local_to_utc(tz, b)))
+}
+
+/// One-off entries that play on the same screen at the same time and haven't ended. With `only`, just
+/// the clashes involving that entry.
+pub fn find_clashes(
+    w: &World,
+    screens: &[ScreenRow],
+    entries: &[Entry],
+    org: &Tz,
+    now: DateTime<Utc>,
+    only: Option<&str>,
+) -> Vec<Clash> {
+    let mut out = vec![];
+    for row in screens {
+        let tz = screen_tz(row, org);
+        let mut spans: Vec<(&Entry, DateTime<Utc>, DateTime<Utc>)> = entries
+            .iter()
+            .filter(|e| e.enabled && e.kind == EntryKind::Once && w.applies(e, &row.id).is_some())
+            .filter_map(|e| once_span(e, &tz).map(|(a, b)| (e, a, b)))
+            .filter(|(_, _, b)| *b > now)
+            .collect();
+        spans.sort_by(|x, y| x.0.created_at.cmp(&y.0.created_at).then(x.0.id.cmp(&y.0.id)));
+        for i in 0..spans.len() {
+            for j in i + 1..spans.len() {
+                let (a, b) = (&spans[i], &spans[j]);
+                if only.is_some_and(|id| a.0.id != id && b.0.id != id) {
+                    continue;
+                }
+                let (start, end) = (a.1.max(b.1), a.2.min(b.2));
+                if start < end {
+                    out.push(Clash { entry_ids: [a.0.id.clone(), b.0.id.clone()], screen_id: row.id.clone(), starts_at: start, ends_at: end });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Re-flags one-off entries that clash (after a retag, a reach change or a schedule change). Newly
+/// flagged entries notify their creators and `actor`; entries no longer clashing resolve their notices.
+/// Returns the clashes involving a newly flagged entry.
+pub async fn refresh_clashes(s: &AppState, actor: Option<&Principal>) -> ApiResult<Vec<Clash>> {
+    let w = World::load(s).await?;
+    let screens = all_screens(s).await?;
+    let entries = all_entries(s).await?;
+    let clashes = find_clashes(&w, &screens, &entries, &s.org_tz(), Utc::now(), None);
+    let flagged: HashSet<&str> = clashes.iter().flat_map(|c| c.entry_ids.iter().map(String::as_str)).collect();
+    let mut newly: HashSet<String> = HashSet::new();
+    for e in &entries {
+        let now_flagged = flagged.contains(e.id.as_str());
+        if now_flagged == e.needs_resolution {
+            continue;
+        }
+        sqlx::query("UPDATE schedule_entries SET needs_resolution = ? WHERE id = ?").bind(now_flagged).bind(&e.id).execute(&s.db).await?;
+        if now_flagged {
+            newly.insert(e.id.clone());
+        } else {
+            crate::notices::resolve_entry(s, &e.id).await?;
+        }
+    }
+    let caused: Vec<Clash> = clashes.into_iter().filter(|c| c.entry_ids.iter().any(|id| newly.contains(id))).collect();
+    for id in &newly {
+        let Some(e) = entries.iter().find(|e| &e.id == id) else { continue };
+        let mine: Vec<&Clash> = caused.iter().filter(|c| c.entry_ids.contains(id)).collect();
+        let detail = json!({ "clashes": mine, "title": e.title, "team_id": e.team_id });
+        let mut to: Vec<String> = e.created_by.iter().cloned().collect();
+        if let Some(a) = actor.filter(|a| !a.is_device()) {
+            if !to.contains(&a.subject) {
+                to.push(a.subject.clone());
+            }
+        }
+        for sub in to {
+            crate::notices::create(s, Some(&sub), "schedule_conflict", None, Some(id), detail.clone()).await?;
+        }
+    }
+    if !newly.is_empty() {
+        notify_screens(s).await;
+        s.hub.broadcast_all(&json!({ "type": "schedule_changed" }));
+    }
+    Ok(caused)
 }
 
 pub fn invalid(message: &str) -> ApiError {
@@ -383,7 +520,7 @@ pub fn invalid(message: &str) -> ApiError {
 /// Pushes `manifest_changed` when a screen's active playlist changes and clears expired overrides.
 pub async fn run(s: AppState) {
     let mut shutdown = s.shutdown.subscribe();
-    let mut active: HashMap<String, Option<String>> = HashMap::new();
+    let mut active: HashMap<String, Option<(Option<String>, Display)>> = HashMap::new();
     loop {
         let now = Utc::now();
         let mut next = now + Duration::seconds(60);
@@ -402,39 +539,31 @@ pub async fn run(s: AppState) {
 async fn tick(
     s: &AppState,
     now: DateTime<Utc>,
-    active: &mut HashMap<String, Option<String>>,
+    active: &mut HashMap<String, Option<(Option<String>, Display)>>,
     next: &mut DateTime<Utc>,
 ) -> ApiResult<()> {
     let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let expired: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, team_id FROM screens WHERE override_set = 1 AND override_until IS NOT NULL AND override_until <= ?",
-    )
-    .bind(&stamp)
-    .fetch_all(&s.db)
-    .await?;
-    for (id, team_id) in &expired {
-        sqlx::query("UPDATE screens SET override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL WHERE id = ?")
-            .bind(id)
-            .execute(&s.db)
+    let expired: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM screens WHERE override_set = 1 AND override_until IS NOT NULL AND override_until <= ?")
+            .bind(&stamp)
+            .fetch_all(&s.db)
             .await?;
-        s.hub.broadcast_team(team_id, &json!({ "type": "screen_updated", "screen_id": id }));
+    for (id,) in &expired {
+        sqlx::query(&format!("UPDATE screens SET {CLEAR_OVERRIDE} WHERE id = ?")).bind(id).execute(&s.db).await?;
+        s.broadcast_screen(id, &json!({ "type": "screen_updated", "screen_id": id })).await;
     }
 
-    let rows: Vec<ScreenRow> = sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens")).fetch_all(&s.db).await?;
-    let mut teams: HashMap<String, (Tz, Vec<Entry>)> = HashMap::new();
+    let w = World::load(s).await?;
+    let rows = all_screens(s).await?;
+    let entries = all_entries(s).await?;
+    let org = s.org_tz();
     for row in &rows {
-        if !teams.contains_key(&row.team_id) {
-            let tz = s.org_tz();
-            let entries = team_entries(s, &row.team_id).await?;
-            teams.insert(row.team_id.clone(), (tz, entries));
-        }
-        let (tz, entries) = &teams[&row.team_id];
-        let segs = screen_segments(row, entries, tz, true, now, now + DEVICE_HORIZON);
-        let current = segs.first().and_then(|g| g.playlist_id.clone());
+        let segs = screen_segments(&w, row, &entries, &org, true, now, now + DEVICE_HORIZON);
+        let current = segs.first().map(|g| (g.playlist_id.clone(), g.display));
         if let Some(previous) = active.insert(row.id.clone(), current.clone()) {
             if previous != current {
                 s.notify_manifest(row.node_id.as_deref(), &row.id, 0);
-                s.hub.broadcast_team(&row.team_id, &json!({ "type": "screen_updated", "screen_id": row.id }));
+                s.broadcast_screen(&row.id, &json!({ "type": "screen_updated", "screen_id": row.id })).await;
             }
         }
         if let Some(change) = next_change(&segs) {
@@ -456,6 +585,7 @@ mod tests {
             playlist_id: Some(playlist.into()),
             title: None,
             screen_ids: vec![],
+            tag_ids: vec![],
             kind,
             enabled: true,
             days: vec![],
@@ -466,6 +596,8 @@ mod tests {
             skip_dates: vec![],
             starts_at: None,
             ends_at: None,
+            created_by: None,
+            needs_resolution: false,
             created_at: format!("2026-01-01T00:00:00.000Z{id}"),
             updated_at: String::new(),
         }
@@ -486,6 +618,10 @@ mod tests {
         e
     }
 
+    fn m<'a>(es: &[&'a Entry]) -> Vec<(&'a Entry, Match)> {
+        es.iter().map(|e| (*e, if e.screen_ids.is_empty() { Match::TeamWide } else { Match::Screen })).collect()
+    }
+
     fn utc(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().to_utc()
     }
@@ -503,7 +639,7 @@ mod tests {
         let dinner = weekly("2", "dinner", &[1, 2, 3, 4, 5], "17:00", "22:00");
         let launch = once("3", "launch", "2026-11-20T18:00", "2026-11-20T23:00");
         let segs = resolve(
-            &[&breakfast, &dinner, &launch],
+            &m(&[&breakfast, &dinner, &launch]),
             Some("house"),
             None,
             &Tz::UTC,
@@ -529,7 +665,7 @@ mod tests {
     #[test]
     fn overnight_and_weekday_filter() {
         let late = weekly("1", "late", &[6], "22:00", "02:00");
-        let segs = resolve(&[&late], None, None, &Tz::UTC, utc("2026-11-21T20:00:00Z"), utc("2026-11-22T04:00:00Z"));
+        let segs = resolve(&m(&[&late]), None, None, &Tz::UTC, utc("2026-11-21T20:00:00Z"), utc("2026-11-22T04:00:00Z"));
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[1].playlist_id.as_deref(), Some("late"));
         assert_eq!(segs[1].ends_at, utc("2026-11-22T02:00:00Z"));
@@ -542,7 +678,7 @@ mod tests {
         let mut specific = weekly("1", "specific", &[1, 2, 3, 4, 5, 6, 7], "09:00", "10:00");
         specific.screen_ids = vec!["s1".into()];
         let newer = weekly("3", "newer", &[1, 2, 3, 4, 5, 6, 7], "09:30", "11:00");
-        let segs = resolve(&[&team_wide, &specific, &newer], None, None, &Tz::UTC, utc("2026-11-18T08:00:00Z"), utc("2026-11-18T12:00:00Z"));
+        let segs = resolve(&m(&[&team_wide, &specific, &newer]), None, None, &Tz::UTC, utc("2026-11-18T08:00:00Z"), utc("2026-11-18T12:00:00Z"));
         let names: Vec<_> = segs.iter().map(|g| g.playlist_id.clone().unwrap()).collect();
         assert_eq!(names, vec!["team", "specific", "newer", "team"]);
     }
@@ -550,8 +686,8 @@ mod tests {
     #[test]
     fn override_wins_until_expiry() {
         let lunch = weekly("1", "lunch", &[3], "11:00", "14:00");
-        let o = Override { playlist_id: Some("manual".into()), until: Some(utc("2026-11-18T12:00:00Z")) };
-        let segs = resolve(&[&lunch], Some("house"), Some(&o), &Tz::UTC, utc("2026-11-18T10:00:00Z"), utc("2026-11-18T15:00:00Z"));
+        let o = Override { playlist_id: Some("manual".into()), until: Some(utc("2026-11-18T12:00:00Z")), team_id: None };
+        let segs = resolve(&m(&[&lunch]), Some("house"), Some(&o), &Tz::UTC, utc("2026-11-18T10:00:00Z"), utc("2026-11-18T15:00:00Z"));
         let names: Vec<_> = segs.iter().map(|g| (g.source, g.playlist_id.clone().unwrap())).collect();
         assert_eq!(
             names,
@@ -565,7 +701,7 @@ mod tests {
         let mut e = weekly("1", "holiday", &[1, 2, 3, 4, 5, 6, 7], "09:00", "17:00");
         e.starts_on = Some("2026-11-20".into());
         e.ends_on = Some("2026-11-21".into());
-        let segs = resolve(&[&e], None, None, &tz, utc("2026-11-19T00:00:00Z"), utc("2026-11-23T00:00:00Z"));
+        let segs = resolve(&m(&[&e]), None, None, &tz, utc("2026-11-19T00:00:00Z"), utc("2026-11-23T00:00:00Z"));
         let on: Vec<_> = segs.iter().filter(|g| g.playlist_id.is_some()).map(|g| g.starts_at).collect();
         assert_eq!(on, vec![utc("2026-11-20T14:00:00Z"), utc("2026-11-21T14:00:00Z")]);
     }
@@ -574,9 +710,91 @@ mod tests {
     fn skip_dates_drop_one_occurrence() {
         let mut e = weekly("1", "breakfast", &[1, 2, 3, 4, 5, 6, 7], "07:00", "11:00");
         e.skip_dates = vec!["2026-11-19".into()];
-        let segs = resolve(&[&e], None, None, &Tz::UTC, utc("2026-11-18T00:00:00Z"), utc("2026-11-21T00:00:00Z"));
+        let segs = resolve(&m(&[&e]), None, None, &Tz::UTC, utc("2026-11-18T00:00:00Z"), utc("2026-11-21T00:00:00Z"));
         let on: Vec<_> = segs.iter().filter(|g| g.playlist_id.is_some()).map(|g| g.starts_at).collect();
         assert_eq!(on, vec![utc("2026-11-18T07:00:00Z"), utc("2026-11-20T07:00:00Z")]);
+    }
+
+    #[test]
+    fn tag_match_beats_team_wide_and_home_shows_without_fallback() {
+        let team_wide = weekly("2", "team", &[3], "09:00", "11:00");
+        let tagged = weekly("1", "tagged", &[3], "10:00", "12:00");
+        let segs = resolve(
+            &[(&team_wide, Match::TeamWide), (&tagged, Match::Tag)],
+            None,
+            None,
+            &Tz::UTC,
+            utc("2026-11-18T08:00:00Z"),
+            utc("2026-11-18T13:00:00Z"),
+        );
+        let got: Vec<_> = segs.iter().map(|g| (g.display, g.playlist_id.clone())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Display::Home, None),
+                (Display::Playlist, Some("team".into())),
+                (Display::Playlist, Some("tagged".into())),
+                (Display::Home, None),
+            ]
+        );
+    }
+
+    fn world() -> World {
+        let mut w = World::default();
+        let set = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<HashSet<String>>();
+        w.teams.insert("lobby".into(), crate::reach::TeamInfo { name: "Lobby".into(), all: false, tags: set(&["front"]) });
+        w.teams.insert("ops".into(), crate::reach::TeamInfo { name: "Ops".into(), all: true, tags: set(&[]) });
+        w.screen_tags.insert("s_front".into(), set(&["front"]));
+        w.screen_tags.insert("s_back".into(), set(&["back"]));
+        w.screen_tags.insert("s_none".into(), set(&[]));
+        w.playlist_tags.insert("p_front".into(), set(&["front"]));
+        w.playlist_tags.insert("p_untagged".into(), set(&[]));
+        w.playlist_team.insert("p_front".into(), "lobby".into());
+        w.playlist_team.insert("p_untagged".into(), "lobby".into());
+        w
+    }
+
+    #[test]
+    fn reach_follows_tags_and_untagged_screens_are_reached_by_none() {
+        let w = world();
+        assert!(w.reaches("lobby", "s_front"));
+        assert!(!w.reaches("lobby", "s_back"));
+        assert!(w.reaches("ops", "s_back"));
+        assert!(!w.reaches("ops", "s_none"));
+        assert!(!w.reaches("lobby", "s_none"));
+        assert_eq!(w.screen_teams("s_front"), vec!["lobby".to_string(), "ops".to_string()]);
+        assert!(w.team_holds("ops", "anything"));
+        assert!(!w.team_holds("lobby", "back"));
+    }
+
+    #[test]
+    fn availability_needs_a_shared_tag() {
+        let w = world();
+        assert!(w.available("p_front", "s_front"));
+        assert!(!w.available("p_front", "s_back"));
+        assert!(!w.available("p_untagged", "s_front"));
+        assert_eq!(w.available_on("s_front"), vec!["p_front".to_string()]);
+    }
+
+    #[test]
+    fn entries_apply_only_where_reached_available_and_targeted() {
+        let w = world();
+        let wide = entry("1", EntryKind::Weekly, "p_front");
+        let mut wide_lobby = wide.clone();
+        wide_lobby.team_id = "lobby".into();
+        assert_eq!(w.applies(&wide_lobby, "s_front"), Some(Match::TeamWide));
+        assert_eq!(w.applies(&wide_lobby, "s_back"), None, "team doesn't reach");
+        let mut ops = wide_lobby.clone();
+        ops.team_id = "ops".into();
+        assert_eq!(w.applies(&ops, "s_back"), None, "playlist not available");
+        assert_eq!(w.applies(&ops, "s_none"), None, "untagged screens play nothing");
+        let mut blank = ops.clone();
+        blank.playlist_id = None;
+        blank.tag_ids = vec!["back".into()];
+        assert_eq!(w.applies(&blank, "s_back"), Some(Match::Tag));
+        assert_eq!(w.applies(&blank, "s_front"), None, "tag doesn't match");
+        blank.screen_ids = vec!["s_front".into()];
+        assert_eq!(w.applies(&blank, "s_front"), Some(Match::Screen));
     }
 
     #[test]

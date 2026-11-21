@@ -7,13 +7,15 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
     auth::Principal,
     error::{ApiError, ApiJson, ApiResult},
     models::{ItemKind, Media, Output, Playlist, Screen, ScreenRow, MEDIA_COLUMNS, SCREEN_COLUMNS},
+    notices::Actor,
+    reach::World,
     schedule,
     state::AppState,
     util::{new_id, now, sha256_hex},
@@ -62,13 +64,80 @@ pub struct ScreenQuery {
     screen_id: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct PickerNode {
+    kind: &'static str,
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    children: Option<Vec<PickerNode>>,
+}
+
+/// Team → folder → playlist, holding only branches with a playlist available on the screen. Teams stay
+/// at the top; a folder with a single child is replaced by it.
+pub async fn picker(s: &AppState, w: &World, screen_id: &str) -> ApiResult<Vec<PickerNode>> {
+    let available: HashSet<String> = w.available_on(screen_id).into_iter().collect();
+    if available.is_empty() {
+        return Ok(vec![]);
+    }
+    let playlists: Vec<(String, String, Option<String>, String)> =
+        sqlx::query_as("SELECT id, team_id, folder_id, name FROM playlists ORDER BY name, id").fetch_all(&s.db).await?;
+    let playlists: Vec<_> = playlists.into_iter().filter(|p| available.contains(&p.0)).collect();
+    let folders: Vec<(String, String, Option<String>, String)> =
+        sqlx::query_as("SELECT id, team_id, parent_id, name FROM playlist_folders ORDER BY position, name, id").fetch_all(&s.db).await?;
+
+    fn level(
+        team: &str,
+        parent: Option<&str>,
+        folders: &[(String, String, Option<String>, String)],
+        playlists: &[(String, String, Option<String>, String)],
+        depth: usize,
+    ) -> Vec<PickerNode> {
+        let mut out = vec![];
+        if depth < 32 {
+            for f in folders.iter().filter(|f| f.1 == team && f.2.as_deref() == parent) {
+                let mut children = level(team, Some(&f.0), folders, playlists, depth + 1);
+                match children.len() {
+                    0 => {}
+                    1 => out.push(children.remove(0)),
+                    _ => out.push(PickerNode { kind: "folder", id: f.0.clone(), name: f.3.clone(), children: Some(children) }),
+                }
+            }
+        }
+        for p in playlists.iter().filter(|p| p.1 == team && p.2.as_deref() == parent) {
+            out.push(PickerNode { kind: "playlist", id: p.0.clone(), name: p.3.clone(), children: None });
+        }
+        out
+    }
+
+    let mut teams: Vec<(&String, &String)> =
+        w.teams.iter().filter(|(id, _)| playlists.iter().any(|p| &p.1 == *id)).map(|(id, t)| (id, &t.name)).collect();
+    teams.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+    Ok(teams
+        .into_iter()
+        .map(|(id, name)| {
+            // A playlist whose folder is gone or belongs elsewhere sits at the team root.
+            let fixed: Vec<_> = playlists
+                .iter()
+                .filter(|p| &p.1 == id)
+                .map(|p| {
+                    let ok = p.2.as_ref().is_some_and(|f| folders.iter().any(|x| &x.0 == f && &x.1 == id));
+                    (p.0.clone(), p.1.clone(), if ok { p.2.clone() } else { None }, p.3.clone())
+                })
+                .collect();
+            PickerNode { kind: "team", id: id.clone(), name: name.clone(), children: Some(level(id, None, &folders, &fixed, 0)) }
+        })
+        .collect())
+}
+
 pub async fn playlists(
     State(s): State<AppState>,
     p: Principal,
     Query(q): Query<ScreenQuery>,
-) -> ApiResult<Json<Vec<super::playlists::Summary>>> {
+) -> ApiResult<Json<Vec<PickerNode>>> {
     let screen = controlled_screen(&s, &p, q.screen_id.as_deref()).await?;
-    Ok(Json(super::playlists::summaries(&s, Some(&screen.team_id)).await?))
+    let w = World::load(&s).await?;
+    Ok(Json(picker(&s, &w, &screen.id).await?))
 }
 
 #[derive(Deserialize)]
@@ -83,14 +152,21 @@ pub async fn select_playlist(
     ApiJson(selection): ApiJson<Selection>,
 ) -> ApiResult<StatusCode> {
     let screen = controlled_screen(&s, &p, selection.screen_id.as_deref()).await?;
+    let w = World::load(&s).await?;
+    if selection.playlist_id.as_deref().is_some_and(|pl| !w.available(pl, &screen.id)) {
+        return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not available on this screen"));
+    }
     let base = schedule::base_timeline(&s, &screen, Utc::now()).await?;
     let scheduled = base.len() > 1 || base.first().is_some_and(|g| g.source != schedule::Source::Default);
     if scheduled {
-        super::screens::set_override_row(&s, &screen, selection.playlist_id.as_deref(), schedule::next_change(&base)).await?;
+        super::screens::set_override_row(&s, &w, &p, &screen, selection.playlist_id.as_deref(), schedule::next_change(&base)).await?;
     } else {
-        super::screens::assign_playlist(&s, &screen, selection.playlist_id.as_deref()).await?;
+        sqlx::query("UPDATE screens SET fallback_playlist_id = ? WHERE id = ?").bind(&selection.playlist_id).bind(&screen.id).execute(&s.db).await?;
+        crate::notices::log(&s, &screen.id, "fallback", &Actor::of(&p, &w, &screen.id), json!({ "playlist_id": selection.playlist_id })).await;
         if screen.override_set {
-            super::screens::clear_override_row(&s, &screen).await?;
+            super::screens::clear_override_row(&s, &w, &p, &screen).await?;
+        } else {
+            super::screens::changed(&s, &screen, 0).await;
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -108,28 +184,63 @@ pub async fn manifest(
         other => device_screen(&s, &p, other).await?,
     };
     let now = Utc::now();
-    let timeline = schedule::screen_timeline(&s, &screen, now, now + schedule::DEVICE_HORIZON).await?;
+    let w = World::load(&s).await?;
+    let entries = schedule::all_entries(&s).await?;
+    let org = s.org_tz();
+    let timeline = schedule::screen_segments(&w, &screen, &entries, &org, true, now, now + schedule::DEVICE_HORIZON);
+    let available = w.available_on(&screen.id);
 
     let mut playlists: Vec<Playlist> = vec![];
+    for id in &available {
+        if let Ok(pl) = super::playlists::fetch(&s, id).await {
+            playlists.push(pl);
+        }
+    }
+    // Download order: the active playlist, later timeline playlists by start, then the rest by name.
+    let mut order: Vec<String> = vec![];
     for seg in &timeline {
         if let Some(id) = &seg.playlist_id {
-            if !playlists.iter().any(|pl| &pl.id == id) {
-                if let Ok(pl) = super::playlists::fetch(&s, id).await {
-                    playlists.push(pl);
-                }
+            if !order.contains(id) {
+                order.push(id.clone());
             }
         }
     }
+    let mut rest: Vec<&Playlist> = playlists.iter().filter(|pl| !order.contains(&pl.id)).collect();
+    rest.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    order.extend(rest.into_iter().map(|pl| pl.id.clone()));
+    playlists.sort_by_key(|pl| order.iter().position(|id| *id == pl.id).unwrap_or(usize::MAX));
     let active = timeline.first().and_then(|g| g.playlist_id.as_ref()).and_then(|id| playlists.iter().find(|pl| &pl.id == id));
+
+    let mut tag_ids: Vec<String> = w.screen_tags.get(&screen.id).map(|t| t.iter().cloned().collect()).unwrap_or_default();
+    tag_ids.sort();
+    let tags: Vec<serde_json::Value> = {
+        let rows: Vec<(String, String, Option<String>, String)> =
+            sqlx::query_as("SELECT id, name, color, created_at FROM tags ORDER BY name").fetch_all(&s.db).await?;
+        rows.into_iter()
+            .filter(|t| tag_ids.contains(&t.0))
+            .map(|(id, name, color, created_at)| {
+                let mut v = json!({ "id": id, "name": name, "created_at": created_at });
+                if let Some(c) = color {
+                    v["color"] = json!(c);
+                }
+                v
+            })
+            .collect()
+    };
+    let picker = picker(&s, &w, &screen.id).await?;
+    let tz = schedule::screen_tz(&screen, &org);
 
     let org_name = s.org_name();
     let fingerprint = json!({
         "segments": timeline.iter().enumerate().map(|(i, g)| json!([
-            g.playlist_id, g.source, g.entry_id, (i + 1 < timeline.len()).then_some(g.ends_at),
+            g.playlist_id, g.source, g.display, g.entry_id, (i + 1 < timeline.len()).then_some(g.ends_at),
         ])).collect::<Vec<_>>(),
         "playlists": playlists.iter().map(|pl| json!([pl.id, pl.version])).collect::<Vec<_>>(),
         "name": screen.name,
         "org": org_name,
+        "tags": tags,
+        "picker": picker,
+        "tz": tz.name(),
     });
     let etag = format!("\"{}\"", &sha256_hex(fingerprint.to_string().as_bytes())[..20]);
     let not_modified = headers
@@ -144,10 +255,13 @@ pub async fn manifest(
     let mut media: Vec<Media> = vec![];
     let mut assets = vec![];
     if !playlists.is_empty() {
-        let all: Vec<Media> = sqlx::query_as(&format!("SELECT {MEDIA_COLUMNS} FROM media WHERE team_id = ?"))
-            .bind(&screen.team_id)
-            .fetch_all(&s.db)
-            .await?;
+        let all: Vec<Media> = sqlx::query_as(&format!(
+            "SELECT {MEDIA_COLUMNS} FROM media WHERE id IN (SELECT media_id FROM playlist_media WHERE playlist_id IN \
+             (SELECT value FROM json_each(?)))"
+        ))
+        .bind(serde_json::to_string(&available)?)
+        .fetch_all(&s.db)
+        .await?;
         let by_id: HashMap<String, Media> = all.into_iter().map(|m| (m.id.clone(), m)).collect();
         let mut seen_media: HashSet<String> = HashSet::new();
         let mut seen_blob: HashSet<String> = HashSet::new();
@@ -194,6 +308,10 @@ pub async fn manifest(
         "screen_name": screen.name,
         "organization_id": s.org_id(),
         "organization_name": org_name,
+        "timezone": tz.name(),
+        "tags": tags,
+        "available_playlist_ids": available,
+        "picker": picker,
         "timeline": timeline,
         "playlists": playlists,
         "media": media,
@@ -212,7 +330,8 @@ pub async fn node(State(s): State<AppState>, p: Principal) -> ApiResult<Json<ser
     let row = super::nodes::fetch_row(&s, node_id).await.map_err(|_| ApiError::unauthorized())?;
     let rows: Vec<ScreenRow> =
         sqlx::query_as(&format!("SELECT {SCREEN_COLUMNS} FROM screens WHERE node_id = ? ORDER BY name, id")).bind(node_id).fetch_all(&s.db).await?;
-    let screens: Vec<Screen> = rows.into_iter().map(|r| super::screens::to_screen(&s, r)).collect();
+    let w = World::load(&s).await?;
+    let screens: Vec<Screen> = super::screens::views(&s, &w, rows).await?;
     Ok(Json(json!({ "node": super::nodes::to_node(&s, row).await?, "screens": screens })))
 }
 
@@ -222,7 +341,6 @@ pub async fn put_outputs(
     ApiJson(outputs): ApiJson<Vec<Output>>,
 ) -> ApiResult<Json<crate::models::Node>> {
     let node_id = device_node(&p)?;
-    let team_id = p.device_team.clone().unwrap_or_default();
     let mut keys = HashSet::new();
     for o in &outputs {
         if o.key.trim().is_empty() || o.name.trim().is_empty() {
@@ -245,7 +363,7 @@ pub async fn put_outputs(
     if res.rows_affected() == 0 {
         return Err(ApiError::unauthorized());
     }
-    s.hub.broadcast_team(&team_id, &json!({ "type": "node_updated", "node_id": node_id }));
+    s.hub.broadcast_all(&json!({ "type": "node_updated", "node_id": node_id }));
     Ok(Json(super::nodes::to_node(&s, super::nodes::fetch_row(&s, node_id).await?).await?))
 }
 
@@ -255,7 +373,8 @@ pub struct NewScreen {
     name: String,
 }
 
-/// A node creates its own screens, in its own team, one per reported output. Studio approval is not needed.
+/// A node creates a new untagged screen on one of its outputs (as its program output). It grants
+/// nothing until an admin tags it.
 pub async fn create_screen(
     State(s): State<AppState>,
     p: Principal,
@@ -274,44 +393,39 @@ pub async fn create_screen(
     let Some(output) = outputs.iter_mut().find(|o| o.key == input.output_key) else {
         return Err(ApiError::unprocessable("unknown_output", "output_key is not in the node's reported outputs"));
     };
-    let taken: Option<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE node_id = ? AND output_key = ?")
-        .bind(&node_id)
-        .bind(&input.output_key)
-        .fetch_optional(&s.db)
-        .await?;
     let conflict = || ApiError::conflict("output_has_screen", "that output already has a screen");
-    if taken.is_some() {
-        return Err(conflict());
-    }
 
     let id = new_id();
     output.screen_id = Some(id.clone());
-    output.role = crate::models::OutputRole::Screen;
-    let mut tx = s.db.begin().await?;
-    let inserted = sqlx::query(
-        "INSERT INTO screens (id, team_id, name, node_id, output_key, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    output.role = crate::models::OutputRole::Program;
+    let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
+    let taken: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM assignments WHERE node_id = ? AND output_key = ? AND job = 'program' AND screen_id IS NOT NULL",
     )
-    .bind(&id)
-    .bind(&node.team_id)
-    .bind(name)
     .bind(&node_id)
     .bind(&input.output_key)
-    .bind(now())
-    .execute(&mut *tx)
-    .await;
-    match inserted {
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Err(conflict()),
-        other => other?,
-    };
-    // The screen job for this output; any settings already stored for it are kept.
+    .fetch_optional(&mut *tx)
+    .await?;
+    if taken.is_some() {
+        return Err(conflict());
+    }
+    let stamp = now();
+    sqlx::query("INSERT INTO screens (id, name, node_id, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&id)
+        .bind(name)
+        .bind(&node_id)
+        .bind(&stamp)
+        .execute(&mut *tx)
+        .await?;
+    // The program job for this output; any settings already stored for it are kept.
     sqlx::query(
-        "INSERT INTO assignments (node_id, output_key, job, screen_id, updated_by, updated_at) VALUES (?1, ?2, 'screen', ?3, ?1, ?4) \
-         ON CONFLICT (node_id, output_key) DO UPDATE SET job = 'screen', screen_id = ?3, updated_by = ?1, updated_at = ?4",
+        "INSERT INTO assignments (node_id, output_key, job, screen_id, updated_by, updated_at) VALUES (?1, ?2, 'program', ?3, ?1, ?4) \
+         ON CONFLICT (node_id, output_key) DO UPDATE SET job = 'program', screen_id = ?3, updated_by = ?1, updated_at = ?4",
     )
     .bind(&node_id)
     .bind(&input.output_key)
     .bind(&id)
-    .bind(now())
+    .bind(&stamp)
     .execute(&mut *tx)
     .await?;
     let version: i64 = sqlx::query_scalar(
@@ -326,10 +440,13 @@ pub async fn create_screen(
     s.hub.send_node(&node_id, &json!({ "type": "assignments_changed", "version": version }));
 
     let row = super::screens::fetch_row(&s, &id).await?;
-    super::screens::broadcast_updated(&s, &row);
-    s.hub.broadcast_team(&node.team_id, &json!({ "type": "node_updated", "node_id": node_id }));
+    let actor = crate::notices::Actor { sub: node_id.clone(), name: Some(node.name.clone()), team_id: None };
+    crate::notices::log(&s, &id, "created", &actor, json!({ "name": name, "node_id": node_id })).await;
+    crate::notices::sync_untagged(&s, &id).await?;
+    super::screens::broadcast_updated(&s, &id).await;
+    s.hub.broadcast_all(&json!({ "type": "node_updated", "node_id": node_id }));
     if s.hub.is_online(&node_id) {
-        s.hub.broadcast_team(&node.team_id, &json!({ "type": "screen_online", "screen_id": id }));
+        s.broadcast_screen(&id, &json!({ "type": "screen_online", "screen_id": id })).await;
     }
-    Ok((StatusCode::CREATED, Json(super::screens::to_screen(&s, row))))
+    Ok((StatusCode::CREATED, Json(super::screens::to_screen(&s, row).await?)))
 }

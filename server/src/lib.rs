@@ -5,6 +5,8 @@ pub mod config;
 pub mod error;
 pub mod hub;
 pub mod models;
+pub mod notices;
+pub mod reach;
 pub mod routes;
 pub mod schedule;
 pub mod state;

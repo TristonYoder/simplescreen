@@ -1,12 +1,14 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     Json,
 };
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
-    auth::{Principal, Role},
-    error::{ApiError, ApiResult},
+    assignments::Mode,
+    auth::Principal,
+    error::{ApiError, ApiJson, ApiResult},
     models::{Node, NodeRow, Output, NODE_COLUMNS},
     state::AppState,
 };
@@ -38,7 +40,6 @@ pub async fn to_node(s: &AppState, row: NodeRow) -> ApiResult<Node> {
         online: s.hub.is_online(&row.id),
         status: s.node_statuses.lock().get(&row.id).cloned(),
         id: row.id,
-        team_id: row.team_id,
         name: row.name,
         model: row.model,
         os_version: row.os_version,
@@ -53,27 +54,48 @@ pub async fn to_node(s: &AppState, row: NodeRow) -> ApiResult<Node> {
     })
 }
 
-#[derive(Deserialize)]
-pub struct ListQuery {
-    team_id: Option<String>,
-}
-
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Node>>> {
-    let rows: Vec<NodeRow> = sqlx::query_as(&format!(
-        "SELECT {NODE_COLUMNS} FROM nodes WHERE (?1 IS NULL OR team_id = ?1) ORDER BY name"
-    ))
-    .bind(&q.team_id)
-    .fetch_all(&s.db)
-    .await?;
+pub async fn list(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Vec<Node>>> {
+    super::assignments::require_user(&p)?;
+    let rows: Vec<NodeRow> = sqlx::query_as(&format!("SELECT {NODE_COLUMNS} FROM nodes ORDER BY name")).fetch_all(&s.db).await?;
     let mut out = vec![];
-    for row in rows.into_iter().filter(|r| p.can_view(&r.team_id)) {
+    for row in rows {
         out.push(to_node(&s, row).await?);
     }
     Ok(Json(out))
 }
 
 pub async fn get(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Node>> {
+    super::assignments::require_user(&p)?;
     let row = fetch_row(&s, &id).await?;
-    p.require(&row.team_id, Role::Viewer)?;
     Ok(Json(to_node(&s, row).await?))
+}
+
+#[derive(Deserialize)]
+pub struct NodePatch {
+    name: Option<String>,
+    mode: Option<Mode>,
+}
+
+/// Node edits that touch no screen are admin only.
+pub async fn patch(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<NodePatch>,
+) -> ApiResult<Json<Node>> {
+    p.require_admin()?;
+    let row = fetch_row(&s, &id).await?;
+    if let Some(name) = &input.name {
+        if name.trim().is_empty() {
+            return Err(ApiError::bad_request("name must not be empty"));
+        }
+        sqlx::query("UPDATE nodes SET name = ? WHERE id = ?").bind(name.trim()).bind(&id).execute(&s.db).await?;
+    }
+    if let Some(mode) = input.mode.filter(|m| *m != Mode::parse(&row.mode)) {
+        let by = p.subject.clone();
+        crate::assignments::set_mode(&s, row, mode, &by, false).await?;
+    } else {
+        s.hub.broadcast_all(&json!({ "type": "node_updated", "node_id": id }));
+    }
+    Ok(Json(to_node(&s, fetch_row(&s, &id).await?).await?))
 }

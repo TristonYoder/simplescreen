@@ -13,6 +13,7 @@ struct App {
     router: Router,
     token: String,
     state: AppState,
+    tags: std::sync::Mutex<std::collections::HashMap<String, String>>,
     _dir: tempfile::TempDir,
 }
 
@@ -40,7 +41,7 @@ impl App {
         tweak(&mut cfg);
         let state = build_state(cfg).await.unwrap();
         let token = state.bootstrap.clone().unwrap();
-        Self { router: router(state.clone()), token, state, _dir: dir }
+        Self { router: router(state.clone()), token, state, tags: Default::default(), _dir: dir }
     }
 
     async fn send(&self, method: &str, uri: &str, token: Option<&str>, headers: &[(&str, &str)], body: Body, json: bool) -> Resp {
@@ -73,10 +74,32 @@ impl App {
         }
     }
 
+    /// A team holding a tag of its own (see `tag`).
     async fn team(&self) -> String {
         let r = self.call("POST", "/v1/teams", Some(json!({ "name": "Lobby" }))).await;
         assert_eq!(r.status, StatusCode::CREATED);
+        let team = r.json()["id"].as_str().unwrap().to_string();
+        let tag = self.new_tag(&format!("tag-{team}")).await;
+        let r = self.call("PUT", &format!("/v1/teams/{team}/tags"), Some(json!({ "tag_ids": [tag] }))).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+        self.tags.lock().unwrap().insert(team.clone(), tag);
+        team
+    }
+
+    fn tag(&self, team: &str) -> String {
+        self.tags.lock().unwrap()[team].clone()
+    }
+
+    async fn new_tag(&self, name: &str) -> String {
+        let r = self.call("POST", "/v1/tags", Some(json!({ "name": name }))).await;
+        assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
         r.json()["id"].as_str().unwrap().to_string()
+    }
+
+    /// Makes a playlist available wherever its team's own tag is.
+    async fn tag_playlist(&self, team: &str, playlist: &str) {
+        let r = self.call("PUT", &format!("/v1/playlists/{playlist}/tags"), Some(json!({ "tag_ids": [self.tag(team)] }))).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     }
 
     async fn upload(&self, data: &[u8]) -> String {
@@ -498,10 +521,11 @@ async fn pair(app: &App, team: &str, name: &str, playlist: Option<&str>) -> (Str
     let r = app.send("GET", &format!("{}x", poll), None, &[], Body::empty(), false).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 
-    let r = app.call("POST", "/v1/pairing/claim", Some(json!({ "code": "ZZZZZZ", "name": name, "team_id": team }))).await;
+    let r = app.call("POST", "/v1/pairing/claim", Some(json!({ "code": "ZZZZZZ", "name": name }))).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
-    let mut claim = json!({ "code": code.to_lowercase(), "name": name, "team_id": team });
+    let mut claim = json!({ "code": code.to_lowercase(), "name": name, "tag_ids": [app.tag(team)] });
     if let Some(p) = playlist {
+        app.tag_playlist(team, p).await;
         claim["playlist_id"] = json!(p);
     }
     let r = app.call("POST", "/v1/pairing/claim", Some(claim)).await;
@@ -588,8 +612,8 @@ async fn pairing_and_manifest() {
     let r = app.call("POST", &format!("/v1/screens/{screen_id}/command"), Some(json!({ "name": "next" }))).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
 
-    let r = app.call("PATCH", &format!("/v1/screens/{screen_id}"), Some(json!({ "playlist_id": null }))).await;
-    assert!(r.json().get("playlist_id").is_none());
+    let r = app.call("PATCH", &format!("/v1/screens/{screen_id}"), Some(json!({ "fallback_playlist_id": null }))).await;
+    assert!(r.json().get("fallback_playlist_id").is_none());
     let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
     assert_ne!(r.headers[header::ETAG].to_str().unwrap(), etag);
     assert!(r.json().get("playlist").is_none());
@@ -617,18 +641,21 @@ async fn device_selects_playlist() {
         .as_str()
         .unwrap()
         .to_string();
+    app.tag_playlist(&g, &a).await;
+    app.tag_playlist(&g, &b).await;
     let (screen_id, token) = pair(&app, &g, "Hall", None).await;
 
     let r = app.call_as(&token, "GET", "/v1/device/playlists", None).await;
     assert_eq!(r.status, StatusCode::OK);
-    let list = r.json();
-    let names: Vec<&str> = list.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    let tree = r.json();
+    assert_eq!((tree[0]["kind"].as_str(), tree[0]["id"].as_str()), (Some("team"), Some(g.as_str())));
+    let names: Vec<&str> = tree[0]["children"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
     assert_eq!(names, vec!["A", "B"]);
 
     let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": a }))).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{:?}", r.body);
     let r = app.call("GET", &format!("/v1/screens/{screen_id}"), None).await;
-    assert_eq!(r.json()["playlist_id"], a);
+    assert_eq!(r.json()["fallback_playlist_id"], a);
     let r = app.call_as(&token, "GET", "/v1/device/manifest", None).await;
     assert_eq!(r.json()["playlist"]["id"], a);
 
@@ -636,10 +663,10 @@ async fn device_selects_playlist() {
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": b }))).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
-    let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "playlist_id": null }))).await;
+    let r = app.call_as(&token, "PUT", "/v1/device/playlist", Some(json!({ "fallback_playlist_id": null }))).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     let r = app.call("GET", &format!("/v1/screens/{screen_id}"), None).await;
-    assert!(r.json().get("playlist_id").is_none());
+    assert!(r.json().get("fallback_playlist_id").is_none());
 
     let r = app.call("GET", "/v1/device/playlists", None).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
@@ -662,6 +689,8 @@ async fn schedule_resolves_events_weekly_and_overrides() {
     let a = id(app.call("POST", "/v1/playlists", Some(mk("A", &img))).await);
     let b = id(app.call("POST", "/v1/playlists", Some(mk("B", &img))).await);
     let c = id(app.call("POST", "/v1/playlists", Some(mk("C", &img2))).await);
+    app.tag_playlist(&g, &b).await;
+    app.tag_playlist(&g, &c).await;
     let (screen, token) = pair(&app, &g, "Hall", Some(&a)).await;
 
     let now = Utc::now().with_second(0).unwrap().with_nanosecond(0).unwrap();
@@ -737,7 +766,6 @@ async fn schedule_resolves_events_weekly_and_overrides() {
     assert_eq!(r.status, StatusCode::NO_CONTENT);
     let r = app.call("GET", &format!("/v1/screens/{screen}"), None).await;
     assert_eq!(r.json()["override"]["playlist_id"], a);
-    assert_eq!(r.json()["playlist_id"], a);
 
     let r = app.call("DELETE", &format!("/v1/schedule/{event}"), None).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT);
@@ -793,13 +821,13 @@ async fn floor_plans_and_placement() {
 
 // MARK: Nodes
 
-async fn pair_node(app: &App, team: &str, name: &str) -> (String, String) {
+async fn pair_node(app: &App, _team: &str, name: &str) -> (String, String) {
     let r = app.send("POST", "/v1/pairing", None, &[], Body::from(json!({ "kind": "node" }).to_string()), true).await;
     assert_eq!(r.status, StatusCode::CREATED);
     let s = r.json();
     let poll = format!("/v1/pairing/{}?secret={}", s["pairing_id"].as_str().unwrap(), s["secret"].as_str().unwrap());
     let r = app
-        .call("POST", "/v1/pairing/claim", Some(json!({ "code": s["code"], "name": name, "team_id": team })))
+        .call("POST", "/v1/pairing/claim", Some(json!({ "code": s["code"], "name": name })))
         .await;
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
     let node = r.json();
@@ -821,7 +849,7 @@ async fn single_pairing_creates_node_and_screen() {
     let g = app.team().await;
     let (screen_id, token) = pair(&app, &g, "Hall", None).await;
     let screen = app.call("GET", &format!("/v1/screens/{screen_id}"), None).await.json();
-    assert_eq!(screen["output_key"], "main");
+    assert_eq!(screen["output_keys"], json!(["main"]));
     let node_id = screen["node_id"].as_str().unwrap();
     let r = app.call("GET", &format!("/v1/nodes?team_id={g}"), None).await;
     assert_eq!(r.json().as_array().unwrap().len(), 1);
@@ -866,22 +894,22 @@ async fn node_outputs_and_screen_creation() {
     assert_eq!(r.json()["code"], "unknown_output");
 
     let outputs = json!([
-        { "key": "hdmi-1", "kind": "display", "name": "Left", "role": "screen" },
-        { "key": "hdmi-2", "kind": "external", "name": "Right", "role": "screen", "format": "1080p60" },
+        { "key": "hdmi-1", "kind": "display", "name": "Left", "role": "program" },
+        { "key": "hdmi-2", "kind": "external", "name": "Right", "role": "program", "format": "1080p60" },
         { "key": "dl-1", "kind": "decklink", "name": "DeckLink 1", "role": "none" },
         { "key": "v-1", "kind": "virtual", "name": "Virtual", "role": "confidence", "audio_device": "BlackHole" },
     ]);
     let r = app.call_as(&token, "PUT", "/v1/device/outputs", Some(outputs.clone())).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    let bad = json!([{ "key": "a", "kind": "hdmi", "name": "A", "role": "screen" }]);
+    let bad = json!([{ "key": "a", "kind": "hdmi", "name": "A", "role": "program" }]);
     assert_eq!(app.call_as(&token, "PUT", "/v1/device/outputs", Some(bad)).await.status, StatusCode::BAD_REQUEST);
     let dup = json!([
-        { "key": "a", "kind": "display", "name": "A", "role": "screen" },
-        { "key": "a", "kind": "display", "name": "B", "role": "screen" },
+        { "key": "a", "kind": "display", "name": "A", "role": "program" },
+        { "key": "a", "kind": "display", "name": "B", "role": "program" },
     ]);
     assert_eq!(app.call_as(&token, "PUT", "/v1/device/outputs", Some(dup)).await.status, StatusCode::UNPROCESSABLE_ENTITY);
     // A reported screen_id is ignored. The stored role comes from assignments, which are still empty.
-    let foreign = json!([{ "key": "a", "kind": "display", "name": "A", "role": "screen", "screen_id": "nope" }]);
+    let foreign = json!([{ "key": "a", "kind": "display", "name": "A", "role": "program", "screen_id": "nope" }]);
     let r = app.call_as(&token, "PUT", "/v1/device/outputs", Some(foreign)).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert!(r.json()["outputs"][0].get("screen_id").is_none(), "{:?}", r.json());
@@ -897,9 +925,9 @@ async fn node_outputs_and_screen_creation() {
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
     let left = r.json();
     assert_eq!(left["name"], "Left TV");
-    assert_eq!(left["team_id"], g);
+    assert_eq!(left["tag_ids"], json!([]));
     assert_eq!(left["node_id"], node_id);
-    assert_eq!(left["output_key"], "hdmi-1");
+    assert_eq!(left["output_keys"], json!(["hdmi-1"]));
     let left_id = left["id"].as_str().unwrap().to_string();
 
     let r = app
@@ -951,8 +979,8 @@ async fn node_socket_routes_screen_messages_and_jump() {
     let g = app.team().await;
     let (node_id, token) = pair_node(&app, &g, "Mac mini").await;
     app.call_as(&token, "PUT", "/v1/device/outputs", Some(json!([
-        { "key": "a", "kind": "display", "name": "A", "role": "screen" },
-        { "key": "b", "kind": "display", "name": "B", "role": "screen" },
+        { "key": "a", "kind": "display", "name": "A", "role": "program" },
+        { "key": "b", "kind": "display", "name": "B", "role": "program" },
     ])))
     .await;
     let mk = |key: &str| json!({ "output_key": key, "name": key });
@@ -965,7 +993,7 @@ async fn node_socket_routes_screen_messages_and_jump() {
     assert_eq!(r.status, StatusCode::CONFLICT);
     assert_eq!(app.call("GET", &format!("/v1/screens/{a}"), None).await.json()["online"], false);
 
-    let (_conn, mut rx) = app.state.hub.register_node(&node_id, &g);
+    let (_conn, mut rx) = app.state.hub.register_node(&node_id);
     assert_eq!(app.call("GET", &format!("/v1/screens/{b}"), None).await.json()["online"], true);
 
     let r = app.call("POST", &format!("/v1/screens/{b}/command"), Some(jump)).await;
@@ -986,7 +1014,7 @@ async fn node_socket_routes_screen_messages_and_jump() {
     assert_eq!(serde_json::from_str::<Value>(&m).unwrap()["screen_id"], a);
 
     // Manifest changes are routed to the node and name the screen.
-    let r = app.call("PATCH", &format!("/v1/screens/{a}"), Some(json!({ "playlist_id": null }))).await;
+    let r = app.call("PATCH", &format!("/v1/screens/{a}"), Some(json!({ "fallback_playlist_id": null }))).await;
     assert_eq!(r.status, StatusCode::OK);
     let Some(Out::Msg(m)) = rx.recv().await else { panic!("no message") };
     let m: Value = serde_json::from_str(&m).unwrap();
@@ -1002,7 +1030,8 @@ async fn pair_mode(app: &App, team: &str, name: &str, mode: &str) -> (String, St
     assert_eq!(r.status, StatusCode::CREATED);
     let s = r.json();
     let poll = format!("/v1/pairing/{}?secret={}", s["pairing_id"].as_str().unwrap(), s["secret"].as_str().unwrap());
-    let r = app.call("POST", "/v1/pairing/claim", Some(json!({ "code": s["code"], "name": name, "team_id": team }))).await;
+    let _ = team;
+    let r = app.call("POST", "/v1/pairing/claim", Some(json!({ "code": s["code"], "name": name }))).await;
     assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
     let node = r.json();
     assert_eq!(node["mode"], mode);
@@ -1029,7 +1058,15 @@ async fn player(app: &App, g: &str, name: &str) -> (String, String, String) {
     outputs(app, &token).await;
     let r = app.call_as(&token, "POST", "/v1/device/screens", Some(json!({ "output_key": "a", "name": name }))).await;
     assert_eq!(r.status, StatusCode::CREATED);
-    (node, token, r.json()["id"].as_str().unwrap().to_string())
+    let screen = r.json()["id"].as_str().unwrap().to_string();
+    let r = app.call("PUT", &format!("/v1/screens/{screen}/tags"), Some(json!({ "tag_ids": [app.tag(g)] }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    (node, token, screen)
+}
+
+/// Studio-side (admin) replacement of a node's assignments.
+async fn put_n(app: &App, node: &str, base: i64, list: Value) -> Resp {
+    app.call("PUT", &format!("/v1/nodes/{node}/assignments"), Some(json!({ "base_version": base, "assignments": list }))).await
 }
 
 async fn put_a(app: &App, token: &str, base: i64, list: Value) -> Resp {
@@ -1059,12 +1096,12 @@ async fn assignments_validation_and_versions() {
     let cur = app.call_as(&token, "GET", "/v1/device/assignments", None).await.json();
     assert_eq!(cur["mode"], "player");
     assert_eq!(cur["version"], 1);
-    assert_eq!(cur["assignments"][0]["job"], "screen");
+    assert_eq!(cur["assignments"][0]["job"], "program");
     assert_eq!(cur["assignments"][0]["screen_id"], screen);
     let node_json = app.call("GET", &format!("/v1/nodes/{node}"), None).await.json();
     assert_eq!((node_json["assignments_version"].as_i64(), node_json["applied_assignments_version"].as_i64()), (Some(1), Some(1)));
 
-    let keep = json!({ "output_key": "a", "job": "screen", "screen_id": screen });
+    let keep = json!({ "output_key": "a", "job": "program", "screen_id": screen });
     let bad = |list: Value| put_a(&app, &token, 1, list);
     let c = code(bad(json!([keep, { "output_key": "zzz", "job": "control", "screen_id": screen }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
     assert_eq!(c, "unknown_output");
@@ -1072,20 +1109,14 @@ async fn assignments_validation_and_versions() {
     assert_eq!(c, "control_needs_input");
     let c = code(bad(json!([keep, { "output_key": "v", "job": "control", "screen_id": screen }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
     assert_eq!(c, "control_needs_input");
-    // A second output cannot play the same screen.
-    let c = code(bad(json!([keep, { "output_key": "b", "job": "screen", "screen_id": screen }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
-    assert_eq!(c, "screen_has_output");
-
-    // Another node's screen: not local for mirror or screen; a foreign team's screen is not in the team.
+    // The device can only use screens it is already assigned to; Studio can't take another node's screen.
     let (_n2, _t2, other) = player(&app, &g, "Other").await;
-    let c = code(bad(json!([keep, { "output_key": "b", "job": "mirror", "screen_id": other }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
-    assert_eq!(c, "mirror_must_be_local");
-    let c = code(bad(json!([keep, { "output_key": "b", "job": "screen", "screen_id": other }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
+    let c = code(bad(json!([keep, { "output_key": "b", "job": "control", "screen_id": other }])).await, StatusCode::FORBIDDEN).await;
+    assert_eq!(c, "target_not_assigned");
+    let c = code(put_n(&app, &node, 1, json!([keep, { "output_key": "b", "job": "program", "screen_id": other }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
     assert_eq!(c, "screen_must_be_local");
-    let g2 = app.call("POST", "/v1/teams", Some(json!({ "name": "Elsewhere" }))).await.json()["id"].as_str().unwrap().to_string();
-    let (_n3, _t3, far) = player(&app, &g2, "Far").await;
-    let c = code(bad(json!([keep, { "output_key": "b", "job": "control", "screen_id": far }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
-    assert_eq!(c, "target_not_in_team");
+    let c = code(put_n(&app, &node, 1, json!([keep, { "output_key": "b", "job": "control", "screen_id": "nope" }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
+    assert_eq!(c, "unknown_screen");
     let c = code(bad(json!([keep, { "output_key": "b", "job": "control" }])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
     assert_eq!(c, "screen_required");
     // Unknown outputs are only allowed when off.
@@ -1095,13 +1126,13 @@ async fn assignments_validation_and_versions() {
 
     // Audio: one enabled assignment per screen, across devices too.
     let audio = |key: &str, job: &str, sid: &str| json!({ "output_key": key, "job": job, "screen_id": sid, "settings": { "audio": { "enabled": true } } });
-    let c = code(put_a(&app, &token, 2, json!([audio("a", "screen", &screen), audio("b", "mirror", &screen)])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
+    let c = code(put_a(&app, &token, 2, json!([audio("a", "program", &screen), audio("b", "program", &screen)])).await, StatusCode::UNPROCESSABLE_ENTITY).await;
     assert_eq!(c, "audio_conflict");
-    let r = put_a(&app, &token, 2, json!([audio("a", "screen", &screen)])).await;
+    let r = put_a(&app, &token, 2, json!([audio("a", "program", &screen)])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    let (_n4, t4) = pair_mode(&app, &g, "iPad", "controller").await;
+    let (n4, t4) = pair_mode(&app, &g, "iPad", "controller").await;
     outputs(&app, &t4).await;
-    let r = put_a(&app, &t4, 0, json!([audio("a", "control", &screen)])).await;
+    let r = put_n(&app, &n4, 0, json!([audio("a", "control", &screen)])).await;
     assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "audio_conflict");
 
     // Stale base_version: 409 with the current body.
@@ -1121,31 +1152,25 @@ async fn controller_mode_limits_jobs() {
     let (_p, _pt, screen) = player(&app, &g, "Mini").await;
     let (node, token) = pair_mode(&app, &g, "iPad", "controller").await;
     outputs(&app, &token).await;
-    for job in ["screen", "mirror"] {
-        let r = put_a(&app, &token, 0, json!([{ "output_key": "a", "job": job, "screen_id": screen }])).await;
-        assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "job_not_allowed_in_mode");
-    }
+    let r = put_n(&app, &node, 0, json!([{ "output_key": "a", "job": "program", "screen_id": screen }])).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "job_not_allowed_in_mode");
     // Controller devices own no screens, so creating one is refused as well.
     let r = app.call_as(&token, "POST", "/v1/device/screens", Some(json!({ "output_key": "a", "name": "x" }))).await;
     assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "job_not_allowed_in_mode");
-    // Control and confidence may target any screen in the team, on any output of a controller node.
-    let r = put_a(&app, &token, 0, json!([
+    // Control and confidence may target any screen, on any output of a controller node.
+    let r = put_n(&app, &node, 0, json!([
         { "output_key": "a", "job": "control", "screen_id": screen, "settings": { "view": "operator", "clock": 24 } },
         { "output_key": "b", "job": "confidence", "screen_id": screen, "settings": { "clock": 12 } },
         { "output_key": "dl", "job": "off" },
     ])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(r.json()["assignments"].as_array().unwrap().len(), 3);
-    let bad_clock = put_a(&app, &token, 1, json!([{ "output_key": "a", "job": "control", "screen_id": screen, "settings": { "clock": 5 } }])).await;
+    let bad_clock = put_n(&app, &node, 1, json!([{ "output_key": "a", "job": "control", "screen_id": screen, "settings": { "clock": 5 } }])).await;
     assert_eq!(code(bad_clock, StatusCode::UNPROCESSABLE_ENTITY).await, "invalid_assignments");
 
-    // team-screens lists everything in the team.
-    let r = app.call_as(&token, "GET", "/v1/device/team-screens", None).await;
-    let list = r.json();
-    let s = list.as_array().unwrap().iter().find(|x| x["id"] == screen).unwrap();
-    assert_eq!((s["node_name"].as_str(), s["node_mode"].as_str(), s["output_key"].as_str()), (Some("Mini"), Some("player"), Some("a")));
-    assert_eq!((s["online"].as_bool(), s["placed"].as_bool()), (Some(false), Some(true)));
-    let _ = node;
+    // The device can rearrange its own assignments.
+    let r = put_a(&app, &token, 1, json!([{ "output_key": "b", "job": "control", "screen_id": screen }])).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
 }
 
 #[tokio::test]
@@ -1160,28 +1185,33 @@ async fn unplace_on_job_removal_and_mode_change() {
     let v = version(&app, &token).await;
     let r = put_a(&app, &token, v, json!([
         { "output_key": "a", "job": "off" },
-        { "output_key": "b", "job": "screen", "screen_id": second },
+        { "output_key": "b", "job": "program", "screen_id": second },
     ])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     let s = app.call("GET", &format!("/v1/screens/{screen}"), None).await.json();
-    assert!(s.get("node_id").is_none() && s.get("output_key").is_none(), "{s}");
+    assert!(s.get("node_id").is_none() && s["output_keys"] == json!([]), "{s}");
     let listed = app.call("GET", &format!("/v1/screens?team_id={g}"), None).await.json();
     assert!(listed.as_array().unwrap().iter().any(|x| x["id"] == screen && x.get("node_id").is_none()));
     let n = app.call("GET", &format!("/v1/nodes/{node}"), None).await.json();
     assert_eq!(n["screen_ids"], json!([second]));
-    // Unplaced screens can be taken over again ("use existing screen").
+    // An unplaced screen is no longer the device's to take; Studio can place it again.
     let v = version(&app, &token).await;
-    let r = put_a(&app, &token, v, json!([
-        { "output_key": "a", "job": "screen", "screen_id": screen },
-        { "output_key": "b", "job": "screen", "screen_id": second },
+    let take = json!([
+        { "output_key": "a", "job": "program", "screen_id": screen },
+        { "output_key": "b", "job": "program", "screen_id": second },
+    ]);
+    assert_eq!(code(put_a(&app, &token, v, take).await, StatusCode::FORBIDDEN).await, "target_not_assigned");
+    let r = put_n(&app, &node, v, json!([
+        { "output_key": "a", "job": "program", "screen_id": screen },
+        { "output_key": "b", "job": "program", "screen_id": second },
     ])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    assert_eq!(app.call("GET", &format!("/v1/screens/{screen}"), None).await.json()["output_key"], "a");
+    assert_eq!(app.call("GET", &format!("/v1/screens/{screen}"), None).await.json()["output_keys"], json!(["a"]));
 
     // Leaving player releases all screens and drops screen/mirror jobs but keeps control.
     let v = version(&app, &token).await;
     let r = put_a(&app, &token, v, json!([
-        { "output_key": "a", "job": "screen", "screen_id": screen },
+        { "output_key": "a", "job": "program", "screen_id": screen },
         { "output_key": "b", "job": "control", "screen_id": second },
     ])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
@@ -1190,7 +1220,7 @@ async fn unplace_on_job_removal_and_mode_change() {
     let body = r.json();
     assert_eq!(body["mode"], "stage");
     let jobs: Vec<_> = body["assignments"].as_array().unwrap().iter().map(|a| (a["output_key"].as_str().unwrap(), a["job"].as_str().unwrap())).collect();
-    assert!(!jobs.iter().any(|(_, j)| *j == "screen" || *j == "mirror"), "{jobs:?}");
+    assert!(!jobs.iter().any(|(_, j)| *j == "program"), "{jobs:?}");
     assert!(jobs.contains(&("b", "control")));
     for id in [&screen, &second] {
         let s = app.call("GET", &format!("/v1/screens/{id}"), None).await.json();
@@ -1213,7 +1243,7 @@ async fn editor_assignments_and_move() {
     outputs(&app, &t2).await;
     let audio = json!({ "audio": { "enabled": true, "device": "HDMI" } });
     let v = version(&app, &t1).await;
-    let r = put_a(&app, &t1, v, json!([{ "output_key": "a", "job": "screen", "screen_id": screen, "settings": audio }])).await;
+    let r = put_a(&app, &t1, v, json!([{ "output_key": "a", "job": "program", "screen_id": screen, "settings": audio }])).await;
     assert_eq!(r.status, StatusCode::OK);
 
     // Editor GET/PUT on a node, versioned, with updated_by set from the user.
@@ -1231,17 +1261,12 @@ async fn editor_assignments_and_move() {
     // Move the screen to the other node's output; its settings follow and the old output goes off.
     let r = app.call("POST", &format!("/v1/screens/{screen}/move"), Some(json!({ "node_id": n2, "output_key": "zzz" }))).await;
     assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "unknown_output");
-    let (other_node, _other_token, _) = {
-        let g2 = app.call("POST", "/v1/teams", Some(json!({ "name": "Elsewhere" }))).await.json()["id"].as_str().unwrap().to_string();
-        let (n, t) = pair_node(&app, &g2, "Far").await;
-        (n, t, ())
-    };
-    let r = app.call("POST", &format!("/v1/screens/{screen}/move"), Some(json!({ "node_id": other_node, "output_key": "a" }))).await;
-    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "target_not_in_team");
+    let r = app.call("POST", &format!("/v1/screens/{screen}/move"), Some(json!({ "node_id": "nope", "output_key": "a" }))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "unknown_node");
 
     let r = app.call("POST", &format!("/v1/screens/{screen}/move"), Some(json!({ "node_id": n2, "output_key": "a" }))).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    assert_eq!((r.json()["node_id"].as_str(), r.json()["output_key"].as_str()), (Some(n2.as_str()), Some("a")));
+    assert_eq!((r.json()["node_id"].as_str(), r.json()["output_keys"].clone()), (Some(n2.as_str()), json!(["a"])));
     let old = app.call("GET", &format!("/v1/nodes/{n1}/assignments"), None).await.json();
     let a = old["assignments"].as_array().unwrap().iter().find(|a| a["output_key"] == "a").unwrap();
     assert_eq!(a["job"], "off");
@@ -1249,7 +1274,7 @@ async fn editor_assignments_and_move() {
     assert_eq!(old["version"], 3);
     let new = app.call("GET", &format!("/v1/nodes/{n2}/assignments"), None).await.json();
     let a = new["assignments"].as_array().unwrap().iter().find(|a| a["output_key"] == "a").unwrap();
-    assert_eq!((a["job"].as_str(), a["screen_id"].as_str()), (Some("screen"), Some(screen.as_str())));
+    assert_eq!((a["job"].as_str(), a["screen_id"].as_str()), (Some("program"), Some(screen.as_str())));
     assert_eq!(a["settings"]["audio"]["device"], "HDMI");
     assert_eq!(new["version"], 2);
     // The confidence job on the new node keeps pointing at the screen.
@@ -1270,47 +1295,49 @@ async fn editor_assignments_and_move() {
 }
 
 #[tokio::test]
-async fn mirrors_follow_screen_jobs_and_moves_keep_their_own_audio() {
+async fn program_outputs_and_moves_keep_their_own_audio() {
     let app = App::new().await;
     let g = app.team().await;
     let (node, token, screen) = player(&app, &g, "Mini").await;
+    // One screen may play on several outputs of its node; the device may move it between them.
     let v = version(&app, &token).await;
-    // The node plays the screen, but this request drops that job and keeps a mirror.
     let r = put_a(&app, &token, v, json!([
-        { "output_key": "a", "job": "off" },
-        { "output_key": "b", "job": "mirror", "screen_id": screen },
+        { "output_key": "a", "job": "program", "screen_id": screen },
+        { "output_key": "b", "job": "program", "screen_id": screen },
     ])).await;
-    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "mirror_must_be_local");
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(app.call("GET", &format!("/v1/screens/{screen}"), None).await.json()["output_keys"], json!(["a", "b"]));
+    let r = put_a(&app, &token, v + 1, json!([{ "output_key": "a", "job": "program", "screen_id": screen }])).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
 
-    // Same-node move onto an output that mirrors a different screen turns that mirror off.
     let second = app.call_as(&token, "POST", "/v1/device/screens", Some(json!({ "output_key": "b", "name": "Second" }))).await;
     assert_eq!(second.status, StatusCode::CREATED, "{:?}", second.body);
     let second_id = second.json()["id"].as_str().unwrap().to_string();
     let v = version(&app, &token).await;
     let r = put_a(&app, &token, v, json!([
-        { "output_key": "a", "job": "screen", "screen_id": screen },
-        { "output_key": "b", "job": "screen", "screen_id": second_id, "settings": { "audio": { "enabled": true } } },
-        { "output_key": "v", "job": "mirror", "screen_id": second_id },
+        { "output_key": "a", "job": "program", "screen_id": screen },
+        { "output_key": "b", "job": "program", "screen_id": second_id, "settings": { "audio": { "enabled": true } } },
+        { "output_key": "v", "job": "program", "screen_id": second_id },
     ])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    // Unplace `second` by moving `screen` onto its output. The mirror of `second` cannot stay.
+    // Moving `screen` onto b takes that output; `second` keeps playing on v.
     let r = app.call("POST", &format!("/v1/screens/{screen}/move"), Some(json!({ "node_id": node, "output_key": "b" }))).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     let body = app.call("GET", &format!("/v1/nodes/{node}/assignments"), None).await.json();
     let jobs: Vec<_> = body["assignments"].as_array().unwrap().iter().map(|a| (a["output_key"].as_str().unwrap(), a["job"].as_str().unwrap())).collect();
-    assert!(jobs.contains(&("v", "off")), "{jobs:?}");
-    assert!(jobs.iter().any(|(k, j)| *k == "b" && *j == "screen"));
+    assert!(jobs.contains(&("a", "off")) && jobs.contains(&("b", "program")) && jobs.contains(&("v", "program")), "{jobs:?}");
     let moved = body["assignments"].as_array().unwrap().iter().find(|a| a["output_key"] == "b").unwrap();
+    assert_eq!(moved["screen_id"], screen);
     assert!(moved["settings"].get("audio").is_none(), "{moved}");
-    let parked = app.call("GET", &format!("/v1/screens/{second_id}"), None).await.json();
-    assert!(parked.get("node_id").is_none(), "{parked}");
+    assert_eq!(app.call("GET", &format!("/v1/screens/{second_id}"), None).await.json()["output_keys"], json!(["v"]));
 
     // An unplaced screen moved onto an output does not take that output's audio.
     let v = body["version"].as_i64().unwrap();
     let r = put_a(&app, &token, v, json!([
-        { "output_key": "b", "job": "screen", "screen_id": screen, "settings": { "audio": { "enabled": true, "device": "HDMI" } } },
+        { "output_key": "b", "job": "program", "screen_id": screen, "settings": { "audio": { "enabled": true, "device": "HDMI" } } },
     ])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert!(app.call("GET", &format!("/v1/screens/{second_id}"), None).await.json().get("node_id").is_none());
     let r = app.call("POST", &format!("/v1/screens/{second_id}/move"), Some(json!({ "node_id": node, "output_key": "b" }))).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     let body = app.call("GET", &format!("/v1/nodes/{node}/assignments"), None).await.json();
@@ -1335,7 +1362,7 @@ async fn remote_command_manifest_and_blob_access() {
     let r = app.call_as(&ct, "GET", &format!("/v1/device/manifest?screen_id={screen}"), None).await;
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 
-    let r = put_a(&app, &ct, 0, json!([
+    let r = put_n(&app, &cn, 0, json!([
         { "output_key": "a", "job": "control", "screen_id": screen },
         { "output_key": "b", "job": "confidence", "screen_id": other },
     ])).await;
@@ -1345,7 +1372,7 @@ async fn remote_command_manifest_and_blob_access() {
     let r = app.call_as(&ct, "POST", &format!("/v1/device/screens/{screen}/command"), Some(cmd.clone())).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
     let owner = app.call("GET", &format!("/v1/screens/{screen}"), None).await.json()["node_id"].as_str().unwrap().to_string();
-    let (_c, mut rx) = app.state.hub.register_node(&owner, &g);
+    let (_c, mut rx) = app.state.hub.register_node(&owner);
     let r = app.call_as(&ct, "POST", &format!("/v1/device/screens/{screen}/command"), Some(json!({ "name": "jump", "item_index": 3 }))).await;
     assert_eq!(r.status, StatusCode::ACCEPTED);
     let Some(Out::Msg(m)) = rx.recv().await else { panic!("no message") };
@@ -1366,15 +1393,16 @@ async fn remote_command_manifest_and_blob_access() {
         assert_eq!(r.json()["screen_id"], *id);
     }
     // Remote playlist choice: control target allowed, confidence-only 403, unrelated 404.
-    let (pl, _) = (app.call("POST", "/v1/playlists", Some(json!({ "team_id": g, "name": "Remote", "items": [] }))).await.json()["id"].as_str().unwrap().to_string(), ());
+    let pl = app.call("POST", "/v1/playlists", Some(json!({ "team_id": g, "name": "Remote", "items": [] }))).await.json()["id"].as_str().unwrap().to_string();
+    app.tag_playlist(&g, &pl).await;
     let r = app.call_as(&ct, "GET", &format!("/v1/device/playlists?screen_id={screen}"), None).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
-    assert!(r.json().as_array().unwrap().iter().any(|p| p["id"] == pl));
+    assert!(r.json()[0]["children"].as_array().unwrap().iter().any(|p| p["id"] == pl));
     let r = app.call_as(&ct, "GET", &format!("/v1/device/playlists?screen_id={other}"), None).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     let r = app.call_as(&ct, "PUT", "/v1/device/playlist", Some(json!({ "screen_id": screen, "playlist_id": pl }))).await;
     assert_eq!(r.status, StatusCode::NO_CONTENT, "{:?}", r.body);
-    assert_eq!(app.call("GET", &format!("/v1/screens/{screen}"), None).await.json()["playlist_id"], pl);
+    assert_eq!(app.call("GET", &format!("/v1/screens/{screen}"), None).await.json()["fallback_playlist_id"], pl);
     let r = app.call_as(&ct, "PUT", "/v1/device/playlist", Some(json!({ "screen_id": other, "playlist_id": pl }))).await;
     assert_eq!(r.status, StatusCode::FORBIDDEN);
     let r = app.call_as(&ct, "PUT", "/v1/device/playlist", Some(json!({ "screen_id": uuid::Uuid::new_v4().to_string(), "playlist_id": pl }))).await;
@@ -1382,7 +1410,6 @@ async fn remote_command_manifest_and_blob_access() {
     let sha = app.upload(b"thumbnail bytes").await;
     let r = app.call_as(&ct, "GET", &format!("/v1/blobs/{sha}"), None).await;
     assert_eq!(r.status, StatusCode::OK);
-    let _ = cn;
 }
 
 #[tokio::test]
@@ -1392,11 +1419,11 @@ async fn watchers_receive_status_manifest_and_assignment_messages() {
     let (pn, _pt, screen) = player(&app, &g, "Mini").await;
     let (cn, ct) = pair_mode(&app, &g, "iPad", "controller").await;
     outputs(&app, &ct).await;
-    let (_pc, mut prx) = app.state.hub.register_node(&pn, &g);
-    let (_cc, mut crx) = app.state.hub.register_node(&cn, &g);
+    let (_pc, mut prx) = app.state.hub.register_node(&pn);
+    let (_cc, mut crx) = app.state.hub.register_node(&cn);
     app.state.statuses.lock().insert(screen.clone(), screen_server::models::ScreenStatus::simple(screen_server::models::ScreenState::Playing));
 
-    let r = put_a(&app, &ct, 0, json!([{ "output_key": "a", "job": "control", "screen_id": screen }])).await;
+    let r = put_n(&app, &cn, 0, json!([{ "output_key": "a", "job": "control", "screen_id": screen }])).await;
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     let m = recv_json(&mut crx).await;
     assert_eq!((m["type"].as_str(), m["version"].as_i64()), (Some("assignments_changed"), Some(1)));
@@ -1411,7 +1438,7 @@ async fn watchers_receive_status_manifest_and_assignment_messages() {
     assert!(prx.try_recv().is_err());
 
     // Manifest changes reach the watcher too (and the player, once each).
-    let r = app.call("PATCH", &format!("/v1/screens/{screen}"), Some(json!({ "playlist_id": null }))).await;
+    let r = app.call("PATCH", &format!("/v1/screens/{screen}"), Some(json!({ "fallback_playlist_id": null }))).await;
     assert_eq!(r.status, StatusCode::OK);
     let m = recv_json(&mut crx).await;
     assert_eq!((m["type"].as_str(), m["screen_id"].as_str()), (Some("manifest_changed"), Some(screen.as_str())));
@@ -1420,7 +1447,7 @@ async fn watchers_receive_status_manifest_and_assignment_messages() {
     assert!(prx.try_recv().is_err());
 
     // Dropping the assignment stops the fan-out.
-    let r = put_a(&app, &ct, 1, json!([{ "output_key": "a", "job": "off" }])).await;
+    let r = put_n(&app, &cn, 1, json!([{ "output_key": "a", "job": "off" }])).await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(recv_json(&mut crx).await["type"], "assignments_changed");
     app.state.hub.send_subscribers(&screen, Some(&pn), &msg);

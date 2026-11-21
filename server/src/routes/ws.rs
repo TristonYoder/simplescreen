@@ -45,17 +45,17 @@ async fn node_screens(s: &AppState, node_id: &str) -> crate::error::ApiResult<Ve
 }
 
 async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
-    let (Some(node_id), Some(team_id)) = (p.node_id.clone(), p.device_team.clone()) else { return };
-    let (conn, mut rx) = s.hub.register_node(&node_id, &team_id);
+    let Some(node_id) = p.node_id.clone() else { return };
+    let (conn, mut rx) = s.hub.register_node(&node_id);
     touch_last_seen(&s, &node_id).await;
     let mut screens = node_screens(&s, &node_id).await.unwrap_or_default();
     crate::assignments::refresh_subscriptions(&s, &node_id).await;
-    s.hub.broadcast_team(&team_id, &json!({ "type": "node_online", "node_id": node_id }));
+    s.hub.broadcast_all(&json!({ "type": "node_online", "node_id": node_id }));
     for id in &screens {
         s.hub.send_subscribers(id, Some(&node_id), &json!({ "type": "screen_online", "screen_id": id }));
     }
     for id in &screens {
-        s.hub.broadcast_team(&team_id, &json!({ "type": "screen_online", "screen_id": id }));
+        s.broadcast_screen(id, &json!({ "type": "screen_online", "screen_id": id })).await;
     }
     let hello = json!({ "type": "hello", "server_id": s.server_id }).to_string();
     let mut alive = sock.send(Message::Text(hello.into())).await.is_ok();
@@ -80,7 +80,7 @@ async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
                     if let Some(v) = m.assignments_version {
                         if v != applied_version {
                             applied_version = v;
-                            record_applied_version(&s, &node_id, &team_id, v).await;
+                            record_applied_version(&s, &node_id, v).await;
                         }
                     }
                     match m.kind.as_str() {
@@ -105,7 +105,7 @@ async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
                             let info = (status.model.clone(), status.os_version.clone(), status.app_version.clone());
                             s.statuses.lock().insert(screen_id.clone(), status.clone());
                             let msg = json!({ "type": "screen_status", "screen_id": screen_id, "status": status });
-                            s.hub.broadcast_team(&team_id, &msg);
+                            s.broadcast_screen(&screen_id, &msg).await;
                             s.hub.send_subscribers(&screen_id, Some(&node_id), &msg);
                             if info != (None, None, None) && info != reported_info {
                                 reported_info = info.clone();
@@ -120,7 +120,7 @@ async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
                             let Some(outputs) = m.outputs else { continue };
                             let status = NodeStatus { outputs, updated_at: now() };
                             s.node_statuses.lock().insert(node_id.clone(), status.clone());
-                            s.hub.broadcast_team(&team_id, &json!({
+                            s.hub.broadcast_all(&json!({
                                 "type": "node_status", "node_id": node_id,
                                 "outputs": status.outputs, "updated_at": status.updated_at,
                             }));
@@ -153,14 +153,14 @@ async fn device_socket(s: AppState, p: Principal, mut sock: WebSocket) {
         }
         for id in ids {
             s.statuses.lock().remove(&id);
-            s.hub.broadcast_team(&team_id, &json!({ "type": "screen_offline", "screen_id": id }));
+            s.broadcast_screen(&id, &json!({ "type": "screen_offline", "screen_id": id })).await;
             s.hub.send_subscribers(&id, Some(&node_id), &json!({ "type": "screen_offline", "screen_id": id }));
         }
-        s.hub.broadcast_team(&team_id, &json!({ "type": "node_offline", "node_id": node_id }));
+        s.hub.broadcast_all(&json!({ "type": "node_offline", "node_id": node_id }));
     }
 }
 
-async fn record_applied_version(s: &AppState, node_id: &str, team_id: &str, version: i64) {
+async fn record_applied_version(s: &AppState, node_id: &str, version: i64) {
     let res = sqlx::query("UPDATE nodes SET applied_assignments_version = ? WHERE id = ? AND applied_assignments_version != ?")
         .bind(version)
         .bind(node_id)
@@ -168,7 +168,7 @@ async fn record_applied_version(s: &AppState, node_id: &str, team_id: &str, vers
         .execute(&s.db)
         .await;
     if res.is_ok_and(|r| r.rows_affected() > 0) {
-        s.hub.broadcast_team(team_id, &json!({ "type": "node_updated", "node_id": node_id }));
+        s.hub.broadcast_all(&json!({ "type": "node_updated", "node_id": node_id }));
     }
 }
 
@@ -194,8 +194,9 @@ async fn user_socket(s: AppState, p: Principal, mut sock: WebSocket) {
     let (conn, mut rx) = s.hub.register_user(p.clone());
     let hello = json!({ "type": "hello", "server_id": s.server_id }).to_string();
     let mut alive = sock.send(Message::Text(hello.into())).await.is_ok();
-    for (node_id, team_id) in s.hub.online_nodes() {
-        if !alive || !p.can_view(&team_id) {
+    let w = crate::reach::World::load(&s).await.unwrap_or_default();
+    for node_id in s.hub.online_nodes() {
+        if !alive {
             continue;
         }
         let mut msgs = vec![json!({ "type": "node_online", "node_id": node_id })];
@@ -204,6 +205,9 @@ async fn user_socket(s: AppState, p: Principal, mut sock: WebSocket) {
             msgs.push(json!({ "type": "node_status", "node_id": node_id, "outputs": st.outputs, "updated_at": st.updated_at }));
         }
         for screen_id in node_screens(&s, &node_id).await.unwrap_or_default() {
+            if !p.sees_screen(&w, &screen_id) {
+                continue;
+            }
             msgs.push(json!({ "type": "screen_online", "screen_id": screen_id }));
             let status = s.statuses.lock().get(&screen_id).cloned();
             if let Some(status) = status {

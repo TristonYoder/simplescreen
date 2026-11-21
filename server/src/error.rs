@@ -13,11 +13,12 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub current: Option<Value>,
+    pub conflicts: Option<Value>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), current: None }
+        Self { status, code, message: message.into(), current: None, conflicts: None }
     }
     pub fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token")
@@ -54,6 +55,9 @@ impl IntoResponse for ApiError {
         let mut body = json!({ "code": self.code, "message": self.message });
         if let Some(cur) = self.current {
             body["current"] = cur;
+        }
+        if let Some(c) = self.conflicts {
+            body["conflicts"] = c;
         }
         (self.status, Json(body)).into_response()
     }

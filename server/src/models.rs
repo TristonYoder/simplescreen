@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::auth::Role;
 
-fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+pub fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -235,6 +235,8 @@ pub struct Bed {
 pub struct PlaylistInput {
     pub team_id: String,
     pub name: String,
+    #[serde(default)]
+    pub folder_id: Option<String>,
     #[serde(rename = "loop")]
     pub looping: Option<bool>,
     pub defaults: Option<PlaylistDefaults>,
@@ -259,6 +261,9 @@ pub struct PlaylistUpdate {
 pub struct Playlist {
     pub id: String,
     pub team_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    pub tag_ids: Vec<String>,
     pub name: String,
     pub version: i64,
     #[serde(rename = "loop")]
@@ -275,6 +280,7 @@ pub struct Playlist {
 pub struct PlaylistRow {
     pub id: String,
     pub team_id: String,
+    pub folder_id: Option<String>,
     pub name: String,
     pub version: i64,
     #[sqlx(rename = "loop")]
@@ -287,13 +293,15 @@ pub struct PlaylistRow {
 }
 
 pub const PLAYLIST_COLUMNS: &str =
-    "id, team_id, name, version, loop, defaults, items, beds, updated_at, updated_by";
+    "id, team_id, folder_id, name, version, loop, defaults, items, beds, updated_at, updated_by";
 
 impl PlaylistRow {
-    pub fn into_playlist(self) -> Result<Playlist, serde_json::Error> {
+    pub fn into_playlist(self, tag_ids: Vec<String>) -> Result<Playlist, serde_json::Error> {
         Ok(Playlist {
             id: self.id,
             team_id: self.team_id,
+            folder_id: self.folder_id,
+            tag_ids,
             name: self.name,
             version: self.version,
             looping: self.looping,
@@ -390,18 +398,20 @@ impl ScreenStatus {
 #[derive(Serialize)]
 pub struct Screen {
     pub id: String,
-    pub team_id: String,
     pub name: String,
+    pub tag_ids: Vec<String>,
+    pub team_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub playlist_id: Option<String>,
+    pub fallback_playlist_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_: Option<ScreenOverride>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement: Option<ScreenPlacement>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_key: Option<String>,
+    pub output_keys: Vec<String>,
     pub online: bool,
     pub status: ScreenStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -412,20 +422,22 @@ pub struct Screen {
 #[derive(FromRow)]
 pub struct ScreenRow {
     pub id: String,
-    pub team_id: String,
     pub name: String,
-    pub playlist_id: Option<String>,
+    pub fallback_playlist_id: Option<String>,
+    pub timezone: Option<String>,
     pub last_seen_at: Option<String>,
     pub created_at: String,
     pub override_set: bool,
     pub override_playlist_id: Option<String>,
     pub override_until: Option<String>,
     pub override_set_at: Option<String>,
+    pub override_set_by: Option<String>,
+    pub override_set_by_name: Option<String>,
+    pub override_team_id: Option<String>,
     pub placement_plan_id: Option<String>,
     pub placement_x: Option<f64>,
     pub placement_y: Option<f64>,
     pub node_id: Option<String>,
-    pub output_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -435,8 +447,9 @@ pub struct ScreenPlacement {
     pub y: f64,
 }
 
-pub const SCREEN_COLUMNS: &str = "id, team_id, name, playlist_id, last_seen_at, created_at, \
-     override_set, override_playlist_id, override_until, override_set_at, placement_plan_id, placement_x, placement_y, node_id, output_key";
+pub const SCREEN_COLUMNS: &str = "id, name, fallback_playlist_id, timezone, last_seen_at, created_at, override_set, \
+     override_playlist_id, override_until, override_set_at, override_set_by, override_set_by_name, override_team_id, \
+     placement_plan_id, placement_x, placement_y, node_id";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ScreenOverride {
@@ -444,6 +457,12 @@ pub struct ScreenOverride {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
     pub set_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_by_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -459,7 +478,9 @@ pub struct ScreenOverrideInput {
 pub struct ScreenPatch {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
-    pub playlist_id: Option<Option<String>>,
+    pub fallback_playlist_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub timezone: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub placement: Option<Option<ScreenPlacement>>,
 }
@@ -498,8 +519,7 @@ pub enum OutputKind {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputRole {
-    Screen,
-    Mirror,
+    Program,
     Control,
     Confidence,
     #[default]
@@ -525,7 +545,6 @@ pub struct Output {
 #[derive(FromRow)]
 pub struct NodeRow {
     pub id: String,
-    pub team_id: String,
     pub name: String,
     pub model: Option<String>,
     pub os_version: Option<String>,
@@ -539,7 +558,7 @@ pub struct NodeRow {
     pub applied_assignments_version: i64,
 }
 
-pub const NODE_COLUMNS: &str = "id, team_id, name, model, os_version, app_version, outputs, single, created_at, last_seen_at, mode, assignments_version, applied_assignments_version";
+pub const NODE_COLUMNS: &str = "id, name, model, os_version, app_version, outputs, single, created_at, last_seen_at, mode, assignments_version, applied_assignments_version";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OutputStatus {
@@ -564,7 +583,6 @@ pub struct NodeStatus {
 #[derive(Serialize)]
 pub struct Node {
     pub id: String,
-    pub team_id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

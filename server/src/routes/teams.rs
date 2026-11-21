@@ -6,11 +6,14 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::{
     auth::{Principal, Role},
     error::{ApiError, ApiJson, ApiResult},
     models::OidcBinding,
+    reach::{self, World},
+    schedule,
     state::AppState,
     util::{new_id, now},
 };
@@ -20,6 +23,8 @@ pub struct Team {
     id: String,
     name: String,
     oidc_bindings: Vec<OidcBinding>,
+    screen_access: String,
+    tag_ids: Vec<String>,
     created_at: String,
 }
 
@@ -30,11 +35,19 @@ pub struct TeamInput {
     oidc_bindings: Vec<OidcBinding>,
 }
 
-type Row = (String, String, String, String);
-const COLUMNS: &str = "id, name, oidc_bindings, created_at";
+type Row = (String, String, String, String, String, Option<String>);
+const COLUMNS: &str = "id, name, oidc_bindings, screen_access, created_at, \
+    (SELECT json_group_array(tag_id) FROM (SELECT tag_id FROM team_tags WHERE team_id = teams.id ORDER BY tag_id))";
 
-fn to_team((id, name, bindings, created_at): Row) -> Team {
-    Team { id, name, oidc_bindings: serde_json::from_str(&bindings).unwrap_or_default(), created_at }
+fn to_team((id, name, bindings, screen_access, created_at, tags): Row) -> Team {
+    Team {
+        id,
+        name,
+        oidc_bindings: serde_json::from_str(&bindings).unwrap_or_default(),
+        screen_access,
+        tag_ids: tags.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default(),
+        created_at,
+    }
 }
 
 async fn fetch(s: &AppState, id: &str) -> ApiResult<Team> {
@@ -117,7 +130,7 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
     }
     let (n,): (i64,) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM media WHERE team_id = ?1) + (SELECT COUNT(*) FROM playlists WHERE team_id = ?1)
-         + (SELECT COUNT(*) FROM screens WHERE team_id = ?1) + (SELECT COUNT(*) FROM nodes WHERE team_id = ?1)",
+         + (SELECT COUNT(*) FROM playlist_folders WHERE team_id = ?1)",
     )
     .bind(&id)
     .fetch_one(&s.db)
@@ -126,10 +139,73 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
         return Err(ApiError::conflict("team_not_empty", "team still owns resources"));
     }
     sqlx::query("DELETE FROM schedule_entries WHERE team_id = ?").bind(&id).execute(&s.db).await?;
-    sqlx::query("DELETE FROM floor_plans WHERE team_id = ?").bind(&id).execute(&s.db).await?;
     let res = sqlx::query("DELETE FROM teams WHERE id = ?").bind(&id).execute(&s.db).await?;
     if res.rows_affected() == 0 {
         return Err(ApiError::not_found());
     }
+    schedule::refresh_clashes(&s, Some(&p)).await?;
+    schedule::notify_screens(&s).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct TagsInput {
+    tag_ids: Vec<String>,
+    screen_access: Option<String>,
+}
+
+pub async fn put_tags(
+    State(s): State<AppState>,
+    p: Principal,
+    Path(id): Path<String>,
+    ApiJson(input): ApiJson<TagsInput>,
+) -> ApiResult<Json<Value>> {
+    p.require_admin()?;
+    let current = fetch(&s, &id).await?;
+    let access = input.screen_access.unwrap_or(current.screen_access);
+    if access != "all" && access != "tags" {
+        return Err(ApiError::bad_request("screen_access must be all or tags"));
+    }
+    let tags = reach::check_tags(&s, &input.tag_ids).await?;
+    let before = World::load(&s).await?.team_screens(&id);
+    let mut tx = s.db.begin().await?;
+    sqlx::query("UPDATE teams SET screen_access = ? WHERE id = ?").bind(&access).bind(&id).execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM team_tags WHERE team_id = ?").bind(&id).execute(&mut *tx).await?;
+    for t in &tags {
+        sqlx::query("INSERT INTO team_tags (team_id, tag_id) VALUES (?, ?)").bind(&id).bind(t).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    let clashes = schedule::refresh_clashes(&s, Some(&p)).await?;
+    schedule::notify_screens(&s).await;
+    let after = World::load(&s).await?.team_screens(&id);
+    let mut touched = before;
+    touched.extend(after);
+    touched.sort();
+    touched.dedup();
+    for screen in &touched {
+        super::screens::broadcast_updated(&s, screen).await;
+    }
+    s.hub.broadcast_all(&json!({ "type": "tags_changed" }));
+    schedule::broadcast_changed(&s, &id);
+    Ok(Json(json!({ "team": fetch(&s, &id).await?, "clashes": clashes, "warnings": [] })))
+}
+
+pub async fn reach_matrix(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Value>> {
+    p.require_admin()?;
+    let w = World::load(&s).await?;
+    let rows: Vec<Row> = sqlx::query_as(&format!("SELECT {COLUMNS} FROM teams ORDER BY name")).fetch_all(&s.db).await?;
+    let teams: Vec<Value> = rows
+        .into_iter()
+        .map(to_team)
+        .map(|t| {
+            json!({
+                "team_id": t.id,
+                "team_name": t.name,
+                "screen_access": t.screen_access,
+                "tag_ids": t.tag_ids,
+                "screen_ids": w.team_screens(&t.id),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "teams": teams })))
 }

@@ -5,20 +5,29 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 
 use super::{device::device_node, nodes};
 use crate::{
     assignments::{self, Assignment, AssignmentsInput, Job, Mode},
-    auth::{Principal, Role},
+    auth::Principal,
     error::{ApiError, ApiJson, ApiResult},
     models::{NodeRow, Output, Screen, ScreenCommand},
+    reach::World,
     state::AppState,
 };
 
 async fn device_row(s: &AppState, p: &Principal) -> ApiResult<NodeRow> {
     nodes::fetch_row(s, device_node(p)?).await.map_err(|_| ApiError::unauthorized())
+}
+
+pub(super) fn require_user(p: &Principal) -> ApiResult<()> {
+    if p.is_device() {
+        Err(ApiError::forbidden())
+    } else {
+        Ok(())
+    }
 }
 
 // MARK: Device
@@ -28,12 +37,24 @@ pub async fn device_get(State(s): State<AppState>, p: Principal) -> ApiResult<Js
     Ok(Json(assignments::body(&s, &node).await?))
 }
 
+/// A change made on the device can only rearrange the screens the node is already assigned to.
 pub async fn device_put(
     State(s): State<AppState>,
     p: Principal,
     ApiJson(input): ApiJson<AssignmentsInput>,
 ) -> ApiResult<Json<Value>> {
     let node = device_row(&s, &p).await?;
+    if input.base_version == node.assignments_version {
+        let allowed = assignments::assigned_screens(&s, &node.id).await?;
+        let foreign = input.assignments.iter().filter(|a| a.job != Job::Off).filter_map(|a| a.screen_id.as_ref()).any(|id| !allowed.contains(id));
+        if foreign {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "target_not_assigned",
+                "a device can only use screens it is already assigned to; assign new screens in Studio",
+            ));
+        }
+    }
     let by = node.id.clone();
     Ok(Json(assignments::replace(&s, node, input, &by, true).await?))
 }
@@ -56,58 +77,6 @@ pub async fn device_mode(
     Ok(Json(assignments::body(&s, &fresh).await?))
 }
 
-#[derive(Serialize, sqlx::FromRow)]
-struct TeamScreenRow {
-    id: String,
-    name: String,
-    node_id: Option<String>,
-    node_name: Option<String>,
-    node_mode: Option<String>,
-    output_key: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct TeamScreen {
-    id: String,
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    node_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    node_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    node_mode: Option<String>,
-    online: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output_key: Option<String>,
-    placed: bool,
-}
-
-/// Every screen in the device's team: what the control and confidence pickers list.
-pub async fn team_screens(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Vec<TeamScreen>>> {
-    let node = device_row(&s, &p).await?;
-    let rows: Vec<TeamScreenRow> = sqlx::query_as(
-        "SELECT s.id, s.name, s.node_id, n.name AS node_name, n.mode AS node_mode, s.output_key \
-         FROM screens s LEFT JOIN nodes n ON n.id = s.node_id WHERE s.team_id = ? ORDER BY s.name, s.id",
-    )
-    .bind(&node.team_id)
-    .fetch_all(&s.db)
-    .await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(|r| TeamScreen {
-                online: r.node_id.as_deref().is_some_and(|n| s.hub.is_online(n)),
-                placed: r.node_id.is_some(),
-                id: r.id,
-                name: r.name,
-                node_id: r.node_id,
-                node_name: r.node_name,
-                node_mode: r.node_mode,
-                output_key: r.output_key,
-            })
-            .collect(),
-    ))
-}
-
 /// Remote control: a node may command a screen only if it has a control assignment for it.
 pub async fn device_command(
     State(s): State<AppState>,
@@ -126,9 +95,24 @@ pub async fn device_command(
 // MARK: Editor
 
 pub async fn node_get(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    require_user(&p)?;
     let node = nodes::fetch_row(&s, &id).await?;
-    p.require(&node.team_id, Role::Viewer)?;
     Ok(Json(assignments::body(&s, &node).await?))
+}
+
+/// Each changed output needs the caller to operate every screen it touches; one touching none is admin only.
+fn check_changes(p: &Principal, w: &World, old: &[Assignment], new: &[Assignment]) -> ApiResult<()> {
+    for (_, screens) in assignments::changes(old, new) {
+        if screens.is_empty() {
+            p.require_admin()?;
+        }
+        for screen in &screens {
+            if w.screen_tags.contains_key(screen) && !p.operates_screen(w, screen) {
+                return Err(ApiError::forbidden());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn node_put(
@@ -137,8 +121,13 @@ pub async fn node_put(
     Path(id): Path<String>,
     ApiJson(input): ApiJson<AssignmentsInput>,
 ) -> ApiResult<Json<Value>> {
+    require_user(&p)?;
     let node = nodes::fetch_row(&s, &id).await?;
-    p.require(&node.team_id, Role::Editor)?;
+    if input.base_version == node.assignments_version {
+        let w = World::load(&s).await?;
+        let current = assignments::load(&s, &node.id).await?;
+        check_changes(&p, &w, &current, &input.assignments)?;
+    }
     let by = p.subject.clone();
     Ok(Json(assignments::replace(&s, node, input, &by, false).await?))
 }
@@ -149,20 +138,18 @@ pub struct MoveInput {
     output_key: String,
 }
 
-/// Makes `output_key` of `node_id` play the screen. The screen's old output goes to off and the screen's
-/// audio and format settings move with it. The old node's mirrors of the screen are switched off.
+/// Makes `output_key` of `node_id` the screen's only program output. Its old program outputs go to off,
+/// and the first one's settings (the audio one if any) move with it.
 pub async fn move_screen(
     State(s): State<AppState>,
     p: Principal,
     Path(id): Path<String>,
     ApiJson(input): ApiJson<MoveInput>,
 ) -> ApiResult<Json<Screen>> {
+    let w = World::load(&s).await?;
     let screen = super::screens::fetch_row(&s, &id).await?;
-    p.require(&screen.team_id, Role::Editor)?;
-    let target = nodes::fetch_row(&s, &input.node_id).await.map_err(|_| ApiError::unprocessable("target_not_in_team", "node does not exist"))?;
-    if target.team_id != screen.team_id {
-        return Err(ApiError::unprocessable("target_not_in_team", "node is not in the screen's team"));
-    }
+    p.require_operate(&w, &id)?;
+    let target = nodes::fetch_row(&s, &input.node_id).await.map_err(|_| ApiError::unprocessable("unknown_node", "node does not exist"))?;
     if Mode::parse(&target.mode) != Mode::Player {
         return Err(ApiError::unprocessable("job_not_allowed_in_mode", "only player devices can play screens"));
     }
@@ -170,32 +157,52 @@ pub async fn move_screen(
     if !outputs.iter().any(|o| o.key == input.output_key) {
         return Err(ApiError::unprocessable("unknown_output", "output_key is not in the node's reported outputs"));
     }
-    let old = screen.node_id.clone().zip(screen.output_key.clone());
-    if old.as_ref().is_some_and(|(n, k)| *n == target.id && *k == input.output_key) {
-        return Ok(Json(super::screens::to_screen(&s, screen)));
+    let old_node_id = screen.node_id.clone();
+    let mut target_set = assignments::load(&s, &target.id).await?;
+    let is_program = |a: &Assignment| a.job == Job::Program && a.screen_id.as_deref() == Some(id.as_str());
+    if old_node_id.as_deref() == Some(target.id.as_str())
+        && target_set.iter().filter(|a| is_program(a)).map(|a| a.output_key.as_str()).eq([input.output_key.as_str()])
+    {
+        return Ok(Json(super::screens::to_screen(&s, screen).await?));
+    }
+    if let Some(displaced) = target_set.iter().find(|a| a.output_key == input.output_key && a.job != Job::Off).and_then(|a| a.screen_id.clone()) {
+        if displaced != id && !p.operates_screen(&w, &displaced) {
+            return Err(ApiError::forbidden());
+        }
     }
 
     let by = p.subject.clone();
-    let mut target_set = assignments::load(&s, &target.id).await?;
     // An unplaced screen starts from empty settings. It must not inherit the output it displaces.
     let mut settings = assignments::AssignmentSettings::default();
+    let mut take = |set: &mut Vec<Assignment>| {
+        let mut picked: Option<assignments::AssignmentSettings> = None;
+        for a in set.iter_mut().filter(|a| is_program(a)) {
+            let st = std::mem::take(&mut a.settings);
+            let audio = st.audio.as_ref().is_some_and(|x| x.enabled);
+            if picked.is_none() || audio {
+                picked = Some(st);
+            }
+            let key = a.output_key.clone();
+            *a = Assignment::off(&key);
+        }
+        if let Some(st) = picked {
+            settings = st;
+        }
+    };
     let mut old_node: Option<(NodeRow, Vec<Assignment>)> = None;
-    if let Some((old_node_id, old_key)) = &old {
-        let old_row = nodes::fetch_row(&s, old_node_id).await?;
-        let mut set = if *old_node_id == target.id { std::mem::take(&mut target_set) } else { assignments::load(&s, old_node_id).await? };
-        if let Some(a) = set.iter_mut().find(|a| a.output_key == *old_key) {
-            settings = std::mem::take(&mut a.settings);
-            *a = Assignment::off(old_key);
+    match &old_node_id {
+        Some(old) if *old == target.id => take(&mut target_set),
+        Some(old) => {
+            let row = nodes::fetch_row(&s, old).await?;
+            let mut set = assignments::load(&s, old).await?;
+            take(&mut set);
+            old_node = Some((row, set));
         }
-        if *old_node_id == target.id {
-            target_set = set;
-        } else {
-            old_node = Some((old_row, set));
-        }
+        None => {}
     }
     let new = Assignment {
         output_key: input.output_key.clone(),
-        job: Job::Screen,
+        job: Job::Program,
         screen_id: Some(id.clone()),
         settings,
         updated_by: None,
@@ -204,10 +211,6 @@ pub async fn move_screen(
     match target_set.iter_mut().find(|a| a.output_key == input.output_key) {
         Some(a) => *a = new,
         None => target_set.push(new),
-    }
-    assignments::drop_orphan_mirrors(&mut target_set);
-    if let Some((_, set)) = &mut old_node {
-        assignments::drop_orphan_mirrors(set);
     }
     let releasing: HashSet<&str> = if old_node.is_some() { HashSet::from([id.as_str()]) } else { HashSet::new() };
     let ignore_old: Vec<&str> = old_node.iter().map(|(row, _)| row.id.as_str()).collect();
@@ -218,35 +221,30 @@ pub async fn move_screen(
 
     let target_version = target.assignments_version;
     let old_version = old_node.as_ref().map(|(row, _)| (row.id.clone(), row.assignments_version));
-    let place = (screen.node_id.clone(), screen.output_key.clone());
     let mut tx = s.db.begin_with("BEGIN IMMEDIATE").await?;
-    let fresh: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT node_id, output_key FROM screens WHERE id = ?").bind(&id).fetch_optional(&mut *tx).await?;
-    let Some(fresh) = fresh else {
+    let fresh: Option<(Option<String>,)> = sqlx::query_as("SELECT node_id FROM screens WHERE id = ?").bind(&id).fetch_optional(&mut *tx).await?;
+    let Some((fresh,)) = fresh else {
         drop(tx);
         return Err(ApiError::not_found());
     };
-    if fresh != place {
-        drop(tx);
-        return Err(assignments::version_conflict(assignments::body(&s, &target).await?));
+    if fresh != old_node_id {
+        { drop(tx); return Err(stale(&s, &target).await) };
     }
     let current: (i64,) = sqlx::query_as("SELECT assignments_version FROM nodes WHERE id = ?").bind(&target.id).fetch_one(&mut *tx).await?;
     if current.0 != target_version {
-        drop(tx);
-        return Err(assignments::version_conflict(assignments::body(&s, &target).await?));
+        { drop(tx); return Err(stale(&s, &target).await) };
     }
     if let Some((old_id, old_ver)) = &old_version {
         let current: (i64,) = sqlx::query_as("SELECT assignments_version FROM nodes WHERE id = ?").bind(old_id).fetch_one(&mut *tx).await?;
         if current.0 != *old_ver {
-            drop(tx);
-            return Err(assignments::version_conflict(assignments::body(&s, &target).await?));
+            { drop(tx); return Err(stale(&s, &target).await) };
         }
     }
     let old_applied = if let Some((row, set)) = &old_node {
         match assignments::apply_set(&mut tx, row, set, &by, false).await {
             Err(e) if e.code == "version_conflict" => {
                 drop(tx);
-                return Err(assignments::version_conflict(assignments::body(&s, &target).await?));
+                return Err(stale(&s, &target).await);
             }
             other => Some(other?),
         }
@@ -255,9 +253,9 @@ pub async fn move_screen(
     };
     let applied = match assignments::apply_set(&mut tx, &target, &target_set, &by, false).await {
         Err(e) if e.code == "version_conflict" => {
-            drop(tx);
-            return Err(assignments::version_conflict(assignments::body(&s, &target).await?));
-        }
+                drop(tx);
+                return Err(stale(&s, &target).await);
+            }
         other => other?,
     };
     tx.commit().await?;
@@ -265,5 +263,12 @@ pub async fn move_screen(
         assignments::announce(&s, row, a).await;
     }
     assignments::announce(&s, &target, &applied).await;
-    Ok(Json(super::screens::to_screen(&s, super::screens::fetch_row(&s, &id).await?)))
+    Ok(Json(super::screens::to_screen(&s, super::screens::fetch_row(&s, &id).await?).await?))
+}
+
+async fn stale(s: &AppState, target: &NodeRow) -> ApiError {
+    match assignments::body(s, target).await {
+        Ok(body) => assignments::version_conflict(body),
+        Err(e) => e,
+    }
 }
