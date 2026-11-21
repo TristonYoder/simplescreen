@@ -1453,3 +1453,343 @@ async fn watchers_receive_status_manifest_and_assignment_messages() {
     app.state.hub.send_subscribers(&screen, Some(&pn), &msg);
     assert!(crx.try_recv().is_err());
 }
+
+// MARK: Tags, reach and clashes
+
+/// A local OIDC provider: discovery and JWKS on loopback, Ed25519 tokens signed with a key made per run.
+struct Idp {
+    issuer: String,
+    pkcs8: Vec<u8>,
+}
+
+impl Idp {
+    async fn start() -> Self {
+        use base64::Engine;
+        use ring::signature::KeyPair;
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref().to_vec();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8).unwrap();
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pair.public_key().as_ref());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let discovery = json!({ "issuer": issuer, "jwks_uri": format!("{issuer}/jwks") });
+        let jwks = json!({ "keys": [{ "kty": "OKP", "crv": "Ed25519", "x": x, "kid": "test", "alg": "EdDSA", "use": "sig" }] });
+        let idp = Router::new()
+            .route("/.well-known/openid-configuration", axum::routing::get(move || async move { axum::Json(discovery) }))
+            .route("/jwks", axum::routing::get(move || async move { axum::Json(jwks) }));
+        tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+        Self { issuer, pkcs8 }
+    }
+
+    fn token(&self, sub: &str, groups: &[&str]) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some("test".into());
+        let exp = chrono::Utc::now().timestamp() + 3600;
+        let claims = json!({ "sub": sub, "iss": self.issuer, "exp": exp, "name": sub, "groups": groups });
+        jsonwebtoken::encode(&header, &claims, &jsonwebtoken::EncodingKey::from_ed_der(&self.pkcs8)).unwrap()
+    }
+}
+
+/// Lobby holds `front`, Kitchen holds `back`. Admin, lobby editor, lobby viewer and kitchen editor tokens.
+struct Org {
+    app: App,
+    lobby: String,
+    kitchen: String,
+    front: String,
+    back: String,
+    le: String,
+    lv: String,
+    ke: String,
+}
+
+async fn org() -> Org {
+    let idp = Idp::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::defaults(dir.path().to_path_buf());
+    cfg.bonjour = false;
+    cfg.oidc_issuer = Some(idp.issuer.clone());
+    cfg.oidc_admin_groups = vec!["admins".into()];
+    let state = build_state(cfg).await.unwrap();
+    let app = App { router: router(state.clone()), token: idp.token("u-admin", &["admins"]), state, tags: Default::default(), _dir: dir };
+    let team = |name: &str, ed: &str, view: &str| {
+        json!({ "name": name, "oidc_bindings": [{ "claim_value": ed, "role": "editor" }, { "claim_value": view, "role": "viewer" }] })
+    };
+    let lobby = app.call("POST", "/v1/teams", Some(team("Lobby", "lobby-ed", "lobby-view"))).await.json()["id"].as_str().unwrap().to_string();
+    let kitchen = app.call("POST", "/v1/teams", Some(team("Kitchen", "kitchen-ed", "kitchen-view"))).await.json()["id"].as_str().unwrap().to_string();
+    let front = app.new_tag("front").await;
+    let back = app.new_tag("back").await;
+    let r = app.call("POST", "/v1/tags", Some(json!({ "name": "FRONT" }))).await;
+    assert_eq!(code(r, StatusCode::CONFLICT).await, "tag_exists");
+    for (t, tag) in [(&lobby, &front), (&kitchen, &back)] {
+        let r = app.call("PUT", &format!("/v1/teams/{t}/tags"), Some(json!({ "tag_ids": [tag] }))).await;
+        assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    }
+    let r = app.call("PATCH", "/v1/settings", Some(json!({ "timezone": "UTC" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    Org {
+        lobby,
+        kitchen,
+        front,
+        back,
+        le: idp.token("u-lobby", &["lobby-ed"]),
+        lv: idp.token("u-view", &["lobby-view"]),
+        ke: idp.token("u-kitchen", &["kitchen-ed"]),
+        app,
+    }
+}
+
+/// Single pairing by the admin with these tags; returns the screen and its device token.
+async fn pair_tagged(app: &App, name: &str, tags: Value) -> (String, String) {
+    let s = app.send("POST", "/v1/pairing", None, &[], Body::empty(), false).await.json();
+    let r = app.call("POST", "/v1/pairing/claim", Some(json!({ "code": s["code"], "name": name, "tag_ids": tags }))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let screen = r.json()["id"].as_str().unwrap().to_string();
+    let poll = format!("/v1/pairing/{}?secret={}", s["pairing_id"].as_str().unwrap(), s["secret"].as_str().unwrap());
+    let token = app.send("GET", &poll, None, &[], Body::empty(), false).await.json()["device_token"].as_str().unwrap().to_string();
+    (screen, token)
+}
+
+async fn playlist_as(app: &App, token: &str, team: &str, name: &str) -> String {
+    let r = app.call_as(token, "POST", "/v1/playlists", Some(json!({ "team_id": team, "name": name, "items": [] }))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    r.json()["id"].as_str().unwrap().to_string()
+}
+
+fn ids(v: &Value) -> Vec<String> {
+    v.as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[tokio::test]
+async fn reach_availability_and_untagged_screens() {
+    let o = org().await;
+    let app = &o.app;
+    let (s_front, front_token) = pair_tagged(app, "Front", json!([o.front])).await;
+    let (s_back, back_token) = pair_tagged(app, "Back", json!([o.back])).await;
+    let (node, nt) = pair_node(app, "", "Mini").await;
+    outputs(app, &nt).await;
+    let r = app.call_as(&nt, "POST", "/v1/device/screens", Some(json!({ "output_key": "a", "name": "Bare" }))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let s_none = r.json()["id"].as_str().unwrap().to_string();
+
+    // Reach: tags shared with the team; untagged screens are admin only.
+    let mine = app.call_as(&o.le, "GET", "/v1/screens", None).await.json();
+    assert_eq!(ids(&mine), vec![s_front.clone()]);
+    assert_eq!(mine[0]["team_ids"], json!([o.lobby]));
+    assert_eq!(app.call("GET", "/v1/screens", None).await.json().as_array().unwrap().len(), 3);
+    assert_eq!(app.call_as(&o.le, "GET", &format!("/v1/screens/{s_back}"), None).await.status, StatusCode::NOT_FOUND);
+    assert_eq!(app.call_as(&o.le, "GET", &format!("/v1/screens/{s_none}"), None).await.status, StatusCode::NOT_FOUND);
+    // Viewers see but don't operate.
+    assert_eq!(app.call_as(&o.lv, "GET", &format!("/v1/screens/{s_front}"), None).await.status, StatusCode::OK);
+    let r = app.call_as(&o.lv, "PUT", &format!("/v1/screens/{s_front}/override"), Some(json!({ "playlist_id": null }))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // Only admins tag screens and set reach.
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/screens/{s_front}/tags"), Some(json!({ "tag_ids": [o.back] }))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/teams/{}/tags", o.lobby), Some(json!({ "tag_ids": [o.back] }))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+
+    // screen_access all reaches every tagged screen, still not the untagged one.
+    let r = app.call("PUT", &format!("/v1/teams/{}/tags", o.kitchen), Some(json!({ "tag_ids": [o.back], "screen_access": "all" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["team"]["screen_access"], "all");
+    let mut seen = ids(&app.call_as(&o.ke, "GET", "/v1/screens", None).await.json());
+    seen.sort();
+    let mut want = vec![s_front.clone(), s_back.clone()];
+    want.sort();
+    assert_eq!(seen, want);
+    let reach = app.call("GET", "/v1/teams/reach", None).await.json();
+    let k = reach["teams"].as_array().unwrap().iter().find(|t| t["team_id"] == o.kitchen.as_str()).unwrap();
+    assert_eq!(k["screen_ids"].as_array().unwrap().len(), 2);
+
+    // Availability: a playlist shows on a screen only through a shared tag, and only held tags go on it.
+    let p = playlist_as(app, &o.le, &o.lobby, "Menu").await;
+    let r = app.call_as(&o.le, "PATCH", &format!("/v1/screens/{s_front}"), Some(json!({ "fallback_playlist_id": p }))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "playlist_unavailable");
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/playlists/{p}/tags"), Some(json!({ "tag_ids": [o.back] }))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "invalid_tag");
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/playlists/{p}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["playlist"]["tag_ids"], json!([o.front]));
+    let r = app.call_as(&o.le, "PATCH", &format!("/v1/screens/{s_front}"), Some(json!({ "fallback_playlist_id": p }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let m = app.call_as(&front_token, "GET", "/v1/device/manifest", None).await.json();
+    assert_eq!(m["available_playlist_ids"], json!([p]));
+    assert_eq!(m["playlist"]["id"], p);
+    let m = app.call_as(&back_token, "GET", "/v1/device/manifest", None).await.json();
+    assert_eq!(m["available_playlist_ids"], json!([]));
+    // Kitchen reaches the screen showing it, so it may read it; scope=visible lists it.
+    assert_eq!(app.call_as(&o.ke, "GET", &format!("/v1/playlists/{p}"), None).await.status, StatusCode::OK);
+    assert!(app.call_as(&o.ke, "GET", "/v1/playlists", None).await.json().as_array().unwrap().is_empty());
+    assert_eq!(ids(&app.call_as(&o.ke, "GET", "/v1/playlists?scope=visible", None).await.json()), vec![p.clone()]);
+    // Untagging the playlist makes the fallback unavailable: the change goes through with a warning.
+    let r = app.call_as(&o.le, "PUT", &format!("/v1/playlists/{p}/tags"), Some(json!({ "tag_ids": [] }))).await;
+    assert_eq!(r.json()["warnings"][0]["code"], "fallback_unavailable");
+    let m = app.call_as(&front_token, "GET", "/v1/device/manifest", None).await.json();
+    assert!(m.get("playlist").is_none(), "{m}");
+
+    // The untagged screen raises an admin notice that resolves once it's tagged.
+    let open = |n: Value| n.as_array().unwrap().iter().filter(|x| x["kind"] == "untagged_screen" && x["screen_id"] == s_none.as_str()).count();
+    assert_eq!(open(app.call("GET", "/v1/notices", None).await.json()), 1);
+    assert_eq!(open(app.call_as(&o.le, "GET", "/v1/notices", None).await.json()), 0);
+    let r = app.call("PUT", &format!("/v1/screens/{s_none}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(open(app.call("GET", "/v1/notices", None).await.json()), 0);
+    assert_eq!(open(app.call("GET", "/v1/notices?all=true", None).await.json()), 1);
+    let events = app.call("GET", &format!("/v1/screens/{s_none}/events"), None).await.json();
+    assert!(events.as_array().unwrap().iter().any(|e| e["kind"] == "tags"), "{events}");
+    let _ = node;
+}
+
+#[tokio::test]
+async fn assignment_permissions_follow_reach() {
+    let o = org().await;
+    let app = &o.app;
+    let (s_front, _) = pair_tagged(app, "Front", json!([o.front])).await;
+    let (s_back, _) = pair_tagged(app, "Back", json!([o.back])).await;
+    let (c, ct) = pair_mode(app, "", "iPad", "controller").await;
+    outputs(app, &ct).await;
+    let put = |token: String, list: Value| {
+        let c = c.clone();
+        async move {
+            let base = app.call("GET", &format!("/v1/nodes/{c}/assignments"), None).await.json()["version"].as_i64().unwrap();
+            app.call_as(&token, "PUT", &format!("/v1/nodes/{c}/assignments"), Some(json!({ "base_version": base, "assignments": list }))).await
+        }
+    };
+    let ctl = |key: &str, screen: &str| json!({ "output_key": key, "job": "control", "screen_id": screen });
+
+    // An editor assigns screens their team reaches, and only those.
+    assert_eq!(put(o.le.clone(), json!([ctl("a", &s_front)])).await.status, StatusCode::OK);
+    assert_eq!(put(o.le.clone(), json!([ctl("a", &s_front), ctl("b", &s_back)])).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(put(o.lv.clone(), json!([ctl("a", &s_front), ctl("b", &s_front)])).await.status, StatusCode::FORBIDDEN);
+    // Another team's editor can add its own output but can't touch Lobby's.
+    assert_eq!(put(o.ke.clone(), json!([ctl("a", &s_front), ctl("b", &s_back)])).await.status, StatusCode::OK);
+    assert_eq!(put(o.ke.clone(), json!([ctl("b", &s_back)])).await.status, StatusCode::FORBIDDEN);
+    assert_eq!(put(o.le.clone(), json!([ctl("a", &s_front), { "output_key": "b", "job": "off" }])).await.status, StatusCode::FORBIDDEN);
+    // Nodes are hardware: everyone lists them, only admins rename them.
+    assert_eq!(app.call_as(&o.le, "GET", "/v1/nodes", None).await.json().as_array().unwrap().len(), 3);
+    let r = app.call_as(&o.le, "PATCH", &format!("/v1/nodes/{c}"), Some(json!({ "name": "Desk" }))).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    let r = app.call("PATCH", &format!("/v1/nodes/{c}"), Some(json!({ "name": "Desk" }))).await;
+    assert_eq!((r.status, r.json()["name"].as_str()), (StatusCode::OK, Some("Desk")));
+    // Moving a screen needs to operate it.
+    let back_node = app.call("GET", &format!("/v1/screens/{s_back}"), None).await.json()["node_id"].as_str().unwrap().to_string();
+    let r = app.call_as(&o.le, "POST", &format!("/v1/screens/{s_back}/move"), Some(json!({ "node_id": back_node, "output_key": "main" }))).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    // Pairing: an editor may only use tags their team holds, and must tag the screen.
+    let s = app.send("POST", "/v1/pairing", None, &[], Body::empty(), false).await.json();
+    let claim = |tags: Value| json!({ "code": s["code"], "name": "New", "tag_ids": tags });
+    let r = app.call_as(&o.le, "POST", "/v1/pairing/claim", Some(claim(json!([o.back])))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "invalid_tag");
+    let r = app.call_as(&o.le, "POST", "/v1/pairing/claim", Some(claim(json!([])))).await;
+    assert_eq!(code(r, StatusCode::UNPROCESSABLE_ENTITY).await, "tag_required");
+    let r = app.call_as(&o.le, "POST", "/v1/pairing/claim", Some(claim(json!([o.front])))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+}
+
+fn at(days: i64, hour: u32) -> String {
+    let d = chrono::Utc::now().date_naive() + chrono::Duration::days(days);
+    format!("{}T{hour:02}:00", d.format("%Y-%m-%d"))
+}
+
+#[tokio::test]
+async fn overlapping_one_off_save_is_refused() {
+    let o = org().await;
+    let app = &o.app;
+    // Kitchen also holds `front`, so both teams reach the screen.
+    let r = app.call("PUT", &format!("/v1/teams/{}/tags", o.kitchen), Some(json!({ "tag_ids": [o.back, o.front] }))).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let (screen, _) = pair_tagged(app, "Front", json!([o.front])).await;
+    let p = playlist_as(app, &o.le, &o.lobby, "P").await;
+    app.call_as(&o.le, "PUT", &format!("/v1/playlists/{p}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+    let q = playlist_as(app, &o.ke, &o.kitchen, "Q").await;
+    app.call_as(&o.ke, "PUT", &format!("/v1/playlists/{q}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+
+    let once = |team: &str, pl: &str, a: u32, b: u32| {
+        json!({ "team_id": team, "playlist_id": pl, "kind": "once", "tag_ids": [o.front], "starts_at": at(1, a), "ends_at": at(1, b) })
+    };
+    let r = app.call_as(&o.le, "POST", "/v1/schedule", Some(once(&o.lobby, &p, 10, 12))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let first = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(r.json()["created_by"], "u-lobby");
+
+    // Preview shows the clash before saving.
+    let r = app.call_as(&o.ke, "POST", "/v1/schedule/preview", Some(once(&o.kitchen, &q, 11, 13))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let pv = &r.json()["screens"][0];
+    assert_eq!(pv["screen_id"], screen);
+    assert_eq!(pv["clashes"][0]["entry_ids"][0], first);
+    assert_eq!(pv["covers"][0]["entry_id"], first);
+
+    let r = app.call_as(&o.ke, "POST", "/v1/schedule", Some(once(&o.kitchen, &q, 11, 13))).await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{:?}", r.body);
+    let e = r.json();
+    assert_eq!(e["code"], "schedule_conflict");
+    assert_eq!((e["conflicts"][0]["entry_ids"][0].as_str(), e["conflicts"][0]["screen_id"].as_str()), (Some(first.as_str()), Some(screen.as_str())));
+    // Back-to-back is fine, and weekly entries only layer.
+    assert_eq!(app.call_as(&o.ke, "POST", "/v1/schedule", Some(once(&o.kitchen, &q, 12, 13))).await.status, StatusCode::CREATED);
+    let weekly = json!({ "team_id": o.kitchen, "playlist_id": q, "kind": "weekly", "days": [1,2,3,4,5,6,7], "start_time": "09:00", "end_time": "17:00" });
+    assert_eq!(app.call_as(&o.ke, "POST", "/v1/schedule", Some(weekly)).await.status, StatusCode::CREATED);
+    // A team can't target screens or tags beyond its reach.
+    let mut bad = once(&o.lobby, &p, 14, 15);
+    bad["tag_ids"] = json!([o.back]);
+    assert_eq!(app.call_as(&o.le, "POST", "/v1/schedule", Some(bad)).await.status, StatusCode::UNPROCESSABLE_ENTITY);
+    // Read-only visibility of the other team's entries on reached screens.
+    let all = app.call_as(&o.le, "GET", "/v1/schedule?scope=visible", None).await.json();
+    assert_eq!(all["entries"].as_array().unwrap().len(), 3);
+    let own = app.call_as(&o.le, "GET", "/v1/schedule", None).await.json();
+    assert_eq!(own["entries"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retag_clash_is_allowed_and_flagged() {
+    let o = org().await;
+    let app = &o.app;
+    let (screen, _) = pair_tagged(app, "Front", json!([o.front])).await;
+    let p = playlist_as(app, &o.le, &o.lobby, "P").await;
+    app.call_as(&o.le, "PUT", &format!("/v1/playlists/{p}/tags"), Some(json!({ "tag_ids": [o.front] }))).await;
+    let q = playlist_as(app, &o.ke, &o.kitchen, "Q").await;
+    app.call_as(&o.ke, "PUT", &format!("/v1/playlists/{q}/tags"), Some(json!({ "tag_ids": [o.back] }))).await;
+    let once = |team: &str, pl: &str, tag: &str, a: u32, b: u32| {
+        json!({ "team_id": team, "playlist_id": pl, "kind": "once", "tag_ids": [tag], "starts_at": at(1, a), "ends_at": at(1, b) })
+    };
+    let lobby_entry = app.call_as(&o.le, "POST", "/v1/schedule", Some(once(&o.lobby, &p, &o.front, 10, 12))).await.json()["id"].as_str().unwrap().to_string();
+    let r = app.call_as(&o.ke, "POST", "/v1/schedule", Some(once(&o.kitchen, &q, &o.back, 11, 13))).await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    let kitchen_entry = r.json()["id"].as_str().unwrap().to_string();
+
+    // The admin adds `back` to the screen: Kitchen now reaches it and both one-offs play there at 11-12.
+    let r = app.call("PUT", &format!("/v1/screens/{screen}/tags"), Some(json!({ "tag_ids": [o.front, o.back] }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    let clash = &r.json()["clashes"][0];
+    assert_eq!(clash["entry_ids"], json!([lobby_entry, kitchen_entry]));
+    assert_eq!(clash["screen_id"], screen);
+    let entries = app.call("GET", "/v1/schedule", None).await.json();
+    assert!(entries["entries"].as_array().unwrap().iter().all(|e| e["needs_resolution"] == true), "{entries}");
+    let conflict = |token: &str| {
+        let token = token.to_string();
+        async move {
+            app.call_as(&token, "GET", "/v1/notices", None).await.json().as_array().unwrap().iter().filter(|n| n["kind"] == "schedule_conflict").count()
+        }
+    };
+    assert_eq!(conflict(&o.le).await, 1);
+    assert_eq!(conflict(&o.ke).await, 1);
+    assert_eq!(conflict(&app.token).await, 2);
+
+    // The newer entry plays while it's unresolved.
+    let from = format!("{}:00Z", at(1, 11));
+    let to = format!("{}:00Z", at(1, 12));
+    let t = app.call("GET", &format!("/v1/schedule/timeline?from={from}&to={to}"), None).await.json();
+    let segs = &t["screens"][0]["segments"];
+    assert_eq!((segs[0]["entry_id"].as_str(), segs[0]["team_id"].as_str()), (Some(kitchen_entry.as_str()), Some(o.kitchen.as_str())));
+
+    // Saving it unchanged is still refused; moving it clear resolves both.
+    let r = app.call_as(&o.ke, "PUT", &format!("/v1/schedule/{kitchen_entry}"), Some(once(&o.kitchen, &q, &o.back, 11, 13))).await;
+    assert_eq!(r.status, StatusCode::CONFLICT);
+    let r = app.call_as(&o.ke, "PUT", &format!("/v1/schedule/{kitchen_entry}"), Some(once(&o.kitchen, &q, &o.back, 12, 13))).await;
+    assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+    assert_eq!(r.json()["needs_resolution"], false);
+    assert_eq!(conflict(&o.le).await, 0);
+    assert_eq!(conflict(&o.ke).await, 0);
+    let entries = app.call("GET", "/v1/schedule", None).await.json();
+    assert!(entries["entries"].as_array().unwrap().iter().all(|e| e["needs_resolution"] == false));
+}

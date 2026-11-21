@@ -45,5 +45,6 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 bytes = "1"
 http-body-util = "0.1"
+ring = "0.17"
 [build-dependencies]
 toml = "0.8"
