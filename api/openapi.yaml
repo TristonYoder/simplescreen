@@ -786,7 +786,8 @@ paths:
       description: |
         Files in folders the caller reaches, plus files the caller's teams' playlists use (`access:
         playlist`, including missing ones). `folder_id` lists one folder (not its subfolders); `team_id`
-        narrows to what that team reaches and uses (viewer role).
+        narrows to what that team reaches and uses (viewer role). `source_sha256` keeps files whose
+        original bytes had that hash, so Studio can offer an existing file instead of uploading a copy.
       parameters:
         - name: folder_id
           in: query
@@ -800,6 +801,10 @@ paths:
           in: query
           required: false
           schema: { $ref: '#/components/schemas/MediaKind' }
+        - name: source_sha256
+          in: query
+          required: false
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
       responses:
         '200':
           description: Media visible to the caller
@@ -2590,6 +2595,10 @@ components:
         hdr: { type: boolean }
         frame_rate: { type: number }
         source_filename: { type: string, description: The original file name before transcoding }
+        source_sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 of the original file before transcoding. Omit when it passed through unchanged (it defaults to `sha256`).
         thumbnail_sha256:
           type: string
           pattern: '^[0-9a-f]{64}$'
@@ -2628,6 +2637,7 @@ components:
         hdr: { type: boolean }
         frame_rate: { type: number }
         source_filename: { type: string }
+        source_sha256: { type: string, description: SHA-256 of the original file before transcoding }
         thumbnail_sha256: { type: string }
         size: { type: integer, format: int64 }
         missing: { type: boolean, description: The file was deleted but playlists still use it }

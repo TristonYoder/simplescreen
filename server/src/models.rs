@@ -50,6 +50,7 @@ pub struct MediaInput {
     pub hdr: Option<bool>,
     pub frame_rate: Option<f64>,
     pub source_filename: Option<String>,
+    pub source_sha256: Option<String>,
     pub thumbnail_sha256: Option<String>,
 }
 
@@ -77,6 +78,7 @@ pub struct Media {
     pub hdr: Option<bool>,
     pub frame_rate: Option<f64>,
     pub source_filename: Option<String>,
+    pub source_sha256: Option<String>,
     pub thumbnail_sha256: Option<String>,
     pub size: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,7 +99,7 @@ impl Media {
     }
 }
 
-pub const MEDIA_COLUMNS: &str = "id, library_id, folder_id, name, path, kind, sha256, mime, width, height, duration_ms, codec, hdr, frame_rate, source_filename, thumbnail_sha256, size, missing_at, created_by, created_at";
+pub const MEDIA_COLUMNS: &str = "id, library_id, folder_id, name, path, kind, sha256, mime, width, height, duration_ms, codec, hdr, frame_rate, source_filename, source_sha256, thumbnail_sha256, size, missing_at, created_by, created_at";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]

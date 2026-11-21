@@ -24,10 +24,14 @@ pub struct ListQuery {
     folder_id: Option<String>,
     team_id: Option<String>,
     kind: Option<String>,
+    source_sha256: Option<String>,
 }
 
 pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Media>>> {
     super::assignments::require_user(&p)?;
+    if let Some(h) = &q.source_sha256 {
+        check_sha(h)?;
+    }
     let (w, tree) = (World::load(&s).await?, Tree::load(&s).await?);
     if let Some(t) = &q.team_id {
         s.require_team(&p, t, Role::Viewer).await?;
@@ -43,10 +47,12 @@ pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQ
     let used = library::used_by_teams(&s, &teams).await?;
     let rows: Vec<Media> = sqlx::query_as(&format!(
         "SELECT {MEDIA_COLUMNS} FROM media WHERE (?1 IS NULL OR folder_id = ?1) AND (?2 IS NULL OR kind = ?2)
+           AND (?3 IS NULL OR source_sha256 = ?3)
          ORDER BY path COLLATE NOCASE"
     ))
     .bind(&q.folder_id)
     .bind(&q.kind)
+    .bind(&q.source_sha256)
     .fetch_all(&s.db)
     .await?;
     let mut out = vec![];
@@ -361,6 +367,9 @@ pub async fn create(
     }
     let (lib, name, path) = target(&s, &p, &input.folder_id, &input.name).await?;
     name_free(&s, &input.folder_id, &name, None).await?;
+    if let Some(h) = &input.source_sha256 {
+        check_sha(h)?;
+    }
     if let Some(t) = &input.thumbnail_sha256 {
         check_sha(t)?;
         if tokio::fs::metadata(s.blob_path(t)).await.is_err() {
@@ -389,8 +398,8 @@ pub async fn create(
     let id = new_id();
     let res = sqlx::query(
         "INSERT INTO media (id, library_id, folder_id, name, path, kind, sha256, mime, width, height, duration_ms, codec, hdr,
-            frame_rate, source_filename, thumbnail_sha256, size, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            frame_rate, source_filename, source_sha256, thumbnail_sha256, size, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&lib.id)
@@ -407,6 +416,7 @@ pub async fn create(
     .bind(input.hdr)
     .bind(input.frame_rate)
     .bind(&input.source_filename)
+    .bind(input.source_sha256.as_ref().unwrap_or(&input.sha256))
     .bind(&input.thumbnail_sha256)
     .bind(size)
     .bind(&p.subject)

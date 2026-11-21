@@ -2377,3 +2377,36 @@ async fn s3_multipart_uploads_copies_and_moves() {
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     assert_eq!(store.lock().unwrap().get("Lobby/Moved.mov").unwrap(), &big);
 }
+
+#[tokio::test]
+async fn media_source_sha256_lookup() {
+    let app = App::new().await;
+    let g = app.team().await;
+    let folder = app.folder(&g).await;
+
+    let (passthrough, sha) = app.media(&g, "image", "image/png", b"png-bytes").await;
+    let r = app.call("GET", &format!("/v1/media?source_sha256={sha}"), None).await;
+    assert_eq!(r.json().as_array().unwrap().len(), 1);
+    assert_eq!(r.json()[0]["id"], passthrough.as_str());
+    assert_eq!(r.json()[0]["source_sha256"], sha.as_str());
+
+    let original = hex::encode(Sha256::digest(b"original-prores"));
+    let transcoded = app.upload(b"hevc-bytes").await;
+    let r = app
+        .call(
+            "POST",
+            "/v1/media",
+            Some(json!({ "folder_id": folder, "name": "t.mov", "kind": "video", "sha256": transcoded, "mime": "video/quicktime", "source_sha256": original })),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert_eq!(r.json()["source_sha256"], original.as_str());
+    let r = app.call("GET", &format!("/v1/media?source_sha256={original}"), None).await;
+    assert_eq!(r.json().as_array().unwrap().len(), 1);
+    assert_eq!(r.json()[0]["sha256"], transcoded.as_str());
+
+    let r = app.call("GET", &format!("/v1/media?source_sha256={}", "f".repeat(64)), None).await;
+    assert!(r.json().as_array().unwrap().is_empty());
+    let r = app.call("GET", "/v1/media?source_sha256=nope", None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+}
