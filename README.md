@@ -30,7 +30,7 @@ Environment variables (or a TOML file via `SIMPLESCREEN_CONFIG` using the same k
 | `SIMPLESCREEN_OIDC_TOKEN_TYPE` | access_token | or `id_token` |
 | `SIMPLESCREEN_BONJOUR` | true | mDNS advertisement |
 | `SIMPLESCREEN_ORG_NAME` | | organization name shown in the apps and on paired TVs; if unset, set it in Studio's first-run setup |
-| `SIMPLESCREEN_ORG_TIMEZONE` | host zone, else UTC | IANA zone for every schedule; if unset, Studio can set it |
+| `SIMPLESCREEN_ORG_TIMEZONE` | host zone, else UTC | IANA zone for every schedule; if unset, Studio can set it. `SIMPLESCREEN_TIMEZONE` is refused at startup |
 | `SIMPLESCREEN_LISTEN` | | `unix:/path/to.sock` listens on a unix socket instead of `BIND`:`PORT` (no Bonjour) |
 | `SIMPLESCREEN_PUBLIC_URL` | | externally reachable base URL when behind a reverse proxy; reported in `/v1/info` |
 

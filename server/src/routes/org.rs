@@ -14,7 +14,7 @@ use crate::{
     state::AppState,
 };
 
-/// Always exactly this server's org. A hosting gateway answers this itself for several orgs.
+/// The unscoped org list. It ignores `X-Organization` because this server has one org.
 pub async fn mine(State(s): State<AppState>, Unscoped(p): Unscoped) -> ApiResult<Json<Value>> {
     if p.is_device() {
         return Err(ApiError::forbidden());
@@ -101,7 +101,9 @@ pub async fn patch_settings(
         }
     }
 
-    let before = s.org_tz();
+    let _settings = s.settings_write.lock().await;
+    let before_tz = s.org_tz();
+    let before_name = s.org_name();
     let mut tx = s.db.begin().await?;
     for (key, value) in [("org_name", &name), ("org_timezone", &timezone)] {
         if let Some(v) = value {
@@ -122,7 +124,7 @@ pub async fn patch_settings(
             org.timezone = timezone;
         }
     }
-    if s.org_tz() != before {
+    if s.org_tz() != before_tz || s.org_name() != before_name {
         schedule::notify_all(&s).await;
     }
     Ok(Json(settings_json(&s)))

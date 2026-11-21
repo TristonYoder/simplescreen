@@ -29,6 +29,8 @@ pub struct Inner {
     pub shutdown: watch::Sender<bool>,
     pub schedule_wake: Notify,
     pub org: Mutex<StoredOrg>,
+    /// Serializes `PATCH /v1/settings` across the read, the write, and the in-memory update.
+    pub settings_write: tokio::sync::Mutex<()>,
 }
 
 /// Org settings written by first-run setup (`PATCH /v1/settings`); env vars win over these.
@@ -188,6 +190,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         shutdown,
         schedule_wake: Notify::new(),
         org: Mutex::new(org),
+        settings_write: tokio::sync::Mutex::new(()),
     })))
 }
 
@@ -206,16 +209,32 @@ fn load_or_create_bootstrap(dir: &std::path::Path) -> anyhow::Result<String> {
     Ok(token)
 }
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_schedule.sql"),
+    include_str!("../migrations/0003_skip_dates.sql"),
+    include_str!("../migrations/0004_floor_plans.sql"),
+    include_str!("../migrations/0005_teams.sql"),
+];
+
+async fn table_exists(db: &SqlitePool, name: &str) -> anyhow::Result<bool> {
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .bind(name)
+        .fetch_one(db)
+        .await?;
+    Ok(n == 1)
+}
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
-    let (legacy,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'groups'").fetch_one(db).await?;
-    anyhow::ensure!(
-        legacy == 0,
-        "this database predates the Teams schema; delete db.sqlite in the data dir (and blobs/ if wanted) and restart"
-    );
     let (current,): (i64,) = sqlx::query_as("PRAGMA user_version").fetch_one(db).await?;
+    let groups = table_exists(db, "groups").await?;
+    let teams = table_exists(db, "teams").await?;
+    anyhow::ensure!(!(groups && teams), "database has both groups and teams tables");
+    // The short-lived squashed migration created `teams` directly and stored user_version 1.
+    if teams && !groups && current < MIGRATIONS.len() as i64 {
+        sqlx::raw_sql(&format!("PRAGMA user_version = {}", MIGRATIONS.len())).execute(db).await?;
+        return Ok(());
+    }
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
         let mut tx = db.begin().await?;
         sqlx::raw_sql(sql).execute(&mut *tx).await?;

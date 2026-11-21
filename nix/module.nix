@@ -27,6 +27,10 @@ let
   // cfg.environment;
 in
 {
+  imports = [
+    (lib.mkRenamedOptionModule [ "services" slug "timezone" ] [ "services" slug "orgTimezone" ])
+  ];
+
   options.services.${slug} = {
     enable = lib.mkEnableOption "the ${slug} server";
     package = lib.mkOption {
