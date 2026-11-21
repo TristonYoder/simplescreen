@@ -842,8 +842,10 @@ paths:
         Editor role in a team that reaches the folder. Says where to send the bytes of a new file:
         `putBlob` on this server for the managed and local libraries, or a presigned S3 `PUT` (which
         must carry the returned headers, including `x-amz-checksum-sha256`, so S3 checks the hash).
+        S3 files larger than the library's part size come back with `multipart` instead of `url`:
+        sign each part with `signMediaUploadParts`, `PUT` it, then call `completeMediaUpload`.
         `already_present` means the bytes are already stored and no upload is needed. Then call
-        `createMedia`. 409 `name_taken`; 413 `file_too_large` (S3 single uploads are limited to 5 GiB);
+        `createMedia`. 409 `name_taken`; 413 `file_too_large` (S3 objects are limited to 5 TiB);
         507 `insufficient_storage` when the file won't fit the library's free space or quota.
       requestBody:
         required: true
@@ -860,6 +862,73 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '413': { $ref: '#/components/responses/PayloadTooLarge' }
         '507': { $ref: '#/components/responses/InsufficientStorage' }
+
+  /v1/media/uploads/{uploadId}:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/UploadId' }
+    delete:
+      operationId: abortMediaUpload
+      tags: [media]
+      description: The user who started the multipart upload. Abandons it and frees the parts in S3.
+      responses:
+        '204': { description: Aborted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/media/uploads/{uploadId}/parts:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/UploadId' }
+    post:
+      operationId: signMediaUploadParts
+      tags: [media]
+      description: |
+        The user who started the multipart upload. Presigns `PUT`s for up to 100 parts, numbered from 1.
+        Every part is `part_size` bytes except the last. Each `PUT` must carry the returned headers,
+        including the part's `x-amz-checksum-sha256`, and its response's `ETag` goes to
+        `completeMediaUpload`. Signing a part again (to retry it) replaces its hash.
+        Unfinished uploads are aborted after 24 hours.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaUploadPartsInput' }
+      responses:
+        '200':
+          description: One presigned PUT per part, in request order
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MediaUploadPart' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/media/uploads/{uploadId}/complete:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/UploadId' }
+    post:
+      operationId: completeMediaUpload
+      tags: [media]
+      description: |
+        The user who started the multipart upload. Joins the parts into the file, then checks it has
+        the declared size and the signed part hashes. 422 `upload_incomplete` if a part was never
+        signed, has no ETag here, or S3 refused it; 422 `hash_mismatch` if the joined file doesn't
+        match. Then call `createMedia`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaUploadCompleteInput' }
+      responses:
+        '204': { description: The file is in place }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
 
   /v1/media/{mediaId}:
     parameters:
@@ -2073,6 +2142,11 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    UploadId:
+      name: uploadId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
     LibraryId:
       name: libraryId
       in: path
@@ -2574,7 +2648,8 @@ components:
 
     MediaUpload:
       type: object
-      required: [method, url, headers, already_present]
+      required: [already_present]
+      description: Either `method`, `url` and `headers` for one PUT, or `multipart`
       properties:
         already_present: { type: boolean, description: The bytes are already stored; skip the upload }
         method: { type: string, enum: [PUT] }
@@ -2584,6 +2659,56 @@ components:
           additionalProperties: { type: string }
           description: Headers to send with the upload (S3 signs them)
         expires_at: { type: string, format: date-time, description: S3 only }
+        multipart: { $ref: '#/components/schemas/MultipartUpload' }
+
+    MultipartUpload:
+      type: object
+      required: [upload_id, part_size, part_count]
+      properties:
+        upload_id: { type: string, format: uuid }
+        part_size: { type: integer, format: int64, description: Bytes in every part but the last }
+        part_count: { type: integer }
+
+    MediaUploadPartsInput:
+      type: object
+      required: [parts]
+      properties:
+        parts:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            required: [number, sha256]
+            properties:
+              number: { type: integer, minimum: 1 }
+              sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of this part's bytes }
+
+    MediaUploadPart:
+      type: object
+      required: [number, method, url, headers, expires_at]
+      properties:
+        number: { type: integer }
+        method: { type: string, enum: [PUT] }
+        url: { type: string }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    MediaUploadCompleteInput:
+      type: object
+      required: [parts]
+      properties:
+        parts:
+          type: array
+          description: Every part, each with the ETag S3 returned for its PUT
+          items:
+            type: object
+            required: [number, etag]
+            properties:
+              number: { type: integer, minimum: 1 }
+              etag: { type: string }
 
     MediaUsagePlaylist:
       type: object
@@ -2678,6 +2803,7 @@ components:
         access_key_id: { type: string }
         secret_access_key: { type: string, writeOnly: true, description: Write only; never returned }
         cdn_base_url: { type: string, format: uri, description: 'If set, players are redirected to <cdn_base_url>/<key> instead of a presigned URL' }
+        part_size_mib: { type: integer, minimum: 5, maximum: 5120, default: 64, description: 'Files larger than this are uploaded and copied in parts of this size (larger when a file needs more than 10,000)' }
 
     Library:
       type: object
@@ -2725,6 +2851,7 @@ components:
             access_key_id: { type: string }
             secret_access_key: { type: string, writeOnly: true }
             cdn_base_url: { type: [string, 'null'] }
+            part_size_mib: { type: integer, minimum: 5, maximum: 5120 }
 
     LibraryTestInput:
       type: object
