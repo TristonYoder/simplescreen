@@ -31,6 +31,9 @@ req GET /v1/teams 404 "${auth[@]}" -H "X-Organization: not-this-org" | jq -e '.c
 
 team="$(req POST /v1/teams 201 "${auth[@]}" "${json[@]}" -d '{"name":"Smoke '"$RANDOM"'"}' | jq -r .id)"
 echo "team:    $team"
+tag="$(req POST /v1/tags 201 "${auth[@]}" "${json[@]}" -d '{"name":"smoke-'"$RANDOM"'"}' | jq -r .id)"
+req PUT "/v1/teams/$team/tags" 200 "${auth[@]}" "${json[@]}" -d '{"tag_ids":["'"$tag"'"]}' >/dev/null
+echo "tag:      $tag"
 
 file="$(mktemp)"; head -c 4096 /dev/urandom > "$file"
 sha="$(shasum -a 256 "$file" | cut -d' ' -f1)"
@@ -47,13 +50,14 @@ echo "media:    $media"
 
 playlist="$(req POST /v1/playlists 201 "${auth[@]}" "${json[@]}" \
   -d '{"team_id":"'"$team"'","name":"Smoke","items":[{"kind":"image","media_id":"'"$media"'"}]}' | jq -r .id)"
+req PUT "/v1/playlists/$playlist/tags" 200 "${auth[@]}" "${json[@]}" -d '{"tag_ids":["'"$tag"'"]}' >/dev/null
 echo "playlist: $playlist"
 
 pairing="$(req POST /v1/pairing 201 "${json[@]}" -d '{"model":"smoke"}')"
 code="$(jq -r .code <<<"$pairing")"; pid="$(jq -r .pairing_id <<<"$pairing")"; secret="$(jq -r .secret <<<"$pairing")"
 req GET "/v1/pairing/$pid?secret=$secret" 200 | jq -e '.status == "pending"' >/dev/null
 screen="$(req POST /v1/pairing/claim 201 "${auth[@]}" "${json[@]}" \
-  -d '{"code":"'"$code"'","name":"Smoke TV","team_id":"'"$team"'","playlist_id":"'"$playlist"'"}' | jq -r .id)"
+  -d '{"code":"'"$code"'","name":"Smoke TV","tag_ids":["'"$tag"'"],"playlist_id":"'"$playlist"'"}' | jq -r .id)"
 poll="$(req GET "/v1/pairing/$pid?secret=$secret" 200)"
 device_token="$(jq -r .device_token <<<"$poll")"
 [ "$device_token" != "null" ] || { echo "FAIL no device token" >&2; exit 1; }
@@ -72,4 +76,5 @@ req DELETE "/v1/screens/$screen" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/playlists/$playlist" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/media/$media" 204 "${auth[@]}" >/dev/null
 req DELETE "/v1/teams/$team" 204 "${auth[@]}" >/dev/null
+req DELETE "/v1/tags/$tag" 200 "${auth[@]}" >/dev/null
 echo "smoke OK"
