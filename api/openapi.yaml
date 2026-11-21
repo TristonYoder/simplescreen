@@ -14,8 +14,8 @@ info:
     - Org-scoped requests (user calls, including `GET /v1/ws`) may send `X-Organization: <id>`.
       If present it must equal this server's org id, else `404 organization_not_found`.
       Absent is accepted. Device tokens and unauthenticated endpoints ignore it.
-    - Screens, nodes, floor plans and tags belong to the org. Teams own content (media, playlist
-      folders, playlists, schedule entries). A team reaches a screen when its `screen_access` is `all`
+    - Screens, nodes, floor plans, tags and media libraries belong to the org. Teams own content
+      (playlist folders, playlists, schedule entries) and reach media folders through tags and grants. A team reaches a screen when its `screen_access` is `all`
       or the screen carries one of the team's tags. A playlist is available on a screen when they
       share a tag; an untagged playlist shows nowhere, and an untagged screen plays nothing and is
       reached by no team (only admins see it), whatever the team's `screen_access`.
@@ -50,6 +50,7 @@ tags:
   - name: organizations
   - name: settings
   - name: teams
+  - name: libraries
   - name: media
   - name: blobs
   - name: playlists
@@ -284,7 +285,7 @@ paths:
     delete:
       operationId: deleteTeam
       tags: [teams]
-      description: Server admin only. Fails with 409 if the team still owns media or playlists.
+      description: Server admin only. Fails with 409 if the team still owns playlists.
       responses:
         '204': { description: Deleted }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -445,6 +446,9 @@ paths:
         Immutable bytes. Supports `Range` (206), `If-None-Match` (304).
         Response headers: `ETag: "<sha256>"`, `Cache-Control: public, max-age=31536000, immutable`,
         `Accept-Ranges: bytes`, `Content-Type` from the media record (or application/octet-stream).
+        Files in the managed library and in local libraries are served directly. Files only in an S3
+        library answer `302` to a presigned URL (or the library's CDN URL), with `Cache-Control: no-store`;
+        clients must not forward their `Authorization` header to it.
       parameters:
         - name: Range
           in: header
@@ -461,6 +465,10 @@ paths:
           content:
             application/octet-stream:
               schema: { type: string, format: binary }
+        '302':
+          description: The file is in an S3 library; fetch it from `Location`
+          headers:
+            Location: { schema: { type: string, format: uri } }
         '304': { description: Not modified }
         '404': { $ref: '#/components/responses/NotFound' }
         '416': { description: Range not satisfiable }
@@ -470,7 +478,9 @@ paths:
       description: |
         Upload raw bytes. Requires editor role in at least one team.
         Server streams to disk while hashing; rejects with 422 if the hash doesn't match the path.
-        Idempotent: returns 200 if the blob already exists, 201 if newly stored.
+        Idempotent: returns 200 if the blob already exists, 201 if newly stored. Used for thumbnails,
+        floor plan images, and media going to the managed or a local library (`createMediaUpload` says
+        which). 507 `insufficient_storage` when the server's disk is full.
       requestBody:
         required: true
         content:
@@ -490,6 +500,282 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+        '507': { $ref: '#/components/responses/InsufficientStorage' }
+
+  /v1/libraries:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: listLibraries
+      tags: [libraries]
+      description: |
+        Any signed-in user. Every library, by position then name. Storage settings (`local`, `s3`) are
+        included for server admins only. The managed library always exists.
+      responses:
+        '200':
+          description: Libraries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Library' }
+    post:
+      operationId: createLibrary
+      tags: [libraries]
+      description: |
+        Server admin only. A `local` path must be absolute and inside a root allowed by the server's
+        `LIBRARY_ROOTS` setting (422 `path_not_allowed`); the directory is created if missing. An `s3`
+        library needs `bucket`, `region`, `access_key_id` and `secret_access_key`. The server checks it
+        can write to the storage first (422 `storage_unreachable`, with the reason in `message`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LibraryInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Library' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/libraries/{libraryId}:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/LibraryId' }
+    get:
+      operationId: getLibrary
+      tags: [libraries]
+      description: Any signed-in user; storage settings for server admins only.
+      responses:
+        '200':
+          description: Library
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Library' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateLibrary
+      tags: [libraries]
+      description: |
+        Server admin only. Rename, reorder, set the quota, or change S3 settings (credentials, endpoint,
+        CDN URL). The bucket, prefix and local path can't change once the library has files (409
+        `library_not_empty`). Omitting `secret_access_key` keeps the stored one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LibraryPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Library' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      operationId: deleteLibrary
+      tags: [libraries]
+      description: Server admin only. Only an empty library (no folders) can be removed (409 `library_not_empty`); the managed library can't (409 `library_managed`). Files in storage are left alone.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/libraries/test:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    post:
+      operationId: testLibrary
+      tags: [libraries]
+      description: |
+        Server admin only. Checks that the server can write, read and delete a small file with these
+        settings, without saving anything. Pass `library_id` to fill in the stored secret.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LibraryTestInput' }
+      responses:
+        '200':
+          description: Result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LibraryTestResult' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/media-folders:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    get:
+      operationId: listMediaFolders
+      tags: [media]
+      description: |
+        Folders the caller reaches (every folder for admins), plus their ancestors with `access: none` so
+        the tree can be drawn. A team reaches a folder through a tag it holds on the folder or an
+        ancestor (or `screen_access: all`), or a grant to it on the folder or an ancestor. `team_id`
+        narrows it to what that team reaches (viewer role).
+      parameters:
+        - name: library_id
+          in: query
+          required: false
+          schema: { type: string }
+        - name: team_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Folders, by library then path
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/MediaFolder' }
+    post:
+      operationId: createMediaFolder
+      tags: [media]
+      description: |
+        Top-level folders (no `parent_id`): server admin only. Subfolders: editor role in a team that
+        reaches the parent. Names are unique among siblings ignoring case (409 `name_taken`) and may not
+        contain `/` or start with `.` (400). The folder is created in storage too.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaFolderInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaFolder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/media-folders/{folderId}:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/FolderId' }
+    get:
+      operationId: getMediaFolder
+      tags: [media]
+      responses:
+        '200':
+          description: Folder
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaFolder' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: updateMediaFolder
+      tags: [media]
+      description: |
+        Editor role in a team that reaches the folder (moving it also needs that for the new parent;
+        a top-level folder is renamed or moved by server admins only). Renames and moves happen in
+        storage too. A folder can't move into itself or a descendant, or to another library (422
+        `invalid_folder`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaFolderPatch' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaFolder' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+    delete:
+      operationId: deleteMediaFolder
+      tags: [media]
+      description: |
+        Editor role in a team that reaches the folder (top-level folders: server admins). Deletes the
+        folder, its subfolders and their files, in storage too. Files that playlists use become missing,
+        as with `deleteMedia`. `getMediaFolderUsage` shows what would be affected.
+      responses:
+        '204': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/media-folders/{folderId}/tags:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/FolderId' }
+    put:
+      operationId: setMediaFolderTags
+      tags: [media]
+      description: |
+        Editor role in a team that reaches the folder. Replaces the folder's own tags. Non-admins may
+        add or remove only tags one of their editor teams holds (403 `tag_not_held`).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TagIdsInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaFolder' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/media-folders/{folderId}/grants:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/FolderId' }
+    put:
+      operationId: setMediaFolderGrants
+      tags: [media]
+      description: Editor role in a team that reaches the folder. Replaces the teams the folder is granted to directly.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaFolderGrantsInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaFolder' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/media-folders/{folderId}/usage:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/FolderId' }
+    get:
+      operationId: getMediaFolderUsage
+      tags: [media]
+      description: Viewer role in a team that reaches the folder. Every playlist using any file in the folder or its subfolders, for the delete confirmation.
+      responses:
+        '200':
+          description: Usage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUsage' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/media:
     parameters:
@@ -497,7 +783,15 @@ paths:
     get:
       operationId: listMedia
       tags: [media]
+      description: |
+        Files in folders the caller reaches, plus files the caller's teams' playlists use (`access:
+        playlist`, including missing ones). `folder_id` lists one folder (not its subfolders); `team_id`
+        narrows to what that team reaches and uses (viewer role).
       parameters:
+        - name: folder_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
         - name: team_id
           in: query
           required: false
@@ -517,7 +811,11 @@ paths:
     post:
       operationId: createMedia
       tags: [media]
-      description: Register metadata for an uploaded blob. Blob must already exist (else 422). Editor role in team.
+      description: |
+        Editor role in a team that reaches the folder. Finishes an upload started with
+        `createMediaUpload`: the server checks the bytes are in place (422 `blob_missing`, or
+        `hash_mismatch` for S3) and records the file at `<folder path>/<name>`. 409 `name_taken` if the
+        folder already has a file with that name (ignoring case).
       requestBody:
         required: true
         content:
@@ -531,7 +829,37 @@ paths:
               schema: { $ref: '#/components/schemas/Media' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
         '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /v1/media/uploads:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+    post:
+      operationId: createMediaUpload
+      tags: [media]
+      description: |
+        Editor role in a team that reaches the folder. Says where to send the bytes of a new file:
+        `putBlob` on this server for the managed and local libraries, or a presigned S3 `PUT` (which
+        must carry the returned headers, including `x-amz-checksum-sha256`, so S3 checks the hash).
+        `already_present` means the bytes are already stored and no upload is needed. Then call
+        `createMedia`. 409 `name_taken`; 413 `file_too_large` (S3 single uploads are limited to 5 GiB);
+        507 `insufficient_storage` when the file won't fit the library's free space or quota.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MediaUploadInput' }
+      responses:
+        '200':
+          description: Where to upload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUpload' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { description: Too large for the library, code `file_too_large` }
+        '507': { $ref: '#/components/responses/InsufficientStorage' }
 
   /v1/media/{mediaId}:
     parameters:
@@ -540,6 +868,7 @@ paths:
     get:
       operationId: getMedia
       tags: [media]
+      description: Viewer role in a team that reaches its folder, or whose playlist uses it.
       responses:
         '200':
           description: Media
@@ -550,6 +879,11 @@ paths:
     patch:
       operationId: updateMedia
       tags: [media]
+      description: |
+        Editor role in a team that reaches its folder (and the target folder when moving). Renames and
+        moves happen in storage; a move to another library copies the bytes, then deletes the old copy.
+        The sha256 stays the same, so playlists keep working. 409 `name_taken`; 422 `media_missing` for a
+        missing file; 507 `insufficient_storage`.
       requestBody:
         required: true
         content:
@@ -563,15 +897,37 @@ paths:
               schema: { $ref: '#/components/schemas/Media' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '507': { $ref: '#/components/responses/InsufficientStorage' }
     delete:
       operationId: deleteMedia
       tags: [media]
-      description: 409 if referenced by a playlist. Blob bytes are garbage-collected when unreferenced.
+      description: |
+        Editor role in a team that reaches its folder. Deletes the file from storage. If playlists use it,
+        the record stays with `missing: true`: players skip those items, manifests leave them out, and
+        the last editor of each playlist gets a `media_missing` notice. `getMediaUsage` shows which
+        playlists use it.
       responses:
         '204': { description: Deleted }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+
+  /v1/media/{mediaId}/usage:
+    parameters:
+      - { $ref: '#/components/parameters/OrganizationHeader' }
+      - { $ref: '#/components/parameters/MediaId' }
+    get:
+      operationId: getMediaUsage
+      tags: [media]
+      description: Same access as `getMedia`. Every playlist using the file, by team, for the delete confirmation.
+      responses:
+        '200':
+          description: Usage
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MediaUsage' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /v1/playlists:
     parameters:
@@ -603,6 +959,7 @@ paths:
     post:
       operationId: createPlaylist
       tags: [playlists]
+      description: Editor of the team. Every file must be in a folder the team reaches (422 `invalid_playlist`).
       requestBody:
         required: true
         content:
@@ -641,6 +998,8 @@ paths:
         current playlist in `Error.current`. On success version increments and assigned screens get
         `manifest_changed`. Item/bed IDs supplied by the client are preserved; missing IDs are generated.
         422 if media references are invalid, bed ranges overlap, or a bed references unknown items.
+        Newly added files must be in folders the playlist's team reaches; files already in the playlist
+        stay valid even if the team no longer reaches them or they are missing.
       requestBody:
         required: true
         content:
@@ -1714,6 +2073,11 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    LibraryId:
+      name: libraryId
+      in: path
+      required: true
+      schema: { type: string }
     PlaylistId:
       name: playlistId
       in: path
@@ -1800,6 +2164,11 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     Unprocessable:
       description: Semantically invalid
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InsufficientStorage:
+      description: 'Not enough space in the library (code `insufficient_storage`; `free_bytes` says how much is left)'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -2128,40 +2497,254 @@ components:
 
     MediaInput:
       type: object
-      required: [team_id, kind, sha256, mime, title]
+      required: [folder_id, name, kind, sha256, mime]
       properties:
-        team_id: { type: string, format: uuid }
+        folder_id: { type: string, format: uuid }
+        name: { type: string, description: 'File name in the folder, e.g. "Welcome loop.mov"' }
         kind: { $ref: '#/components/schemas/MediaKind' }
         sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
         mime: { type: string, examples: [video/mp4, video/quicktime, image/jpeg, image/png, image/heic, audio/mp4] }
-        title: { type: string }
         width: { type: integer }
         height: { type: integer }
         duration_ms: { type: integer, format: int64, description: Video/audio only }
         codec: { type: string, description: e.g. hvc1, avc1, aac, alac }
         hdr: { type: boolean }
         frame_rate: { type: number }
-        source_filename: { type: string }
+        source_filename: { type: string, description: The original file name before transcoding }
         thumbnail_sha256:
           type: string
           pattern: '^[0-9a-f]{64}$'
-          description: Optional uploaded JPEG thumbnail blob
+          description: Optional JPEG thumbnail uploaded with `putBlob`; it stays in the managed store
 
     MediaPatch:
       type: object
       properties:
-        title: { type: string }
+        name: { type: string }
+        folder_id: { type: string, format: uuid, description: Move to this folder (any library) }
+
+    MediaAccess:
+      type: string
+      description: |
+        What the caller can do with a file. `edit`: an editor team reaches its folder. `view`: a team
+        reaches its folder. `playlist`: only used by one of the caller's teams' playlists (it stays there
+        read-only, flagged in Studio).
+      enum: [edit, view, playlist]
 
     Media:
-      allOf:
-        - $ref: '#/components/schemas/MediaInput'
-        - type: object
-          required: [id, size, created_at]
+      type: object
+      required: [id, library_id, name, path, kind, sha256, mime, size, missing, access, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        library_id: { type: string }
+        folder_id: { type: string, format: uuid, description: Absent once the file is missing }
+        name: { type: string }
+        path: { type: string, description: 'Path in the library, e.g. "Lobby/Loops/Welcome loop.mov"' }
+        kind: { $ref: '#/components/schemas/MediaKind' }
+        sha256: { type: string }
+        mime: { type: string }
+        width: { type: integer }
+        height: { type: integer }
+        duration_ms: { type: integer, format: int64 }
+        codec: { type: string }
+        hdr: { type: boolean }
+        frame_rate: { type: number }
+        source_filename: { type: string }
+        thumbnail_sha256: { type: string }
+        size: { type: integer, format: int64 }
+        missing: { type: boolean, description: The file was deleted but playlists still use it }
+        missing_at: { type: string, format: date-time }
+        access: { $ref: '#/components/schemas/MediaAccess' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+
+    MediaUploadInput:
+      type: object
+      required: [folder_id, name, sha256, size, mime]
+      properties:
+        folder_id: { type: string, format: uuid }
+        name: { type: string }
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        size: { type: integer, format: int64 }
+        mime: { type: string }
+
+    MediaUpload:
+      type: object
+      required: [method, url, headers, already_present]
+      properties:
+        already_present: { type: boolean, description: The bytes are already stored; skip the upload }
+        method: { type: string, enum: [PUT] }
+        url: { type: string, description: 'Absolute (S3) or relative to the server (`/v1/blobs/<sha256>`, send the usual Authorization)' }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: Headers to send with the upload (S3 signs them)
+        expires_at: { type: string, format: date-time, description: S3 only }
+
+    MediaUsagePlaylist:
+      type: object
+      required: [id, name, team_id, team_name, items, member]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        team_id: { type: string, format: uuid }
+        team_name: { type: string }
+        items: { type: integer, description: How many of its items and bed tracks use the file(s) }
+        member: { type: boolean, description: The caller is in this team (otherwise only the name and team are shown) }
+
+    MediaUsage:
+      type: object
+      required: [playlists, media_count]
+      properties:
+        media_count: { type: integer, description: Files covered (1 for a file; every file under a folder) }
+        playlists:
+          type: array
+          description: By team name, then playlist name
+          items: { $ref: '#/components/schemas/MediaUsagePlaylist' }
+
+    FolderAccess:
+      type: string
+      description: '`edit`: an editor team of the caller reaches it. `view`: a team reaches it. `none`: listed only as an ancestor.'
+      enum: [edit, view, none]
+
+    MediaFolder:
+      type: object
+      required: [id, library_id, name, path, tag_ids, team_ids, inherited_tag_ids, inherited_team_ids, access, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        library_id: { type: string }
+        parent_id: { type: string, format: uuid, description: Absent for a top-level folder }
+        name: { type: string }
+        path: { type: string, description: 'e.g. "Lobby/Loops"' }
+        tag_ids:
+          type: array
+          description: Tags set on this folder
+          items: { type: string, format: uuid }
+        team_ids:
+          type: array
+          description: Teams granted this folder directly
+          items: { type: string, format: uuid }
+        inherited_tag_ids:
+          type: array
+          description: Tags from ancestors
+          items: { type: string, format: uuid }
+        inherited_team_ids:
+          type: array
+          description: Grants from ancestors
+          items: { type: string, format: uuid }
+        access: { $ref: '#/components/schemas/FolderAccess' }
+        created_at: { type: string, format: date-time }
+
+    MediaFolderInput:
+      type: object
+      required: [library_id, name]
+      properties:
+        library_id: { type: string }
+        parent_id: { type: string, format: uuid }
+        name: { type: string }
+
+    MediaFolderPatch:
+      type: object
+      properties:
+        name: { type: string }
+        parent_id: { type: string, format: uuid, description: New parent in the same library }
+
+    MediaFolderGrantsInput:
+      type: object
+      required: [team_ids]
+      properties:
+        team_ids:
+          type: array
+          items: { type: string, format: uuid }
+
+    LibraryKind:
+      type: string
+      description: '`managed`: the server''s own store under its data directory. `local`: a server directory. `s3`: an S3 bucket.'
+      enum: [managed, local, s3]
+
+    S3Settings:
+      type: object
+      required: [bucket, region, access_key_id]
+      properties:
+        endpoint: { type: string, format: uri, description: 'For S3-compatible stores; default AWS' }
+        region: { type: string }
+        bucket: { type: string }
+        prefix: { type: string, description: Key prefix for the library's folders }
+        path_style: { type: boolean, description: Path-style URLs (most S3-compatible stores) }
+        access_key_id: { type: string }
+        secret_access_key: { type: string, writeOnly: true, description: Write only; never returned }
+        cdn_base_url: { type: string, format: uri, description: 'If set, players are redirected to <cdn_base_url>/<key> instead of a presigned URL' }
+
+    Library:
+      type: object
+      required: [id, name, kind, position, used_bytes, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        kind: { $ref: '#/components/schemas/LibraryKind' }
+        position: { type: integer }
+        used_bytes: { type: integer, format: int64, description: Total size of the library's files }
+        free_bytes: { type: integer, format: int64, description: 'Space left: the quota less used, or the disk''s free space, whichever is smaller; absent when unlimited' }
+        quota_bytes: { type: integer, format: int64 }
+        path: { type: string, description: 'local only, admins only' }
+        s3:
+          $ref: '#/components/schemas/S3Settings'
+          description: s3 only, admins only (without the secret)
+        created_at: { type: string, format: date-time }
+
+    LibraryInput:
+      type: object
+      required: [name, kind]
+      properties:
+        name: { type: string }
+        kind: { type: string, enum: [local, s3] }
+        path: { type: string, description: local only }
+        s3: { $ref: '#/components/schemas/S3Settings' }
+        quota_bytes: { type: integer, format: int64 }
+
+    LibraryPatch:
+      type: object
+      properties:
+        name: { type: string }
+        position: { type: integer }
+        quota_bytes: { type: [integer, 'null'], format: int64, description: null removes the quota }
+        path: { type: string }
+        s3:
+          type: object
+          description: Fields to change; omitted ones keep their value
           properties:
-            id: { type: string, format: uuid }
-            size: { type: integer, format: int64 }
-            created_by: { type: string }
-            created_at: { type: string, format: date-time }
+            endpoint: { type: string }
+            region: { type: string }
+            bucket: { type: string }
+            prefix: { type: string }
+            path_style: { type: boolean }
+            access_key_id: { type: string }
+            secret_access_key: { type: string, writeOnly: true }
+            cdn_base_url: { type: [string, 'null'] }
+
+    LibraryTestInput:
+      type: object
+      required: [kind]
+      properties:
+        library_id: { type: string, description: Fill in the stored secret from this library }
+        kind: { type: string, enum: [local, s3] }
+        path: { type: string }
+        s3:
+          type: object
+          properties:
+            endpoint: { type: string }
+            region: { type: string }
+            bucket: { type: string }
+            prefix: { type: string }
+            path_style: { type: boolean }
+            access_key_id: { type: string }
+            secret_access_key: { type: string, writeOnly: true }
+
+    LibraryTestResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        message: { type: string, description: Why it failed }
 
     AdvanceMode:
       type: string
@@ -3008,11 +3591,11 @@ components:
           items: { $ref: '#/components/schemas/ScheduleSegment' }
         playlists:
           type: array
-          description: Every available playlist (the timeline only references these)
+          description: Every available playlist (the timeline only references these). Items whose file is missing are left out, as are missing bed tracks; a bed whose start item was left out starts at the next item.
           items: { $ref: '#/components/schemas/Playlist' }
         media:
           type: array
-          description: Every media record referenced by those playlists
+          description: Every media record referenced by those playlists (never missing ones)
           items: { $ref: '#/components/schemas/Media' }
         assets:
           type: array
@@ -3021,7 +3604,7 @@ components:
 
     WsServerMessageType:
       type: string
-      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, screen_activity, node_online, node_offline, node_updated, node_status, schedule_changed, floor_plans_changed, tags_changed, notice, assignments_changed, unpaired]
+      enum: [hello, manifest_changed, command, screen_status, screen_online, screen_offline, screen_updated, screen_activity, node_online, node_offline, node_updated, node_status, schedule_changed, floor_plans_changed, tags_changed, media_changed, notice, assignments_changed, unpaired]
 
     WsServerMessage:
       type: object
@@ -3032,6 +3615,7 @@ components:
         server_id: { type: string, format: uuid, description: hello }
         version: { type: integer, format: int64, description: 'manifest_changed (informational; devices refetch with If-None-Match) and assignments_changed (the new assignments version; refetch getDeviceAssignments)' }
         team_id: { type: string, format: uuid, description: schedule_changed }
+        folder_id: { type: string, format: uuid, description: 'media_changed: a folder or the files in it changed (absent when libraries or the folder tree changed); sent to every user' }
         command: { $ref: '#/components/schemas/ScreenCommand' }
         screen_id: { type: string, format: uuid, description: 'manifest_changed / command (device-facing) and screen_status / online / offline / updated / activity (users who reach the screen). A device also receives screen_status, manifest_changed, screen_online and screen_offline for screens it has a control or confidence assignment for (not played by itself)' }
         node_id: { type: string, format: uuid, description: node_online / node_offline / node_updated / node_status }
@@ -3046,7 +3630,7 @@ components:
 
     NoticeKind:
       type: string
-      enum: [schedule_conflict, untagged_screen]
+      enum: [schedule_conflict, untagged_screen, media_missing]
 
     Notice:
       type: object
@@ -3054,6 +3638,9 @@ components:
       description: |
         `schedule_conflict`: `entry_id` needs resolution (it clashes with another one-off; `detail.clashes`).
         `untagged_screen`: `screen_id` has no tags and plays nothing (addressed to every admin).
+        `media_missing`: a file a playlist uses was deleted (`detail.media_id`, `detail.name`,
+        `detail.path`, `detail.playlist_ids`); addressed to each playlist's last editor. It resolves when
+        no playlist uses the file any more.
       properties:
         id: { type: string, format: uuid }
         kind: { $ref: '#/components/schemas/NoticeKind' }
