@@ -17,7 +17,8 @@ info:
     - Screens, nodes, floor plans and tags belong to the org. Teams own content (media, playlist
       folders, playlists, schedule entries). A team reaches a screen when its `screen_access` is `all`
       or the screen carries one of the team's tags. A playlist is available on a screen when they
-      share a tag; an untagged playlist shows nowhere, and an untagged screen plays nothing.
+      share a tag; an untagged playlist shows nowhere, and an untagged screen plays nothing and is
+      reached by no team (only admins see it), whatever the team's `screen_access`.
     - Screen permissions: admins manage tags, team reach, screen tags, floor plans, node name and
       mode, and delete screens. Editors of a team that reaches a screen operate it (rename, place,
       fallback, timezone, override, commands, assignments that target it). Viewers of a reaching
