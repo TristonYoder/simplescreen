@@ -117,7 +117,7 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
     }
     let (n,): (i64,) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM media WHERE team_id = ?1) + (SELECT COUNT(*) FROM playlists WHERE team_id = ?1)
-         + (SELECT COUNT(*) FROM screens WHERE team_id = ?1)",
+         + (SELECT COUNT(*) FROM screens WHERE team_id = ?1) + (SELECT COUNT(*) FROM nodes WHERE team_id = ?1)",
     )
     .bind(&id)
     .fetch_one(&s.db)

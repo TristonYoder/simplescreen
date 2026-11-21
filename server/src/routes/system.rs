@@ -63,7 +63,13 @@ pub async fn me(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Value
         v["email"] = json!(e);
     }
     if p.kind == Kind::Device {
-        v["screen_id"] = json!(p.screen_id);
+        v["node_id"] = json!(p.node_id);
+        if let Some(node_id) = &p.node_id {
+            let ids = super::nodes::screen_ids(&s, node_id).await?;
+            if let [only] = ids.as_slice() {
+                v["screen_id"] = json!(only);
+            }
+        }
     }
     Ok(Json(v))
 }

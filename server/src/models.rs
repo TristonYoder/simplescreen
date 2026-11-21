@@ -348,6 +348,18 @@ pub struct ScreenStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blackout: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
 
@@ -364,6 +376,12 @@ impl ScreenStatus {
             os_version: None,
             model: None,
             message: None,
+            step_index: None,
+            step_count: None,
+            item_count: None,
+            position_ms: None,
+            duration_ms: None,
+            blackout: None,
             updated_at: None,
         }
     }
@@ -380,6 +398,10 @@ pub struct Screen {
     pub override_: Option<ScreenOverride>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placement: Option<ScreenPlacement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_key: Option<String>,
     pub online: bool,
     pub status: ScreenStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,6 +424,8 @@ pub struct ScreenRow {
     pub placement_plan_id: Option<String>,
     pub placement_x: Option<f64>,
     pub placement_y: Option<f64>,
+    pub node_id: Option<String>,
+    pub output_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -412,7 +436,7 @@ pub struct ScreenPlacement {
 }
 
 pub const SCREEN_COLUMNS: &str = "id, team_id, name, playlist_id, last_seen_at, created_at, \
-     override_set, override_playlist_id, override_until, override_set_at, placement_plan_id, placement_x, placement_y";
+     override_set, override_playlist_id, override_until, override_set_at, placement_plan_id, placement_x, placement_y, node_id, output_key";
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ScreenOverride {
@@ -449,6 +473,7 @@ pub enum CommandName {
     Blackout,
     Reload,
     Identify,
+    Jump,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -456,4 +481,106 @@ pub struct ScreenCommand {
     pub name: CommandName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_index: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputKind {
+    Display,
+    External,
+    BuiltIn,
+    Decklink,
+    Virtual,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputRole {
+    Screen,
+    Mirror,
+    Control,
+    Confidence,
+    #[default]
+    None,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Output {
+    pub key: String,
+    pub kind: OutputKind,
+    pub name: String,
+    /// Legacy mirror of the output's assignment job; hardware reports may omit it.
+    #[serde(default)]
+    pub role: OutputRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_device: Option<String>,
+}
+
+#[derive(FromRow)]
+pub struct NodeRow {
+    pub id: String,
+    pub team_id: String,
+    pub name: String,
+    pub model: Option<String>,
+    pub os_version: Option<String>,
+    pub app_version: Option<String>,
+    pub outputs: String,
+    pub single: bool,
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+    pub mode: String,
+    pub assignments_version: i64,
+    pub applied_assignments_version: i64,
+}
+
+pub const NODE_COLUMNS: &str = "id, team_id, name, model, os_version, app_version, outputs, single, created_at, last_seen_at, mode, assignments_version, applied_assignments_version";
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OutputStatus {
+    pub key: String,
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_frames: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_frames: Option<i64>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct NodeStatus {
+    pub outputs: Vec<OutputStatus>,
+    pub updated_at: String,
+}
+
+#[derive(Serialize)]
+pub struct Node {
+    pub id: String,
+    pub team_id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+    pub outputs: Vec<Output>,
+    pub screen_ids: Vec<String>,
+    pub mode: String,
+    pub assignments_version: i64,
+    pub applied_assignments_version: i64,
+    pub online: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<NodeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<String>,
+    pub created_at: String,
 }

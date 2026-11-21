@@ -12,7 +12,7 @@ use crate::{
     error::ApiError,
     config::Config,
     hub::Hub,
-    models::ScreenStatus,
+    models::{NodeStatus, ScreenStatus},
     util::{new_id, random_token},
 };
 
@@ -26,6 +26,7 @@ pub struct Inner {
     pub devices: Mutex<HashMap<String, DeviceInfo>>,
     pub touched: Mutex<HashMap<String, std::time::Instant>>,
     pub statuses: Mutex<HashMap<String, ScreenStatus>>,
+    pub node_statuses: Mutex<HashMap<String, NodeStatus>>,
     pub shutdown: watch::Sender<bool>,
     pub schedule_wake: Notify,
     pub org: Mutex<StoredOrg>,
@@ -94,25 +95,29 @@ impl AppState {
             .unwrap_or(chrono_tz::Tz::UTC)
     }
 
-    pub fn forget_device_tokens(&self, screen_id: &str) {
-        self.devices.lock().retain(|_, d| d.screen_id != screen_id);
+    pub fn forget_device_tokens(&self, node_id: &str) {
+        self.devices.lock().retain(|_, d| d.node_id != node_id);
     }
 
     /// Notifies every screen in the team; devices refetch with If-None-Match.
     pub async fn notify_screens_for_playlist(&self, team_id: &str, version: i64) {
-        let ids: Vec<(String,)> = sqlx::query_as("SELECT id FROM screens WHERE team_id = ?")
+        let ids: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, node_id FROM screens WHERE team_id = ?")
             .bind(team_id)
             .fetch_all(&self.db)
             .await
             .unwrap_or_default();
-        for (id,) in ids {
-            self.notify_manifest(&id, version);
+        for (id, node_id) in ids {
+            self.notify_manifest(node_id.as_deref(), &id, version);
         }
     }
 
-    pub fn notify_manifest(&self, screen_id: &str, version: i64) {
-        self.hub
-            .send_device(screen_id, &serde_json::json!({ "type": "manifest_changed", "version": version }));
+    /// Tells the node that plays `screen_id` to refetch that screen's manifest.
+    pub fn notify_manifest(&self, node_id: Option<&str>, screen_id: &str, version: i64) {
+        let msg = serde_json::json!({ "type": "manifest_changed", "screen_id": screen_id, "version": version });
+        if let Some(node_id) = node_id {
+            self.hub.send_node(node_id, &msg);
+        }
+        self.hub.send_subscribers(screen_id, node_id, &msg);
     }
 }
 
@@ -187,6 +192,7 @@ pub async fn build_state(cfg: Config) -> anyhow::Result<AppState> {
         devices: Mutex::default(),
         touched: Mutex::default(),
         statuses: Mutex::default(),
+        node_statuses: Mutex::default(),
         shutdown,
         schedule_wake: Notify::new(),
         org: Mutex::new(org),
@@ -215,6 +221,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_skip_dates.sql"),
     include_str!("../migrations/0004_floor_plans.sql"),
     include_str!("../migrations/0005_teams.sql"),
+    include_str!("../migrations/0006_nodes.sql"),
 ];
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {

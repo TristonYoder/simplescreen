@@ -48,7 +48,7 @@ pub struct Principal {
     pub email: Option<String>,
     pub server_admin: bool,
     pub memberships: Vec<Membership>,
-    pub screen_id: Option<String>,
+    pub node_id: Option<String>,
     pub device_team: Option<String>,
 }
 
@@ -83,7 +83,7 @@ impl Principal {
 
 #[derive(Clone)]
 pub struct DeviceInfo {
-    pub screen_id: String,
+    pub node_id: String,
     pub team_id: String,
 }
 
@@ -164,7 +164,7 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
                 email: None,
                 server_admin: true,
                 memberships: vec![],
-                screen_id: None,
+                node_id: None,
                 device_team: None,
             });
         }
@@ -176,12 +176,12 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
         Some(d) => Some(d),
         None => {
             let row: Option<(String, String)> =
-                sqlx::query_as("SELECT id, team_id FROM screens WHERE token_hash = ?")
+                sqlx::query_as("SELECT id, team_id FROM nodes WHERE token_hash = ?")
                     .bind(&hash)
                     .fetch_optional(&state.db)
                     .await?;
-            row.map(|(screen_id, team_id)| {
-                let d = DeviceInfo { screen_id, team_id };
+            row.map(|(node_id, team_id)| {
+                let d = DeviceInfo { node_id, team_id };
                 state.devices.lock().insert(hash.clone(), d.clone());
                 d
             })
@@ -190,12 +190,12 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
     if let Some(d) = device {
         return Ok(Principal {
             kind: Kind::Device,
-            subject: d.screen_id.clone(),
+            subject: d.node_id.clone(),
             display_name: None,
             email: None,
             server_admin: false,
             memberships: vec![],
-            screen_id: Some(d.screen_id),
+            node_id: Some(d.node_id),
             device_team: Some(d.team_id),
         });
     }
@@ -265,7 +265,7 @@ async fn user_principal(state: &AppState, oidc: &Oidc, claims: &Value) -> Result
         email,
         server_admin,
         memberships,
-        screen_id: None,
+        node_id: None,
         device_team: None,
     })
 }

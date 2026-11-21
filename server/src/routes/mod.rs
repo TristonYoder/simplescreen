@@ -4,6 +4,8 @@ mod floor_plans;
 mod teams;
 mod media;
 mod org;
+pub mod nodes;
+mod assignments;
 mod pairing;
 mod playlists;
 mod schedule;
@@ -43,6 +45,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/playlists/{id}",
             get(playlists::get).put(playlists::update).delete(playlists::delete),
         )
+        .route("/v1/nodes", get(nodes::list))
+        .route("/v1/nodes/{id}", get(nodes::get))
+        .route("/v1/nodes/{id}/assignments", get(assignments::node_get).put(assignments::node_put))
+        .route("/v1/screens/{id}/move", post(assignments::move_screen))
         .route("/v1/screens", get(screens::list))
         .route("/v1/screens/{id}", get(screens::get).patch(screens::patch).delete(screens::delete))
         .route("/v1/screens/{id}/command", post(screens::command))
@@ -58,6 +64,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/device/manifest", get(device::manifest))
         .route("/v1/device/playlists", get(device::playlists))
         .route("/v1/device/playlist", put(device::select_playlist))
+        .route("/v1/device/node", get(device::node))
+        .route("/v1/device/outputs", put(device::put_outputs))
+        .route("/v1/device/screens", post(device::create_screen))
+        .route("/v1/device/assignments", get(assignments::device_get).put(assignments::device_put))
+        .route("/v1/device/mode", put(assignments::device_mode))
+        .route("/v1/device/team-screens", get(assignments::team_screens))
+        .route("/v1/device/screens/{id}/command", post(assignments::device_command))
         .route("/v1/ws", get(ws::upgrade))
         .fallback(|| async { ApiError::not_found() })
         .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
