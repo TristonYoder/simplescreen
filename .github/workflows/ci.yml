@@ -77,7 +77,7 @@ jobs:
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "KVM is not usable on this runner; NixOS VM tests will be skipped"
+            echo "::warning::KVM is not usable on this runner; NixOS VM tests were skipped"
           fi
 
       - name: nix build .#server
