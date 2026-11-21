@@ -27,6 +27,8 @@ async fn main() -> anyhow::Result<()> {
         let listener = tokio::net::UnixListener::bind(path)?;
         // connect(2) needs write permission. A reverse proxy runs as another user, and systemd's
         // umask would otherwise leave the socket owner-only.
+        // Safe because every request still needs a bearer token; revisit this mode if a gateway ever
+        // passes trusted identity over the socket instead.
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
         tracing::info!("{BRAND_SLUG} server {version} listening on unix:{path}");
         if cfg.bonjour {
