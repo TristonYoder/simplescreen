@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -15,8 +15,10 @@ use crate::{
 };
 
 pub const TIME_FORMAT: &str = "%H:%M";
+pub const TIME_FORMAT_SECONDS: &str = "%H:%M:%S";
 pub const DATE_FORMAT: &str = "%Y-%m-%d";
 pub const LOCAL_FORMAT: &str = "%Y-%m-%dT%H:%M";
+pub const LOCAL_FORMAT_SECONDS: &str = "%Y-%m-%dT%H:%M:%S";
 pub const DEVICE_HORIZON: Duration = Duration::hours(48);
 pub const MAX_RANGE: Duration = Duration::days(14);
 pub const CLEAR_OVERRIDE: &str = "override_set = 0, override_playlist_id = NULL, override_until = NULL, override_set_at = NULL, \
@@ -156,7 +158,16 @@ pub struct Override {
 }
 
 pub fn parse_time(s: &str) -> Option<NaiveTime> {
-    NaiveTime::parse_from_str(s, TIME_FORMAT).ok()
+    NaiveTime::parse_from_str(s, TIME_FORMAT_SECONDS).ok().or_else(|| NaiveTime::parse_from_str(s, TIME_FORMAT).ok())
+}
+
+/// `HH:MM`, or `HH:MM:SS` when the seconds aren't zero.
+pub fn format_time(t: NaiveTime) -> String {
+    t.format(if t.second() == 0 { TIME_FORMAT } else { TIME_FORMAT_SECONDS }).to_string()
+}
+
+pub fn format_local(dt: NaiveDateTime) -> String {
+    dt.format(if dt.second() == 0 { LOCAL_FORMAT } else { LOCAL_FORMAT_SECONDS }).to_string()
 }
 
 pub fn parse_date(s: &str) -> Option<NaiveDate> {
@@ -164,7 +175,7 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
 }
 
 pub fn parse_local(s: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, LOCAL_FORMAT).ok()
+    NaiveDateTime::parse_from_str(s, LOCAL_FORMAT_SECONDS).ok().or_else(|| NaiveDateTime::parse_from_str(s, LOCAL_FORMAT).ok())
 }
 
 /// Wall clock to instant; a time skipped by a DST jump moves forward an hour, a repeated one takes the first.
@@ -660,6 +671,23 @@ mod tests {
         );
         assert_eq!(segs[4].source, Source::Once);
         assert_eq!(next_change(&segs), Some(utc("2026-11-20T07:00:00Z")));
+    }
+
+    #[test]
+    fn seconds_parse_resolve_and_format() {
+        assert_eq!(parse_time("09:30"), NaiveTime::from_hms_opt(9, 30, 0));
+        assert_eq!(parse_time("09:30:15"), NaiveTime::from_hms_opt(9, 30, 15));
+        assert_eq!(format_time(parse_time("09:30:00").unwrap()), "09:30");
+        assert_eq!(format_time(parse_time("09:30:15").unwrap()), "09:30:15");
+        assert_eq!(format_local(parse_local("2026-11-20T18:00:00").unwrap()), "2026-11-20T18:00");
+        assert_eq!(format_local(parse_local("2026-11-20T18:00:05").unwrap()), "2026-11-20T18:00:05");
+        let cue = weekly("1", "cue", &[5], "09:30:15", "09:31:45");
+        let segs = resolve(&m(&[&cue]), None, None, &Tz::UTC, utc("2026-11-20T09:00:00Z"), utc("2026-11-20T10:00:00Z"));
+        assert_eq!(segs[1].starts_at, utc("2026-11-20T09:30:15Z"));
+        assert_eq!(segs[1].ends_at, utc("2026-11-20T09:31:45Z"));
+        let launch = once("2", "launch", "2026-11-20T09:40:30", "2026-11-20T09:41");
+        let segs = resolve(&m(&[&launch]), None, None, &Tz::UTC, utc("2026-11-20T09:00:00Z"), utc("2026-11-20T10:00:00Z"));
+        assert_eq!(segs[1].starts_at, utc("2026-11-20T09:40:30Z"));
     }
 
     #[test]

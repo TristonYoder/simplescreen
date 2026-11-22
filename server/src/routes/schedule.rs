@@ -117,11 +117,14 @@ async fn validate(s: &AppState, w: &World, input: &mut EntryInput) -> ApiResult<
             if input.days.is_empty() || input.days.iter().any(|d| !(1..=7).contains(d)) {
                 return Err(invalid("days must list weekdays 1 (Monday) to 7"));
             }
-            if input.start_time.as_deref().and_then(schedule::parse_time).is_none()
-                || input.end_time.as_deref().and_then(schedule::parse_time).is_none()
-            {
-                return Err(invalid("start_time and end_time must be HH:MM"));
-            }
+            let (Some(a), Some(b)) = (
+                input.start_time.as_deref().and_then(schedule::parse_time),
+                input.end_time.as_deref().and_then(schedule::parse_time),
+            ) else {
+                return Err(invalid("start_time and end_time must be HH:MM or HH:MM:SS"));
+            };
+            input.start_time = Some(schedule::format_time(a));
+            input.end_time = Some(schedule::format_time(b));
             let on = |v: &Option<String>| -> ApiResult<Option<chrono::NaiveDate>> {
                 match v {
                     None => Ok(None),
@@ -146,11 +149,13 @@ async fn validate(s: &AppState, w: &World, input: &mut EntryInput) -> ApiResult<
                 input.starts_at.as_deref().and_then(schedule::parse_local),
                 input.ends_at.as_deref().and_then(schedule::parse_local),
             ) else {
-                return Err(invalid("starts_at and ends_at must be YYYY-MM-DDTHH:MM"));
+                return Err(invalid("starts_at and ends_at must be YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS"));
             };
             if b <= a {
                 return Err(invalid("ends_at must be after starts_at"));
             }
+            input.starts_at = Some(schedule::format_local(a));
+            input.ends_at = Some(schedule::format_local(b));
             input.days.clear();
             input.start_time = None;
             input.end_time = None;

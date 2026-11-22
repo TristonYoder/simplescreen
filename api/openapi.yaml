@@ -26,7 +26,8 @@ info:
     - Nodes are hardware only: they have no team and no tags, and grant nothing. An assignment
       (one output's job) is the node's whole grant to its target screen.
     - Schedules use wall-clock times in the screen's zone (`Screen.timezone`, else the org's
-      `timezone`) (`HH:MM`, `YYYY-MM-DDTHH:MM`). Resolved segments are UTC timestamps.
+      `timezone`) (`HH:MM[:SS]`, `YYYY-MM-DDTHH:MM[:SS]`). Seconds are optional and come back only
+      when non-zero. Resolved segments are UTC timestamps.
     - Media blobs are content-addressed by lowercase hex SHA-256 and immutable.
     - Errors always use the `Error` schema.
     - Auth: `Authorization: Bearer <token>`. Token is an OIDC JWT (users), the
@@ -3552,16 +3553,16 @@ components:
           type: array
           description: ISO weekdays, 1 = Monday
           items: { type: integer, minimum: 1, maximum: 7 }
-        start_time: { type: string, pattern: '^[0-9]{2}:[0-9]{2}$' }
-        end_time: { type: string, pattern: '^[0-9]{2}:[0-9]{2}$' }
+        start_time: { type: string, pattern: '^[0-9]{2}:[0-9]{2}(:[0-9]{2})?$' }
+        end_time: { type: string, pattern: '^[0-9]{2}:[0-9]{2}(:[0-9]{2})?$' }
         starts_on: { type: string, format: date }
         ends_on: { type: string, format: date }
         skip_dates:
           type: array
           description: Weekly only. Local dates whose occurrence (by start date) is skipped.
           items: { type: string, format: date }
-        starts_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$', description: Local wall clock }
-        ends_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$', description: Local wall clock }
+        starts_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?$', description: Local wall clock }
+        ends_at: { type: string, pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(:[0-9]{2})?$', description: Local wall clock }
 
     ScheduleEntry:
       allOf:

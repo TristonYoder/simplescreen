@@ -747,6 +747,15 @@ async fn schedule_resolves_events_weekly_and_overrides() {
         .await;
     assert_eq!(bad.status, StatusCode::UNPROCESSABLE_ENTITY);
 
+    let r = app
+        .call("POST", "/v1/schedule", Some(json!({ "team_id": g, "playlist_id": b, "kind": "weekly", "days": [3], "start_time": "07:00:15", "end_time": "08:00:00", "enabled": false })))
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{:?}", r.body);
+    assert_eq!(r.json()["start_time"], "07:00:15");
+    assert_eq!(r.json()["end_time"], "08:00");
+    let seconds_entry = r.json()["id"].as_str().unwrap().to_string();
+    assert_eq!(app.call("DELETE", &format!("/v1/schedule/{seconds_entry}"), None).await.status, StatusCode::NO_CONTENT);
+
     let event_end = now + Duration::hours(2);
     let r = app
         .call(
