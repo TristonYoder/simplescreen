@@ -2431,6 +2431,10 @@ async fn media_replace_keeps_id_and_bumps_playlists() {
     assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
     app.upload(b"second-cut").await;
 
+    let r = app
+        .call("POST", &format!("/v1/media/{media_id}/replace"), Some(json!({ "name": "Cut.png", "kind": "image", "sha256": new_sha, "mime": "image/png" })))
+        .await;
+    assert_eq!(r.json()["code"], "kind_mismatch");
     let body = |name: &str| json!({ "name": name, "kind": "video", "sha256": new_sha, "mime": "video/quicktime", "duration_ms": 5000 });
     let r = app.call("POST", &format!("/v1/media/{media_id}/replace"), Some(body(&other_name))).await;
     assert_eq!(r.status, StatusCode::CONFLICT);

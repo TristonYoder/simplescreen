@@ -999,7 +999,7 @@ paths:
         `createMediaUpload` (`replaces` set to this file) and keeps the id, so every playlist that uses
         it gets the new version: their versions bump and their screens get `manifest_changed`. The old
         bytes are deleted. 409 `name_taken` if the new name belongs to another file; 422 `blob_missing`,
-        `hash_mismatch` or `media_missing`; 507 `insufficient_storage`.
+        `hash_mismatch`, `media_missing`, or `kind_mismatch` (a video only takes a video, and so on); 507 `insufficient_storage`.
       requestBody:
         required: true
         content:

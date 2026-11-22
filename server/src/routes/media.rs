@@ -557,6 +557,9 @@ pub async fn replace(
         return Err(ApiError::bad_request("mime is required"));
     }
     let (m, tree, _) = editable(&s, &p, &id).await?;
+    if input.kind.as_str() != m.kind {
+        return Err(ApiError::unprocessable("kind_mismatch", format!("a {} can only be replaced with another {}", m.kind, m.kind)));
+    }
     let folder = m.folder_id.clone().unwrap_or_default();
     let name = library::check_name(&input.name)?;
     name_free(&s, &folder, &name, Some(&m.id)).await?;
