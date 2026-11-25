@@ -157,7 +157,7 @@ fn clean_name(name: &str) -> ApiResult<String> {
 }
 
 async fn probe(s: &AppState, b: &Backend) -> ApiResult<()> {
-    b.probe(s).await.map_err(|m| ApiError::unprocessable("storage_unreachable", m).because("probe_failed"))
+    b.probe(s).await.map_err(|m| ApiError::unprocessable("storage_unreachable", m.clone()).because("probe_failed").with("detail", m))
 }
 
 pub async fn create(

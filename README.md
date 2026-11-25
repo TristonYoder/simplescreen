@@ -102,12 +102,13 @@ To build it yourself on a Linux builder: `nix build .#docker && docker load < re
 - **Lost bootstrap token:** read `<data dir>/bootstrap-token`, or set `SIMPLESCREEN_BOOTSTRAP_TOKEN_FILE`.
 - **Uploads fail with 422 `hash_mismatch`:** the bytes differ from the SHA-256 in the URL; re-upload.
 - **Adding a local library fails with `path_not_allowed`:** the path must be inside `SIMPLESCREEN_LIBRARY_ROOTS` (or `libraryRoots`).
-- **Adding a library fails with `storage_unreachable`:** the server couldn't write, read back and delete a test file. The message has the reason: check directory permissions, or the S3 endpoint, region, bucket, path-style setting and key permissions.
+- **Adding a library fails with `storage_unreachable`:** the server couldn't write, read back and delete a test file. Studio shows the cause (`params.detail` in the error): check directory permissions, or the S3 endpoint, region, bucket, path-style setting and key permissions.
 - **Uploads fail with 507 `insufficient_storage`:** the library's quota or disk is full (`free_bytes` in the error).
 - **Players don't download from an S3 library:** they're redirected to S3 or the CDN URL; that host must be reachable from the TVs' network.
 - **Scheduled content starts at the wrong hour:** schedule times are wall-clock in the organization's timezone. Check it in Studio's settings, then `SIMPLESCREEN_ORG_TIMEZONE` / `services.simplescreen.orgTimezone`. The server refuses to start with an unknown zone name.
 - **Schedule doesn't switch while the server is down:** players switch offline only within the 48 h timeline they last fetched, and only to playlists they've finished caching. Let the screen reconnect once after editing the schedule.
 - **Screen shows offline:** the device WebSocket (`/v1/ws`) must pass through any reverse proxy with upgrade headers enabled.
+- **Reading an API error:** every error body has a stable `code`, often a `reason` and `params`, and an English `message`. The apps word the error themselves from `code` and `reason`; search the server log or `api/openapi.yaml` (the Error schema lists every code and reason) by those, not by the text Studio shows.
 - **Verify a running server:** `DATA_DIR=./data scripts/smoke.sh` (needs `curl` and `jq`).
 
 ## License and contributing

@@ -527,7 +527,7 @@ paths:
         Server admin only. A `local` path must be absolute and inside a root allowed by the server's
         `LIBRARY_ROOTS` setting (422 `path_not_allowed`); the directory is created if missing. An `s3`
         library needs `bucket`, `region`, `access_key_id` and `secret_access_key`. The server checks it
-        can write to the storage first (422 `storage_unreachable`, with the reason in `message`).
+        can write to the storage first (422 `storage_unreachable`, with the cause in `params.detail`).
       requestBody:
         required: true
         content:
