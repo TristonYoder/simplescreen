@@ -99,13 +99,13 @@ impl S3Input {
         }
         if let Some(v) = self.part_size_mib {
             if !(5..=5120).contains(&v) {
-                return Err(ApiError::bad_request("part_size_mib must be between 5 and 5120"));
+                return Err(ApiError::bad_request("part_size_mib must be between 5 and 5120").because("part_size_invalid"));
             }
             cfg.part_size_mib = Some(v);
         }
         let secret = self.secret_access_key.clone().or(secret).unwrap_or_default();
         if cfg.bucket.is_empty() || cfg.region.is_empty() || cfg.access_key_id.is_empty() || secret.is_empty() {
-            return Err(ApiError::bad_request("s3 needs bucket, region, access_key_id and secret_access_key"));
+            return Err(ApiError::bad_request("s3 needs bucket, region, access_key_id and secret_access_key").because("s3_settings_incomplete"));
         }
         Ok((cfg, secret))
     }
@@ -115,7 +115,7 @@ impl S3Input {
 fn allowed_path(s: &AppState, path: &str) -> ApiResult<PathBuf> {
     let p = FsPath::new(path.trim());
     if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir | Component::CurDir)) {
-        return Err(ApiError::unprocessable("path_not_allowed", "the path must be absolute, without . or .."));
+        return Err(ApiError::unprocessable("path_not_allowed", "the path must be absolute, without . or ..").because("path_not_absolute"));
     }
     let p = p.to_path_buf();
     let roots: Vec<PathBuf> = s.cfg.library_roots.iter().map(|r| r.canonicalize().unwrap_or_else(|_| r.clone())).collect();
@@ -133,7 +133,8 @@ fn allowed_path(s: &AppState, path: &str) -> ApiResult<PathBuf> {
         return Err(ApiError::unprocessable(
             "path_not_allowed",
             "the path is not inside a directory allowed by the server's LIBRARY_ROOTS setting",
-        ));
+        )
+        .because("path_outside_roots"));
     }
     Ok(resolved)
 }
@@ -150,13 +151,13 @@ pub struct LibraryInput {
 fn clean_name(name: &str) -> ApiResult<String> {
     let n = name.trim();
     if n.is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     Ok(n.to_string())
 }
 
 async fn probe(s: &AppState, b: &Backend) -> ApiResult<()> {
-    b.probe(s).await.map_err(|m| ApiError::unprocessable("storage_unreachable", m))
+    b.probe(s).await.map_err(|m| ApiError::unprocessable("storage_unreachable", m).because("probe_failed"))
 }
 
 pub async fn create(
@@ -167,7 +168,7 @@ pub async fn create(
     p.require_admin()?;
     let name = clean_name(&input.name)?;
     if input.quota_bytes.is_some_and(|q| q < 0) {
-        return Err(ApiError::bad_request("quota_bytes must not be negative"));
+        return Err(ApiError::bad_request("quota_bytes must not be negative").because("quota_negative"));
     }
     let (path, s3, secret) = match input.kind.as_str() {
         "local" => {
@@ -181,7 +182,7 @@ pub async fn create(
             probe(&s, &Backend::S3(Box::new(S3::new(&cfg, &secret)?))).await?;
             (None, Some(serde_json::to_string(&cfg)?), Some(secret))
         }
-        _ => return Err(ApiError::bad_request("kind must be local or s3")),
+        _ => return Err(ApiError::bad_request("kind must be local or s3").because("kind_invalid")),
     };
     let id = new_id();
     let (pos,): (i64,) = sqlx::query_as("SELECT COALESCE(MAX(position), 0) + 1 FROM libraries").fetch_one(&s.db).await?;
@@ -233,19 +234,19 @@ pub async fn patch(
     }
     if let Some(q) = input.quota_bytes {
         if q.is_some_and(|q| q < 0) {
-            return Err(ApiError::bad_request("quota_bytes must not be negative"));
+            return Err(ApiError::bad_request("quota_bytes must not be negative").because("quota_negative"));
         }
         sqlx::query("UPDATE libraries SET quota_bytes = ? WHERE id = ?").bind(q).bind(&id).execute(&s.db).await?;
     }
     if let Some(path) = &input.path {
         if lib.kind != "local" {
-            return Err(ApiError::bad_request("only local libraries have a path"));
+            return Err(ApiError::bad_request("only local libraries have a path").because("path_only_local"));
         }
         let path = allowed_path(&s, path)?;
         let path_str = path.to_string_lossy().to_string();
         if lib.path.as_deref() != Some(path_str.as_str()) {
             if has_folders(&s, &id).await? {
-                return Err(ApiError::conflict("library_not_empty", "the path can't change once the library has folders"));
+                return Err(ApiError::conflict("library_not_empty", "the path can't change once the library has folders").because("path_locked"));
             }
             probe(&s, &Backend::Local(path)).await?;
             sqlx::query("UPDATE libraries SET path = ? WHERE id = ?").bind(path_str).bind(&id).execute(&s.db).await?;
@@ -253,13 +254,13 @@ pub async fn patch(
     }
     if let Some(s3) = &input.s3 {
         if lib.kind != "s3" {
-            return Err(ApiError::bad_request("only s3 libraries have s3 settings"));
+            return Err(ApiError::bad_request("only s3 libraries have s3 settings").because("s3_only_s3"));
         }
         let old = lib.s3_settings();
         let (cfg, secret) = s3.merge(old.clone(), lib.s3_secret.clone())?;
         let moved = old.as_ref().is_some_and(|o| o.bucket != cfg.bucket || o.prefix != cfg.prefix);
         if moved && has_folders(&s, &id).await? {
-            return Err(ApiError::conflict("library_not_empty", "the bucket and prefix can't change once the library has folders"));
+            return Err(ApiError::conflict("library_not_empty", "the bucket and prefix can't change once the library has folders").because("bucket_locked"));
         }
         probe(&s, &Backend::S3(Box::new(S3::new(&cfg, &secret)?))).await?;
         sqlx::query("UPDATE libraries SET s3 = ?, s3_secret = ? WHERE id = ?")
@@ -281,7 +282,7 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
     }
     let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media WHERE library_id = ?").bind(&id).fetch_one(&s.db).await?;
     if n > 0 || has_folders(&s, &id).await? {
-        return Err(ApiError::conflict("library_not_empty", "remove the library's folders first"));
+        return Err(ApiError::conflict("library_not_empty", "remove the library's folders first").because("has_folders"));
     }
     sqlx::query("DELETE FROM libraries WHERE id = ?").bind(&id).execute(&s.db).await?;
     library::changed(&s, None);
@@ -311,7 +312,7 @@ pub async fn test(State(s): State<AppState>, p: Principal, ApiJson(input): ApiJs
             .merge(stored.as_ref().and_then(|l| l.s3_settings()), stored.and_then(|l| l.s3_secret))
             .and_then(|(cfg, secret)| S3::new(&cfg, &secret))
             .map(|b| Backend::S3(Box::new(b))),
-        _ => Err(ApiError::bad_request("kind must be local or s3")),
+        _ => Err(ApiError::bad_request("kind must be local or s3").because("kind_invalid")),
     };
     let result = match backend {
         Ok(b) => b.probe(&s).await,

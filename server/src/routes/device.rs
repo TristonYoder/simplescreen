@@ -1,7 +1,8 @@
+use crate::error::ApiQuery;
 use std::collections::{HashMap, HashSet};
 
 use axum::{
-    extract::{Query, State},
+    extract::{State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -133,7 +134,7 @@ pub async fn picker(s: &AppState, w: &World, screen_id: &str) -> ApiResult<Vec<P
 pub async fn playlists(
     State(s): State<AppState>,
     p: Principal,
-    Query(q): Query<ScreenQuery>,
+    ApiQuery(q): ApiQuery<ScreenQuery>,
 ) -> ApiResult<Json<Vec<PickerNode>>> {
     let screen = controlled_screen(&s, &p, q.screen_id.as_deref()).await?;
     let w = World::load(&s).await?;
@@ -154,7 +155,7 @@ pub async fn select_playlist(
     let screen = controlled_screen(&s, &p, selection.screen_id.as_deref()).await?;
     let w = World::load(&s).await?;
     if selection.playlist_id.as_deref().is_some_and(|pl| !w.available(pl, &screen.id)) {
-        return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not available on this screen"));
+        return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not available on this screen").because("not_on_screen"));
     }
     let base = schedule::base_timeline(&s, &screen, Utc::now()).await?;
     let scheduled = base.len() > 1 || base.first().is_some_and(|g| g.source != schedule::Source::Default);
@@ -175,7 +176,7 @@ pub async fn select_playlist(
 pub async fn manifest(
     State(s): State<AppState>,
     p: Principal,
-    Query(q): Query<ScreenQuery>,
+    ApiQuery(q): ApiQuery<ScreenQuery>,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     // Read-only access also covers screens this node watches through control or confidence assignments.
@@ -386,10 +387,10 @@ pub async fn put_outputs(
     let mut keys = HashSet::new();
     for o in &outputs {
         if o.key.trim().is_empty() || o.name.trim().is_empty() {
-            return Err(ApiError::unprocessable("invalid_outputs", "output key and name must not be empty"));
+            return Err(ApiError::unprocessable("invalid_outputs", "output key and name must not be empty").because("output_empty"));
         }
         if !keys.insert(o.key.as_str()) {
-            return Err(ApiError::unprocessable("invalid_outputs", format!("duplicate output key {}", o.key)));
+            return Err(ApiError::unprocessable("invalid_outputs", format!("duplicate output key {}", o.key)).because("output_repeated").with("output", &o.key));
         }
     }
     // role and screen_id are copies of the assignments. A hardware report cannot change them.
@@ -425,11 +426,11 @@ pub async fn create_screen(
     let node_id = device_node(&p)?.to_string();
     let name = input.name.trim();
     if name.is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     let node = super::nodes::fetch_row(&s, &node_id).await.map_err(|_| ApiError::unauthorized())?;
     if crate::assignments::Mode::parse(&node.mode) != crate::assignments::Mode::Player {
-        return Err(ApiError::unprocessable("job_not_allowed_in_mode", "only player devices own screens"));
+        return Err(ApiError::unprocessable("job_not_allowed_in_mode", "only player devices own screens").because("screens_need_player"));
     }
     let mut outputs = super::nodes::outputs_of(&node);
     let Some(output) = outputs.iter_mut().find(|o| o.key == input.output_key) else {

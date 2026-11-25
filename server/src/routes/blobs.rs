@@ -36,7 +36,7 @@ pub async fn put(
         return Err(ApiError::forbidden());
     }
     if !is_sha256(&sha) {
-        return Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters"));
+        return Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters").because("sha256_invalid"));
     }
     let dest = s.blob_path(&sha);
     if let Ok(meta) = tokio::fs::metadata(&dest).await {
@@ -60,7 +60,7 @@ pub async fn put(
     };
     if hash != sha {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(ApiError::unprocessable("hash_mismatch", "uploaded bytes do not match the sha256 in the path"));
+        return Err(ApiError::unprocessable("hash_mismatch", "uploaded bytes do not match the sha256 in the path").because("upload"));
     }
     if let Some(dir) = dest.parent() {
         tokio::fs::create_dir_all(dir).await?;
@@ -79,7 +79,7 @@ async fn write_stream(tmp: &std::path::Path, body: Body) -> ApiResult<(String, u
     let mut size = 0u64;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload interrupted: {e}")))?;
+        let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload interrupted: {e}")).because("upload_interrupted"))?;
         hasher.update(&chunk);
         size += chunk.len() as u64;
         out.write_all(&chunk).await?;

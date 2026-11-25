@@ -112,7 +112,7 @@ pub enum Backend {
 }
 
 fn s3_err(e: impl std::fmt::Display) -> ApiError {
-    ApiError::unprocessable("storage_unreachable", format!("S3: {e}"))
+    ApiError::unprocessable("storage_unreachable", format!("S3: {e}")).because("s3").with("detail", e.to_string())
 }
 
 impl S3 {
@@ -121,10 +121,10 @@ impl S3 {
             Some(e) => e.clone(),
             None => format!("https://s3.{}.amazonaws.com", cfg.region),
         };
-        let url = url::Url::parse(&endpoint).map_err(|e| ApiError::bad_request(format!("invalid S3 endpoint: {e}")))?;
+        let url = url::Url::parse(&endpoint).map_err(|e| ApiError::bad_request(format!("invalid S3 endpoint: {e}")).because("s3_endpoint_invalid"))?;
         let style = if cfg.path_style { UrlStyle::Path } else { UrlStyle::VirtualHost };
         let bucket = Bucket::new(url, style, cfg.bucket.clone(), cfg.region.clone())
-            .map_err(|e| ApiError::bad_request(format!("invalid S3 bucket: {e}")))?;
+            .map_err(|e| ApiError::bad_request(format!("invalid S3 bucket: {e}")).because("s3_bucket_invalid"))?;
         let prefix = cfg.prefix.trim_matches('/');
         Ok(S3 {
             bucket,
@@ -216,7 +216,7 @@ impl S3 {
         let text = resp.text().await.map_err(s3_err)?;
         if !status.is_success() || text.contains("<Error>") {
             let code = xml_field(&text, "Code").unwrap_or_else(|| status.to_string());
-            return Err(ApiError::unprocessable("upload_incomplete", format!("S3 refused to join the parts: {code}")));
+            return Err(ApiError::unprocessable("upload_incomplete", format!("S3 refused to join the parts: {code}")).because("s3_refused").with("detail", &code));
         }
         Ok(())
     }
@@ -455,7 +455,7 @@ fn urlencode(s: &str) -> String {
 }
 
 pub fn sha_b64(sha: &str) -> ApiResult<String> {
-    let bytes = hex::decode(sha).map_err(|_| ApiError::bad_request("sha256 must be 64 lowercase hex characters"))?;
+    let bytes = hex::decode(sha).map_err(|_| ApiError::bad_request("sha256 must be 64 lowercase hex characters").because("sha256_invalid"))?;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 

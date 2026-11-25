@@ -1,5 +1,6 @@
+use crate::error::ApiQuery;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -20,7 +21,7 @@ pub struct ListQuery {
     all: bool,
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Value>>> {
+pub async fn list(State(s): State<AppState>, p: Principal, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult<Json<Vec<Value>>> {
     super::assignments::require_user(&p)?;
     let rows: Vec<Notice> = sqlx::query_as(&format!(
         "SELECT {NOTICE_COLUMNS} FROM notices WHERE (user_sub = ?1 OR (user_sub IS NULL AND ?2)) \

@@ -87,7 +87,7 @@ pub async fn patch(
     let row = fetch_row(&s, &id).await?;
     if let Some(name) = &input.name {
         if name.trim().is_empty() {
-            return Err(ApiError::bad_request("name must not be empty"));
+            return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
         }
         sqlx::query("UPDATE nodes SET name = ? WHERE id = ?").bind(name.trim()).bind(&id).execute(&s.db).await?;
     }

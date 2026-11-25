@@ -171,6 +171,12 @@ async fn teams() {
     let app = App::new().await;
     let r = app.call("POST", "/v1/teams", Some(json!({ "name": "" }))).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["reason"], "name_empty");
+    let r = app.call("POST", "/v1/teams", Some(json!({ "name": 5 }))).await;
+    assert_eq!(r.json()["reason"], "invalid_body");
+    let r = app.call("GET", "/v1/schedule?scope=7&from=x", None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.json()["code"], "bad_request");
     let id = app.team().await;
     let r = app.call("GET", "/v1/teams", None).await;
     assert_eq!(r.json().as_array().unwrap().len(), 1);
@@ -538,10 +544,13 @@ async fn playlists() {
     let r = app.call("PUT", &format!("/v1/playlists/{pid}"), Some(update(2, v["items"].clone(), overlap))).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert!(r.json()["message"].as_str().unwrap().contains("overlap"));
+    assert_eq!(r.json()["reason"], "beds_overlap");
 
     let bad_kind = json!([{ "kind": "image", "media_id": v1 }]);
     let r = app.call("PUT", &format!("/v1/playlists/{pid}"), Some(update(2, bad_kind, json!([])))).await;
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(r.json()["reason"], "media_kind");
+    assert_eq!(r.json()["params"]["expected"], "image");
 
     let r = app.call("GET", &format!("/v1/playlists?team_id={g}"), None).await;
     assert_eq!(r.json()[0]["item_count"], 3);

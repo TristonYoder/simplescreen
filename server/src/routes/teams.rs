@@ -60,16 +60,16 @@ async fn fetch(s: &AppState, id: &str) -> ApiResult<Team> {
 
 fn validate(input: &mut TeamInput) -> ApiResult<()> {
     if input.name.trim().is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     let mut seen = HashSet::new();
     for b in &mut input.oidc_bindings {
         b.claim_value = b.claim_value.trim().to_string();
         if b.claim_value.is_empty() {
-            return Err(ApiError::bad_request("oidc_bindings claim_value must not be empty"));
+            return Err(ApiError::bad_request("oidc_bindings claim_value must not be empty").because("claim_value_empty"));
         }
         if !seen.insert(b.claim_value.clone()) {
-            return Err(ApiError::bad_request(format!("oidc_bindings lists {} more than once", b.claim_value)));
+            return Err(ApiError::bad_request(format!("oidc_bindings lists {} more than once", b.claim_value)).because("claim_value_repeated").with("claim_value", &b.claim_value));
         }
     }
     Ok(())
@@ -164,7 +164,7 @@ pub async fn put_tags(
     let current = fetch(&s, &id).await?;
     let access = input.screen_access.unwrap_or(current.screen_access);
     if access != "all" && access != "tags" {
-        return Err(ApiError::bad_request("screen_access must be all or tags"));
+        return Err(ApiError::bad_request("screen_access must be all or tags").because("screen_access_invalid"));
     }
     let tags = reach::check_tags(&s, &input.tag_ids).await?;
     let before = World::load(&s).await?.team_screens(&id);

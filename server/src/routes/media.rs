@@ -1,7 +1,8 @@
+use crate::error::ApiQuery;
 use std::collections::HashSet;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -27,7 +28,7 @@ pub struct ListQuery {
     source_sha256: Option<String>,
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Media>>> {
+pub async fn list(State(s): State<AppState>, p: Principal, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult<Json<Vec<Media>>> {
     super::assignments::require_user(&p)?;
     if let Some(h) = &q.source_sha256 {
         check_sha(h)?;
@@ -103,7 +104,7 @@ async fn name_free(s: &AppState, folder_id: &str, name: &str, except: Option<&st
             .fetch_optional(&s.db)
             .await?;
     match taken {
-        Some(_) => Err(ApiError::conflict("name_taken", "the folder already has a file with that name")),
+        Some(_) => Err(ApiError::conflict("name_taken", "the folder already has a file with that name").because("file")),
         None => Ok(()),
     }
 }
@@ -112,7 +113,7 @@ fn check_sha(sha: &str) -> ApiResult<()> {
     if is_sha256(sha) {
         Ok(())
     } else {
-        Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters"))
+        Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters").because("sha256_invalid"))
     }
 }
 
@@ -151,7 +152,7 @@ pub async fn upload(State(s): State<AppState>, p: Principal, ApiJson(input): Api
     if let Some(id) = &input.replaces {
         let (m, tree, _) = editable(&s, &p, id).await?;
         if m.folder_id.as_deref() != Some(input.folder_id.as_str()) {
-            return Err(ApiError::bad_request("folder_id must be the replaced file's folder"));
+            return Err(ApiError::bad_request("folder_id must be the replaced file's folder").because("folder_mismatch"));
         }
         if m.sha256 == input.sha256 {
             return Ok(Json(json!({ "already_present": true })));
@@ -159,7 +160,7 @@ pub async fn upload(State(s): State<AppState>, p: Principal, ApiJson(input): Api
         path = staging_path(&tree.path(&input.folder_id), id, &input.sha256);
     }
     if input.size < 0 {
-        return Err(ApiError::bad_request("size must not be negative"));
+        return Err(ApiError::bad_request("size must not be negative").because("size_negative"));
     }
     let backend = lib.backend()?;
     let in_store = tokio::fs::metadata(s.blob_path(&input.sha256)).await.is_ok();
@@ -263,7 +264,7 @@ pub async fn upload_parts(
 ) -> ApiResult<Json<Value>> {
     let (row, b) = own_upload(&s, &p, &id).await?;
     if input.parts.is_empty() || input.parts.len() > 100 {
-        return Err(ApiError::bad_request("sign between 1 and 100 parts at a time"));
+        return Err(ApiError::bad_request("sign between 1 and 100 parts at a time").because("part_batch_invalid"));
     }
     let expires = (chrono::Utc::now() + chrono::Duration::from_std(crate::storage::PRESIGN_TTL).unwrap_or_default())
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -271,7 +272,7 @@ pub async fn upload_parts(
     for part in &input.parts {
         check_sha(&part.sha256)?;
         if part.number < 1 || part.number > row.part_count {
-            return Err(ApiError::bad_request(format!("part numbers run from 1 to {}", row.part_count)));
+            return Err(ApiError::bad_request(format!("part numbers run from 1 to {}", row.part_count)).because("part_number_invalid").with("part_count", row.part_count));
         }
         let (url, headers) = b.part_url(&row.path, &row.s3_upload_id, part.number as u16, &part.sha256)?;
         sqlx::query("INSERT INTO media_upload_parts (upload_id, number, sha256) VALUES (?, ?, ?) ON CONFLICT DO UPDATE SET sha256 = excluded.sha256")
@@ -314,19 +315,19 @@ pub async fn complete_upload(
     for n in 1..=row.part_count {
         let sha = signed.iter().find(|(m, _)| *m == n).map(|(_, sha)| sha.clone());
         let (Some(sha), Some(etag)) = (sha, etags.get(&n)) else {
-            return Err(ApiError::unprocessable("upload_incomplete", format!("part {n} was not signed or has no ETag")));
+            return Err(ApiError::unprocessable("upload_incomplete", format!("part {n} was not signed or has no ETag")).because("part_unsigned").with("part", n));
         };
         parts.push((n as u16, etag.to_string(), Some(sha_b64(&sha)?)));
         shas.push(sha);
     }
     b.complete_multipart(&row.path, &row.s3_upload_id, &parts).await?;
-    let info = b.head_info(&row.path).await?.ok_or_else(|| ApiError::unprocessable("upload_incomplete", "the joined file is not in S3"))?;
+    let info = b.head_info(&row.path).await?.ok_or_else(|| ApiError::unprocessable("upload_incomplete", "the joined file is not in S3").because("not_joined"))?;
     let composite = composite_checksum(&shas)?;
     let checksum_ok = info.matches_composite(&composite);
     if info.size != row.size || !checksum_ok {
         b.delete(&row.path).await?;
         sqlx::query("DELETE FROM media_uploads WHERE id = ?").bind(&row.id).execute(&s.db).await?;
-        return Err(ApiError::unprocessable("hash_mismatch", "the joined file does not match the declared size and part hashes"));
+        return Err(ApiError::unprocessable("hash_mismatch", "the joined file does not match the declared size and part hashes").because("joined"));
     }
     sqlx::query("DELETE FROM media_uploads WHERE id = ?").bind(&row.id).execute(&s.db).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -379,7 +380,7 @@ pub async fn create(
 ) -> ApiResult<(StatusCode, Json<Media>)> {
     check_sha(&input.sha256)?;
     if input.mime.trim().is_empty() {
-        return Err(ApiError::bad_request("mime is required"));
+        return Err(ApiError::bad_request("mime is required").because("mime_required"));
     }
     let (lib, name, path) = target(&s, &p, &input.folder_id, &input.name).await?;
     name_free(&s, &input.folder_id, &name, None).await?;
@@ -389,7 +390,7 @@ pub async fn create(
     if let Some(t) = &input.thumbnail_sha256 {
         check_sha(t)?;
         if tokio::fs::metadata(s.blob_path(t)).await.is_err() {
-            return Err(ApiError::unprocessable("blob_missing", "thumbnail blob has not been uploaded"));
+            return Err(ApiError::unprocessable("blob_missing", "thumbnail blob has not been uploaded").because("thumbnail"));
         }
     }
     let staged = s.blob_path(&input.sha256);
@@ -398,7 +399,7 @@ pub async fn create(
         Backend::Managed | Backend::Local(_) => {
             let meta = tokio::fs::metadata(&staged)
                 .await
-                .map_err(|_| ApiError::unprocessable("blob_missing", "the file has not been uploaded"))?;
+                .map_err(|_| ApiError::unprocessable("blob_missing", "the file has not been uploaded").because("file"))?;
             if matches!(backend, Backend::Local(_)) {
                 library::ensure_space(&s, &lib, meta.len() as i64).await?;
                 backend.put_from(&s, &staged, &path, &input.sha256).await?;
@@ -406,9 +407,9 @@ pub async fn create(
             meta.len() as i64
         }
         Backend::S3(b) => match b.head(&path).await? {
-            None => return Err(ApiError::unprocessable("blob_missing", "the file has not been uploaded to S3")),
+            None => return Err(ApiError::unprocessable("blob_missing", "the file has not been uploaded to S3").because("file")),
             Some((size, sha)) if sha.as_deref() == Some(input.sha256.as_str()) => size,
-            Some(_) => return Err(ApiError::unprocessable("hash_mismatch", "the object in S3 does not match sha256")),
+            Some(_) => return Err(ApiError::unprocessable("hash_mismatch", "the object in S3 does not match sha256").because("object")),
         },
     };
     let id = new_id();
@@ -441,7 +442,7 @@ pub async fn create(
     .await;
     if let Err(e) = res {
         return Err(match &e {
-            sqlx::Error::Database(d) if d.is_unique_violation() => ApiError::conflict("name_taken", "the folder already has a file with that name"),
+            sqlx::Error::Database(d) if d.is_unique_violation() => ApiError::conflict("name_taken", "the folder already has a file with that name").because("file"),
             _ => e.into(),
         });
     }
@@ -554,11 +555,11 @@ pub async fn replace(
         check_sha(h)?;
     }
     if input.mime.trim().is_empty() {
-        return Err(ApiError::bad_request("mime is required"));
+        return Err(ApiError::bad_request("mime is required").because("mime_required"));
     }
     let (m, tree, _) = editable(&s, &p, &id).await?;
     if input.kind.as_str() != m.kind {
-        return Err(ApiError::unprocessable("kind_mismatch", format!("a {} can only be replaced with another {}", m.kind, m.kind)));
+        return Err(ApiError::unprocessable("kind_mismatch", format!("a {} can only be replaced with another {}", m.kind, m.kind)).with("kind", &m.kind));
     }
     let folder = m.folder_id.clone().unwrap_or_default();
     let name = library::check_name(&input.name)?;
@@ -566,7 +567,7 @@ pub async fn replace(
     if let Some(t) = &input.thumbnail_sha256 {
         check_sha(t)?;
         if tokio::fs::metadata(s.blob_path(t)).await.is_err() {
-            return Err(ApiError::unprocessable("blob_missing", "thumbnail blob has not been uploaded"));
+            return Err(ApiError::unprocessable("blob_missing", "thumbnail blob has not been uploaded").because("thumbnail"));
         }
     }
     let folder_path = tree.path(&folder);
@@ -585,7 +586,7 @@ pub async fn replace(
                 let staged = s.blob_path(&input.sha256);
                 let meta = tokio::fs::metadata(&staged)
                     .await
-                    .map_err(|_| ApiError::unprocessable("blob_missing", "the file has not been uploaded"))?;
+                    .map_err(|_| ApiError::unprocessable("blob_missing", "the file has not been uploaded").because("file"))?;
                 if matches!(backend, Backend::Local(_)) {
                     library::ensure_space(&s, &lib, meta.len() as i64).await?;
                     if path != m.path {
@@ -598,11 +599,11 @@ pub async fn replace(
             Backend::S3(b) => {
                 let staging = staging_path(&folder_path, &m.id, &input.sha256);
                 let size = match b.head(&staging).await? {
-                    None => return Err(ApiError::unprocessable("blob_missing", "the file has not been uploaded to S3")),
+                    None => return Err(ApiError::unprocessable("blob_missing", "the file has not been uploaded to S3").because("file")),
                     Some((size, sha)) if sha.as_deref() == Some(input.sha256.as_str()) => size,
                     Some(_) => {
                         b.delete(&staging).await?;
-                        return Err(ApiError::unprocessable("hash_mismatch", "the object in S3 does not match sha256"));
+                        return Err(ApiError::unprocessable("hash_mismatch", "the object in S3 does not match sha256").because("object"));
                     }
                 };
                 b.copy(&staging, &path).await?;

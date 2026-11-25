@@ -1,7 +1,8 @@
+use crate::error::ApiQuery;
 use std::collections::{HashMap, HashSet};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -103,7 +104,7 @@ pub struct ListQuery {
     team_id: Option<String>,
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Screen>>> {
+pub async fn list(State(s): State<AppState>, p: Principal, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult<Json<Vec<Screen>>> {
     super::assignments::require_user(&p)?;
     let w = World::load(&s).await?;
     if let Some(t) = &q.team_id {
@@ -132,7 +133,7 @@ pub async fn get(State(s): State<AppState>, p: Principal, Path(id): Path<String>
 async fn check_playlist(s: &AppState, w: &World, p: &Principal, screen: &str, playlist: Option<&str>) -> ApiResult<i64> {
     let Some(pid) = playlist else { return Ok(0) };
     let found: Option<(i64, String)> = sqlx::query_as("SELECT version, team_id FROM playlists WHERE id = ?").bind(pid).fetch_optional(&s.db).await?;
-    let unavailable = || ApiError::unprocessable("playlist_unavailable", "playlist is not one of your team's playlists available on this screen");
+    let unavailable = || ApiError::unprocessable("playlist_unavailable", "playlist is not one of your team's playlists available on this screen").because("not_on_screen");
     let (version, team) = found.ok_or_else(unavailable)?;
     if !(p.is_device() || p.edits_team(&team)) || !w.available(pid, screen) {
         return Err(unavailable());
@@ -151,7 +152,7 @@ pub async fn patch(
     p.require_operate(&w, &id)?;
     let actor = Actor::of(&p, &w, &id);
     let name = match &patch.name {
-        Some(n) if n.trim().is_empty() => return Err(ApiError::bad_request("name must not be empty")),
+        Some(n) if n.trim().is_empty() => return Err(ApiError::bad_request("name must not be empty").because("name_empty")),
         Some(n) => Some(n.trim().to_string()),
         None => None,
     };
@@ -168,7 +169,7 @@ pub async fn patch(
     }
     if let Some(Some(pl)) = &patch.placement {
         if !(0.0..=1.0).contains(&pl.x) || !(0.0..=1.0).contains(&pl.y) {
-            return Err(ApiError::bad_request("placement x and y must be between 0 and 1"));
+            return Err(ApiError::bad_request("placement x and y must be between 0 and 1").because("placement_invalid"));
         }
         let found: Option<(String,)> = sqlx::query_as("SELECT id FROM floor_plans WHERE id = ?").bind(&pl.floor_plan_id).fetch_optional(&s.db).await?;
         if found.is_none() {
@@ -279,7 +280,7 @@ struct EventRow {
     created_at: String,
 }
 
-pub async fn events(State(s): State<AppState>, p: Principal, Path(id): Path<String>, Query(q): Query<EventsQuery>) -> ApiResult<Json<Vec<Value>>> {
+pub async fn events(State(s): State<AppState>, p: Principal, Path(id): Path<String>, ApiQuery(q): ApiQuery<EventsQuery>) -> ApiResult<Json<Vec<Value>>> {
     let w = World::load(&s).await?;
     fetch_row(&s, &id).await?;
     if !p.sees_screen(&w, &id) {
@@ -431,7 +432,7 @@ pub async fn bulk_override(State(s): State<AppState>, p: Principal, ApiJson(inpu
     if let (false, Some(pl)) = (input.clear, &input.playlist_id) {
         let team: Option<(String,)> = sqlx::query_as("SELECT team_id FROM playlists WHERE id = ?").bind(pl).fetch_optional(&s.db).await?;
         if !team.is_some_and(|(t,)| p.edits_team(&t)) {
-            return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not one of your team's playlists"));
+            return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not one of your team's playlists").because("not_team_playlist"));
         }
     }
     let mut warnings = vec![];
@@ -544,10 +545,10 @@ pub async fn command(
 /// Validates a command and delivers it to the node that plays the screen.
 pub fn send_command(s: &AppState, row: &ScreenRow, cmd: &ScreenCommand) -> ApiResult<StatusCode> {
     if matches!(cmd.name, CommandName::Jump) && cmd.item_index.is_none_or(|i| i < 0) {
-        return Err(ApiError::bad_request("jump requires a non-negative item_index"));
+        return Err(ApiError::bad_request("jump requires a non-negative item_index").because("item_index_invalid"));
     }
     if cmd.step_index.is_some_and(|i| i < 0) {
-        return Err(ApiError::bad_request("step_index must not be negative"));
+        return Err(ApiError::bad_request("step_index must not be negative").because("step_index_invalid"));
     }
     let delivered = row.node_id.as_deref().is_some_and(|n| {
         s.hub.send_node(n, &json!({ "type": "command", "screen_id": row.id, "command": cmd }))

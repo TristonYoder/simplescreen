@@ -1,6 +1,7 @@
+use crate::error::ApiQuery;
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -49,11 +50,11 @@ pub async fn start(State(s): State<AppState>, body: Bytes) -> ApiResult<(StatusC
     let input: StartInput = if body.iter().all(|b| b.is_ascii_whitespace()) {
         StartInput::default()
     } else {
-        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()).because("invalid_body"))?
     };
     let mode = input.mode.unwrap_or_default();
     if matches!(input.kind, PairingKind::Single) && mode != crate::assignments::Mode::Player {
-        return Err(ApiError::bad_request("mode only applies to kind node; single-screen devices are players"));
+        return Err(ApiError::bad_request("mode only applies to kind node; single-screen devices are players").because("mode_needs_node"));
     }
     let kind = match input.kind {
         PairingKind::Single => "single",
@@ -110,7 +111,7 @@ pub async fn claim(
         return Err(ApiError::forbidden());
     }
     if input.name.trim().is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     let code = input.code.trim().to_uppercase();
     let pairing: Option<(String, String, String)> = sqlx::query_as(
@@ -123,7 +124,7 @@ pub async fn claim(
     let (pairing_id, kind, mode) = pairing.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "pairing_not_found", "unknown or expired code"))?;
     let single = kind == "single";
     if !single && (input.playlist_id.is_some() || input.tag_ids.is_some()) {
-        return Err(ApiError::bad_request("tag_ids and playlist_id only apply to single-screen pairings"));
+        return Err(ApiError::bad_request("tag_ids and playlist_id only apply to single-screen pairings").because("single_screen_only"));
     }
     let tags = reach::check_tags(&s, input.tag_ids.as_deref().unwrap_or_default()).await?;
     let w = World::load(&s).await?;
@@ -131,7 +132,7 @@ pub async fn claim(
         // An editor's new screen must land in their reach, with only tags their teams hold.
         let held = |t: &String| p.memberships.iter().any(|m| m.role >= Role::Editor && w.team_holds(&m.team_id, t));
         if let Some(t) = tags.iter().find(|t| !held(t)) {
-            return Err(ApiError::unprocessable("invalid_tag", format!("tag {t} is not held by a team you edit")));
+            return Err(ApiError::unprocessable("invalid_tag", format!("tag {t} is not held by a team you edit")).because("tag_not_editable").with("tag", t));
         }
         let reached = p.memberships.iter().any(|m| {
             m.role >= Role::Editor && w.teams.get(&m.team_id).is_some_and(|team| tags.iter().any(|t| team.tags.contains(t)) || (team.all && !tags.is_empty()))
@@ -144,7 +145,7 @@ pub async fn claim(
         let found: Option<(String,)> = sqlx::query_as("SELECT team_id FROM playlists WHERE id = ?").bind(pid).fetch_optional(&s.db).await?;
         let shares = w.playlist_tags.get(pid).is_some_and(|pt| tags.iter().any(|t| pt.contains(t)));
         if !found.is_some_and(|(team,)| p.edits_team(&team)) || !shares {
-            return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not one of your team's playlists available on this screen"));
+            return Err(ApiError::unprocessable("playlist_unavailable", "playlist is not one of your team's playlists available on this screen").because("not_on_screen"));
         }
     }
 
@@ -239,7 +240,7 @@ struct PairingRow {
 pub async fn poll(
     State(s): State<AppState>,
     Path(id): Path<String>,
-    Query(q): Query<PollQuery>,
+    ApiQuery(q): ApiQuery<PollQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let row: PairingRow =
         sqlx::query_as("SELECT secret_hash, expires_at, node_id, screen_id, device_token FROM pairings WHERE id = ?")

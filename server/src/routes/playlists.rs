@@ -1,7 +1,8 @@
+use crate::error::ApiQuery;
 use std::collections::{HashMap, HashSet};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -50,13 +51,13 @@ pub fn visible(p: &Principal, w: &World, playlist: &str, team: &str) -> bool {
 pub async fn list(
     State(s): State<AppState>,
     p: Principal,
-    Query(q): Query<ListQuery>,
+    ApiQuery(q): ApiQuery<ListQuery>,
 ) -> ApiResult<Json<Vec<Summary>>> {
     let all = summaries(&s, q.team_id.as_deref()).await?;
     let wide = match q.scope.as_deref() {
         None | Some("mine") => false,
         Some("visible") => true,
-        Some(_) => return Err(ApiError::bad_request("scope must be mine or visible")),
+        Some(_) => return Err(ApiError::bad_request("scope must be mine or visible").because("scope_invalid")),
     };
     let w = if wide { Some(World::load(&s).await?) } else { None };
     Ok(Json(
@@ -126,7 +127,7 @@ async fn check_folder(s: &AppState, team_id: &str, folder: Option<&str>) -> ApiR
     let Some(f) = folder else { return Ok(()) };
     let found: Option<(String,)> =
         sqlx::query_as("SELECT id FROM playlist_folders WHERE id = ? AND team_id = ?").bind(f).bind(team_id).fetch_optional(&s.db).await?;
-    found.map(|_| ()).ok_or_else(|| ApiError::unprocessable("invalid_folder", "folder does not exist in the team"))
+    found.map(|_| ()).ok_or_else(|| ApiError::unprocessable("invalid_folder", "folder does not exist in the team").because("folder_unknown"))
 }
 
 #[derive(Deserialize)]
@@ -165,7 +166,7 @@ pub async fn put_tags(
     let w = World::load(&s).await?;
     if !p.server_admin {
         if let Some(t) = tags.iter().find(|t| !w.team_holds(&current.team_id, t)) {
-            return Err(ApiError::unprocessable("invalid_tag", format!("tag {t} is not held by the playlist's team")));
+            return Err(ApiError::unprocessable("invalid_tag", format!("tag {t} is not held by the playlist's team")).because("tag_not_held").with("tag", t));
         }
     }
     let before = w.playlist_screens(&id);
@@ -211,42 +212,42 @@ async fn validate(
         rows.into_iter().filter(|(id, _)| usable.contains(id) || existing.contains(id)).collect();
     let check = |id: &Uuid, kind: &str| -> ApiResult<()> {
         match media.get(&id.to_string()) {
-            None => Err(invalid(format!("media {id} is not in a folder this team reaches"))),
+            None => Err(invalid(format!("media {id} is not in a folder this team reaches")).because("media_unreachable").with("media", id)),
             Some(k) if k == kind => Ok(()),
-            Some(k) => Err(invalid(format!("media {id} is {k}, expected {kind}"))),
+            Some(k) => Err(invalid(format!("media {id} is {k}, expected {kind}")).because("media_kind").with("media", id).with("kind", k).with("expected", kind)),
         }
     };
 
     if defaults.transition.duration_ms > 10000 {
-        return Err(invalid("transition duration_ms must be <= 10000"));
+        return Err(invalid("transition duration_ms must be <= 10000").because("transition_too_long"));
     }
     let mut index: HashMap<Uuid, usize> = HashMap::new();
     for (i, item) in items.iter_mut().enumerate() {
         let id = *item.id.get_or_insert_with(Uuid::new_v4);
         if index.insert(id, i).is_some() {
-            return Err(invalid(format!("duplicate item id {id}")));
+            return Err(invalid(format!("duplicate item id {id}")).because("item_repeated").with("item_id", id));
         }
         match item.kind {
             ItemKind::Video | ItemKind::Image => {
-                let m = item.media_id.as_ref().ok_or_else(|| invalid(format!("item {i} requires media_id")))?;
+                let m = item.media_id.as_ref().ok_or_else(|| invalid(format!("item {i} requires media_id")).because("item_needs_media").with("item", i))?;
                 check(m, if item.kind == ItemKind::Video { "video" } else { "image" })?;
                 if item.pages.is_some() {
-                    return Err(invalid(format!("item {i} must not have pages")));
+                    return Err(invalid(format!("item {i} must not have pages")).because("item_has_pages").with("item", i));
                 }
             }
             ItemKind::Sequence => {
                 let pages = item.pages.as_ref().filter(|p| !p.is_empty());
-                let pages = pages.ok_or_else(|| invalid(format!("item {i} requires pages")))?;
+                let pages = pages.ok_or_else(|| invalid(format!("item {i} requires pages")).because("item_needs_pages").with("item", i))?;
                 for m in pages {
                     check(m, "image")?;
                 }
             }
         }
         if item.volume.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
-            return Err(invalid(format!("item {i} volume must be within 0..1")));
+            return Err(invalid(format!("item {i} volume must be within 0..1")).because("item_volume").with("item", i));
         }
         if item.transition.as_ref().is_some_and(|t| t.duration_ms > 10000) {
-            return Err(invalid(format!("item {i} transition duration_ms must be <= 10000")));
+            return Err(invalid(format!("item {i} transition duration_ms must be <= 10000")).because("item_transition_too_long").with("item", i));
         }
     }
 
@@ -254,26 +255,26 @@ async fn validate(
     for (b, bed) in beds.iter_mut().enumerate() {
         bed.id.get_or_insert_with(Uuid::new_v4);
         if bed.tracks.is_empty() {
-            return Err(invalid(format!("bed {b} requires at least one track")));
+            return Err(invalid(format!("bed {b} requires at least one track")).because("bed_needs_track").with("bed", b));
         }
         for t in &bed.tracks {
             check(t, "audio")?;
         }
         for v in [bed.volume, bed.duck_volume] {
             if !(0.0..=1.0).contains(&v) {
-                return Err(invalid(format!("bed {b} volumes must be within 0..1")));
+                return Err(invalid(format!("bed {b} volumes must be within 0..1")).because("bed_volume").with("bed", b));
             }
         }
-        let start = *index.get(&bed.start_item_id).ok_or_else(|| invalid(format!("bed {b} start item unknown")))?;
-        let end = *index.get(&bed.end_item_id).ok_or_else(|| invalid(format!("bed {b} end item unknown")))?;
+        let start = *index.get(&bed.start_item_id).ok_or_else(|| invalid(format!("bed {b} start item unknown")).because("bed_start_unknown").with("bed", b))?;
+        let end = *index.get(&bed.end_item_id).ok_or_else(|| invalid(format!("bed {b} end item unknown")).because("bed_end_unknown").with("bed", b))?;
         if start > end {
-            return Err(invalid(format!("bed {b} start item comes after end item")));
+            return Err(invalid(format!("bed {b} start item comes after end item")).because("bed_reversed").with("bed", b));
         }
         ranges.push((start, end));
     }
     ranges.sort();
     if ranges.windows(2).any(|w| w[1].0 <= w[0].1) {
-        return Err(invalid("bed ranges overlap"));
+        return Err(invalid("bed ranges overlap").because("beds_overlap"));
     }
     Ok(())
 }
@@ -297,7 +298,7 @@ pub async fn create(
 ) -> ApiResult<(StatusCode, Json<Playlist>)> {
     s.require_team(&p, &input.team_id, Role::Editor).await?;
     if input.name.trim().is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     let defaults = input.defaults.take().unwrap_or_default();
     validate(&s, &input.team_id, &HashSet::new(), &defaults, &mut input.items, &mut input.beds).await?;
@@ -340,7 +341,7 @@ pub async fn update(
     let current = fetch(&s, &id).await?;
     p.require(&current.team_id, Role::Editor)?;
     let conflict = |cur: &Playlist| -> ApiError {
-        let mut e = ApiError::conflict("version_conflict", "playlist was modified; base_version is stale");
+        let mut e = ApiError::conflict("version_conflict", "playlist was modified; base_version is stale").because("playlist");
         e.current = serde_json::to_value(cur).ok();
         e
     };
@@ -348,7 +349,7 @@ pub async fn update(
         return Err(conflict(&current));
     }
     if input.name.trim().is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     let existing: Vec<(String,)> =
         sqlx::query_as("SELECT media_id FROM playlist_media WHERE playlist_id = ?").bind(&id).fetch_all(&s.db).await?;

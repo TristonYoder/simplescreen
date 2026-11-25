@@ -1,7 +1,8 @@
+use crate::error::ApiQuery;
 use std::collections::HashSet;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -43,7 +44,7 @@ fn folder_json(tree: &Tree, id: &str, access: Access) -> Value {
 
 fn name_taken(e: sqlx::Error) -> ApiError {
     match &e {
-        sqlx::Error::Database(d) if d.is_unique_violation() => ApiError::conflict("name_taken", "that name is already used here"),
+        sqlx::Error::Database(d) if d.is_unique_violation() => ApiError::conflict("name_taken", "that name is already used here").because("folder"),
         _ => e.into(),
     }
 }
@@ -54,7 +55,7 @@ pub struct ListQuery {
     team_id: Option<String>,
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Value>>> {
+pub async fn list(State(s): State<AppState>, p: Principal, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult<Json<Vec<Value>>> {
     super::assignments::require_user(&p)?;
     if let Some(t) = &q.team_id {
         s.require_team(&p, t, Role::Viewer).await?;
@@ -126,7 +127,7 @@ pub async fn create(
         Some(pid) => {
             let parent = tree.get(pid)?;
             if parent.library_id != lib.id {
-                return Err(ApiError::unprocessable("invalid_folder", "the parent folder is in another library"));
+                return Err(ApiError::unprocessable("invalid_folder", "the parent folder is in another library").because("parent_other_library"));
             }
             tree.require(&p, &w, pid, Access::Edit)?;
             format!("{}/{name}", tree.path(pid))
@@ -184,7 +185,7 @@ pub async fn patch(
         Some(Some(pid)) => {
             let target = tree.get(pid)?;
             if target.library_id != folder.library_id || tree.subtree(&id).contains(pid) {
-                return Err(ApiError::unprocessable("invalid_folder", "a folder can't move into itself, a subfolder, or another library"));
+                return Err(ApiError::unprocessable("invalid_folder", "a folder can't move into itself, a subfolder, or another library").because("move_invalid"));
             }
             tree.require(&p, &w, pid, Access::Edit)?;
             Some(pid.clone())
@@ -208,7 +209,7 @@ pub async fn patch(
     .fetch_optional(&s.db)
     .await?;
     if taken.is_some() {
-        return Err(ApiError::conflict("name_taken", "that name is already used here"));
+        return Err(ApiError::conflict("name_taken", "that name is already used here").because("folder"));
     }
     let lib = library::library(&s, &folder.library_id).await?;
     if !old_path.eq(&new_path) {
@@ -283,7 +284,7 @@ pub async fn put_tags(
     for t in &new {
         let found: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE id = ?").bind(t).fetch_optional(&s.db).await?;
         if found.is_none() {
-            return Err(ApiError::unprocessable("unknown_tag", format!("tag {t} does not exist")));
+            return Err(ApiError::unprocessable("unknown_tag", format!("tag {t} does not exist")).with("tag", t));
         }
     }
     let old = tree.tags.get(&id).cloned().unwrap_or_default();
@@ -325,7 +326,7 @@ pub async fn put_grants(
     let new: HashSet<String> = input.team_ids.into_iter().collect();
     for t in &new {
         if !w.teams.contains_key(t) {
-            return Err(ApiError::unprocessable("unknown_team", format!("team {t} does not exist")));
+            return Err(ApiError::unprocessable("unknown_team", format!("team {t} does not exist")).with("team", t));
         }
     }
     let mut tx = s.db.begin().await?;

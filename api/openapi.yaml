@@ -2296,8 +2296,73 @@ components:
       properties:
         code:
           type: string
-          description: Stable machine code, e.g. `not_found`, `version_conflict`, `hash_mismatch`.
-        message: { type: string }
+          description: |
+            Stable machine code. Clients word their own messages from `code`, `reason` and `params`;
+            `message` is English for logs and API users. Codes and the reasons each can carry:
+            - `audio_conflict`: `one_output`, `other_device`
+            - `bad_request`: `claim_value_empty`, `claim_value_repeated`, `folder_mismatch`, `image_size_invalid`, `invalid_body`, `invalid_query`, `item_index_invalid`, `kind_invalid`, `mime_required`, `name_empty`, `name_invalid`, `org_name_empty`, `part_batch_invalid`, `part_number_invalid`, `part_size_invalid`, `path_only_local`, `placement_invalid`, `quota_negative`, `s3_bucket_invalid`, `s3_endpoint_invalid`, `s3_only_s3`, `s3_settings_incomplete`, `scope_invalid`, `screen_access_invalid`, `sha256_invalid`, `single_screen_only`, `size_negative`, `step_index_invalid`, `timeline_range_invalid`, `upload_interrupted`
+            - `blob_missing`: `file`, `image`, `thumbnail`
+            - `control_needs_input`
+            - `file_too_large`
+            - `forbidden`
+            - `hash_mismatch`: `joined`, `object`, `upload`
+            - `insufficient_storage`
+            - `internal`
+            - `invalid_assignments`: `clock_invalid`, `output_key_empty`, `output_repeated`
+            - `invalid_floor_plan`
+            - `invalid_folder`: `folder_unknown`, `move_into_self`, `move_invalid`, `parent_other_library`, `parent_unknown`
+            - `invalid_outputs`: `output_empty`, `output_repeated`
+            - `invalid_override`
+            - `invalid_playlist`: `bed_end_unknown`, `bed_needs_track`, `bed_reversed`, `bed_start_unknown`, `bed_volume`, `beds_overlap`, `item_has_pages`, `item_needs_media`, `item_needs_pages`, `item_repeated`, `item_transition_too_long`, `item_volume`, `media_kind`, `media_unreachable`, `playlist_unknown`, `transition_too_long`
+            - `invalid_schedule`: `date_invalid`, `datetime_invalid`, `days_invalid`, `end_before_start`, `entry_unknown`, `range_reversed`, `screens_unreachable`, `tags_not_held`, `tags_unknown`, `team_locked`, `time_invalid`
+            - `invalid_tag`: `tag_not_editable`, `tag_not_held`, `tag_unknown`
+            - `invalid_timezone`
+            - `job_not_allowed_in_mode`: `mode_jobs`, `screens_need_player`
+            - `kind_mismatch`
+            - `library_managed`
+            - `library_not_empty`: `bucket_locked`, `has_folders`, `path_locked`
+            - `media_missing`
+            - `name_taken`: `file`, `folder`
+            - `no_screens`
+            - `not_found`
+            - `not_supported`: `single_organization`
+            - `organization_not_found`
+            - `output_has_screen`
+            - `pairing_not_found`
+            - `path_not_allowed`: `path_not_absolute`, `path_outside_roots`
+            - `playlist_unavailable`: `not_on_screen`, `not_team_playlist`
+            - `schedule_conflict`
+            - `screen_id_required`
+            - `screen_must_be_local`
+            - `screen_offline`
+            - `screen_required`
+            - `setting_locked`: `org_name`, `timezone`
+            - `storage_unreachable`: `probe_failed`, `s3`
+            - `tag_exists`
+            - `tag_not_held`
+            - `tag_required`
+            - `target_not_assigned`
+            - `team_not_empty`
+            - `unauthorized`
+            - `unknown_node`
+            - `unknown_output`
+            - `unknown_screen`
+            - `unknown_tag`
+            - `unknown_team`
+            - `upload_incomplete`: `not_joined`, `part_unsigned`, `s3_refused`
+            - `version_conflict`: `assignments`, `playlist`
+        reason:
+          type: string
+          description: Finer cause within `code` (listed under `code`). Absent when the code has one cause.
+        params:
+          type: object
+          additionalProperties: true
+          description: |
+            Values the message refers to, by reason: `item`/`bed` (0-based index), `item_id`, `media`,
+            `kind`/`expected` (media kinds), `tag`, `team`, `output`, `mode`, `claim_value`, `part`,
+            `part_count`, `free_bytes` (on `insufficient_storage`), `detail` (raw storage or S3 text).
+        message: { type: string, description: English description for logs; not for display. }
+        free_bytes: { type: integer, format: int64, description: 'Present on `insufficient_storage`.' }
         current:
           description: |
             Present on `version_conflict`. A playlist conflict returns the current Playlist.

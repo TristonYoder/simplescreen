@@ -78,7 +78,7 @@ pub async fn free_bytes(s: &AppState, lib: &LibraryRow) -> ApiResult<Option<i64>
 }
 
 pub fn insufficient(free: i64) -> ApiError {
-    let mut e = ApiError::new(axum::http::StatusCode::INSUFFICIENT_STORAGE, "insufficient_storage", "not enough space in the library");
+    let mut e = ApiError::new(axum::http::StatusCode::INSUFFICIENT_STORAGE, "insufficient_storage", "not enough space in the library").with("free_bytes", free);
     e.extra = Some(json!({ "free_bytes": free }));
     e
 }
@@ -94,7 +94,7 @@ pub async fn ensure_space(s: &AppState, lib: &LibraryRow, size: i64) -> ApiResul
 pub fn check_name(name: &str) -> ApiResult<String> {
     let n = name.trim();
     if n.is_empty() || n.len() > 255 || n.starts_with('.') || n.contains(['/', '\\', '\0']) {
-        return Err(ApiError::bad_request("names can't be empty, start with a dot, or contain / or \\"));
+        return Err(ApiError::bad_request("names can't be empty, start with a dot, or contain / or \\").because("name_invalid"));
     }
     Ok(n.to_string())
 }

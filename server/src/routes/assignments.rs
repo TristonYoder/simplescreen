@@ -151,7 +151,7 @@ pub async fn move_screen(
     p.require_operate(&w, &id)?;
     let target = nodes::fetch_row(&s, &input.node_id).await.map_err(|_| ApiError::unprocessable("unknown_node", "node does not exist"))?;
     if Mode::parse(&target.mode) != Mode::Player {
-        return Err(ApiError::unprocessable("job_not_allowed_in_mode", "only player devices can play screens"));
+        return Err(ApiError::unprocessable("job_not_allowed_in_mode", "only player devices can play screens").because("screens_need_player"));
     }
     let outputs: Vec<Output> = nodes::outputs_of(&target);
     if !outputs.iter().any(|o| o.key == input.output_key) {

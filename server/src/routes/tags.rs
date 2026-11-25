@@ -42,7 +42,7 @@ fn exists(e: sqlx::Error) -> ApiError {
 fn clean_name(name: &str) -> ApiResult<String> {
     let n = name.trim();
     if n.is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     Ok(n.to_string())
 }

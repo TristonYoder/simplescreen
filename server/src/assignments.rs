@@ -229,28 +229,30 @@ async fn check(
     let mut keys = HashSet::new();
     for a in set {
         if a.output_key.trim().is_empty() {
-            return Err(invalid("output_key must not be empty"));
+            return Err(invalid("output_key must not be empty").because("output_key_empty"));
         }
         if !keys.insert(a.output_key.as_str()) {
-            return Err(invalid(format!("duplicate assignment for output {}", a.output_key)));
+            return Err(invalid(format!("duplicate assignment for output {}", a.output_key)).because("output_repeated").with("output", &a.output_key));
         }
         if a.settings.clock.is_some_and(|c| c != 12 && c != 24) {
-            return Err(invalid("clock must be 12 or 24"));
+            return Err(invalid("clock must be 12 or 24").because("clock_invalid"));
         }
         if mode != Mode::Player && !matches!(a.job, Job::Control | Job::Confidence | Job::Off) {
             return Err(ApiError::unprocessable(
                 "job_not_allowed_in_mode",
                 format!("{} devices can only use control, confidence or off", mode.as_str()),
-            ));
+            )
+            .because("mode_jobs")
+            .with("mode", mode.as_str()));
         }
         if a.job == Job::Off {
             continue;
         }
         let Some(output) = outputs.iter().find(|o| o.key == a.output_key) else {
-            return Err(ApiError::unprocessable("unknown_output", format!("output {} is not in the node's reported outputs", a.output_key)));
+            return Err(ApiError::unprocessable("unknown_output", format!("output {} is not in the node's reported outputs", a.output_key)).with("output", &a.output_key));
         };
         if a.job == Job::Control && matches!(output.kind, OutputKind::Decklink | OutputKind::Virtual) {
-            return Err(ApiError::unprocessable("control_needs_input", format!("output {} cannot take input", output.key)));
+            return Err(ApiError::unprocessable("control_needs_input", format!("output {} cannot take input", output.key)).with("output", &output.key));
         }
         let Some(screen_id) = a.screen_id.as_deref() else {
             if a.job == Job::Program {
@@ -277,7 +279,7 @@ async fn check(
         }
     }
     if audio.values().any(|n| *n > 1) {
-        return Err(ApiError::unprocessable("audio_conflict", "a screen can play audio on one output only"));
+        return Err(ApiError::unprocessable("audio_conflict", "a screen can play audio on one output only").because("one_output"));
     }
     if !audio.is_empty() {
         let others: Vec<(Option<String>, String, String)> = sqlx::query_as(
@@ -292,7 +294,7 @@ async fn check(
             }
             let on = serde_json::from_str::<AssignmentSettings>(&settings).is_ok_and(|x| x.audio_on());
             if on && id.as_deref().is_some_and(|id| audio.contains_key(id)) {
-                return Err(ApiError::unprocessable("audio_conflict", "another device already plays audio for that screen"));
+                return Err(ApiError::unprocessable("audio_conflict", "another device already plays audio for that screen").because("other_device"));
             }
         }
     }
@@ -390,7 +392,7 @@ pub async fn apply_set(
                 .execute(&mut **tx)
                 .await?;
             if res.rows_affected() == 0 {
-                return Err(ApiError::conflict("version_conflict", "assignments were modified; base_version is stale"));
+                return Err(ApiError::conflict("version_conflict", "assignments were modified; base_version is stale").because("assignments"));
             }
             if !claimed.iter().any(|c| c == id) {
                 claimed.push(id.to_string());
@@ -489,7 +491,7 @@ pub async fn sync_reported_outputs(tx: &mut Transaction<'_, Sqlite>, node_id: &s
 }
 
 pub fn version_conflict(current: serde_json::Value) -> ApiError {
-    let mut e = ApiError::conflict("version_conflict", "assignments were modified; base_version is stale");
+    let mut e = ApiError::conflict("version_conflict", "assignments were modified; base_version is stale").because("assignments");
     e.current = Some(current);
     e
 }

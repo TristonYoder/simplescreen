@@ -46,13 +46,13 @@ pub struct FloorPlanInput {
 fn validate(input: &mut FloorPlanInput) -> ApiResult<()> {
     input.name = input.name.trim().to_string();
     if input.name.is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     if input.image_sha256.as_deref().is_some_and(|h| !is_sha256(h)) {
-        return Err(ApiError::bad_request("image_sha256 must be 64 lowercase hex characters"));
+        return Err(ApiError::bad_request("image_sha256 must be 64 lowercase hex characters").because("sha256_invalid"));
     }
     if input.image_width.is_some_and(|w| w < 1) || input.image_height.is_some_and(|h| h < 1) {
-        return Err(ApiError::bad_request("image size must be positive"));
+        return Err(ApiError::bad_request("image size must be positive").because("image_size_invalid"));
     }
     Ok(())
 }
@@ -60,7 +60,7 @@ fn validate(input: &mut FloorPlanInput) -> ApiResult<()> {
 async fn check_blob(s: &AppState, input: &FloorPlanInput) -> ApiResult<()> {
     if let Some(sha) = &input.image_sha256 {
         if tokio::fs::metadata(s.blob_path(sha)).await.is_err() {
-            return Err(ApiError::unprocessable("missing_blob", "upload the image blob first"));
+            return Err(ApiError::unprocessable("blob_missing", "upload the image blob first").because("image"));
         }
     }
     Ok(())

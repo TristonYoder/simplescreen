@@ -1,5 +1,6 @@
+use crate::error::ApiQuery;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -41,7 +42,7 @@ fn invalid(msg: &str) -> ApiError {
 fn clean_name(name: &str) -> ApiResult<String> {
     let n = name.trim();
     if n.is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     Ok(n.to_string())
 }
@@ -56,7 +57,7 @@ pub struct ListQuery {
     team_id: Option<String>,
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<Vec<Folder>>> {
+pub async fn list(State(s): State<AppState>, p: Principal, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult<Json<Vec<Folder>>> {
     if let Some(t) = &q.team_id {
         s.require_team(&p, t, Role::Viewer).await?;
     }
@@ -81,13 +82,13 @@ async fn check_parent(s: &AppState, team_id: &str, parent: Option<&str>, moving:
     let mut cur = parent.map(String::from);
     while let Some(id) = cur {
         if Some(id.as_str()) == moving {
-            return Err(invalid("a folder can't move into itself or a descendant"));
+            return Err(invalid("a folder can't move into itself or a descendant").because("move_into_self"));
         }
         let row: Option<(String, Option<String>)> =
             sqlx::query_as("SELECT team_id, parent_id FROM playlist_folders WHERE id = ?").bind(&id).fetch_optional(&s.db).await?;
         match row {
             Some((t, next)) if t == team_id => cur = next,
-            _ => return Err(invalid("parent folder does not exist in the team")),
+            _ => return Err(invalid("parent folder does not exist in the team").because("parent_unknown")),
         }
     }
     Ok(())

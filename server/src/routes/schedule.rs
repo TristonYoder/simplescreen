@@ -1,7 +1,8 @@
+use crate::error::ApiQuery;
 use std::collections::{BTreeMap, HashSet};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -59,14 +60,14 @@ pub struct ScheduleList {
     entries: Vec<Entry>,
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<ListQuery>) -> ApiResult<Json<ScheduleList>> {
+pub async fn list(State(s): State<AppState>, p: Principal, ApiQuery(q): ApiQuery<ListQuery>) -> ApiResult<Json<ScheduleList>> {
     if let Some(t) = &q.team_id {
         s.require_team(&p, t, Role::Viewer).await?;
     }
     let wide = match q.scope.as_deref() {
         None | Some("mine") => false,
         Some("visible") => true,
-        Some(_) => return Err(ApiError::bad_request("scope must be mine or visible")),
+        Some(_) => return Err(ApiError::bad_request("scope must be mine or visible").because("scope_invalid")),
     };
     let all = schedule::all_entries(&s).await?;
     let w = World::load(&s).await?;
@@ -95,19 +96,19 @@ async fn fetch(s: &AppState, id: &str) -> ApiResult<Entry> {
 async fn validate(s: &AppState, w: &World, input: &mut EntryInput) -> ApiResult<()> {
     if let Some(pid) = &input.playlist_id {
         if w.playlist_team.get(pid) != Some(&input.team_id) {
-            return Err(ApiError::unprocessable("invalid_playlist", "playlist does not exist in the team"));
+            return Err(ApiError::unprocessable("invalid_playlist", "playlist does not exist in the team").because("playlist_unknown"));
         }
     }
     let mut seen = HashSet::new();
     input.screen_ids.retain(|id| seen.insert(id.clone()));
     if input.screen_ids.iter().any(|id| !w.reaches(&input.team_id, id)) {
-        return Err(invalid("screen_ids must be screens the team reaches"));
+        return Err(invalid("screen_ids must be screens the team reaches").because("screens_unreachable"));
     }
     let mut seen = HashSet::new();
     input.tag_ids.retain(|id| seen.insert(id.clone()));
-    crate::reach::check_tags(s, &input.tag_ids).await.map_err(|_| invalid("tag_ids must be existing tags"))?;
+    crate::reach::check_tags(s, &input.tag_ids).await.map_err(|_| invalid("tag_ids must be existing tags").because("tags_unknown"))?;
     if input.tag_ids.iter().any(|t| !w.team_holds(&input.team_id, t)) {
-        return Err(invalid("tag_ids must be tags the team holds"));
+        return Err(invalid("tag_ids must be tags the team holds").because("tags_not_held"));
     }
     input.title = input.title.take().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
     match input.kind {
@@ -115,20 +116,20 @@ async fn validate(s: &AppState, w: &World, input: &mut EntryInput) -> ApiResult<
             input.days.sort();
             input.days.dedup();
             if input.days.is_empty() || input.days.iter().any(|d| !(1..=7).contains(d)) {
-                return Err(invalid("days must list weekdays 1 (Monday) to 7"));
+                return Err(invalid("days must list weekdays 1 (Monday) to 7").because("days_invalid"));
             }
             let (Some(a), Some(b)) = (
                 input.start_time.as_deref().and_then(schedule::parse_time),
                 input.end_time.as_deref().and_then(schedule::parse_time),
             ) else {
-                return Err(invalid("start_time and end_time must be HH:MM or HH:MM:SS"));
+                return Err(invalid("start_time and end_time must be HH:MM or HH:MM:SS").because("time_invalid"));
             };
             input.start_time = Some(schedule::format_time(a));
             input.end_time = Some(schedule::format_time(b));
             let on = |v: &Option<String>| -> ApiResult<Option<chrono::NaiveDate>> {
                 match v {
                     None => Ok(None),
-                    Some(d) => schedule::parse_date(d).map(Some).ok_or_else(|| invalid("dates must be YYYY-MM-DD")),
+                    Some(d) => schedule::parse_date(d).map(Some).ok_or_else(|| invalid("dates must be YYYY-MM-DD").because("date_invalid")),
                 }
             };
             for d in &input.skip_dates {
@@ -138,7 +139,7 @@ async fn validate(s: &AppState, w: &World, input: &mut EntryInput) -> ApiResult<
             input.skip_dates.dedup();
             if let (Some(a), Some(b)) = (on(&input.starts_on)?, on(&input.ends_on)?) {
                 if b < a {
-                    return Err(invalid("ends_on must not be before starts_on"));
+                    return Err(invalid("ends_on must not be before starts_on").because("range_reversed"));
                 }
             }
             input.starts_at = None;
@@ -149,10 +150,10 @@ async fn validate(s: &AppState, w: &World, input: &mut EntryInput) -> ApiResult<
                 input.starts_at.as_deref().and_then(schedule::parse_local),
                 input.ends_at.as_deref().and_then(schedule::parse_local),
             ) else {
-                return Err(invalid("starts_at and ends_at must be YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS"));
+                return Err(invalid("starts_at and ends_at must be YYYY-MM-DDTHH:MM or YYYY-MM-DDTHH:MM:SS").because("datetime_invalid"));
             };
             if b <= a {
-                return Err(invalid("ends_at must be after starts_at"));
+                return Err(invalid("ends_at must be after starts_at").because("end_before_start"));
             }
             input.starts_at = Some(schedule::format_local(a));
             input.ends_at = Some(schedule::format_local(b));
@@ -277,7 +278,7 @@ pub async fn update(
     let current = fetch(&s, &id).await?;
     p.require(&current.team_id, Role::Editor)?;
     if input.team_id != current.team_id {
-        return Err(invalid("team_id cannot change"));
+        return Err(invalid("team_id cannot change").because("team_locked"));
     }
     let w = World::load(&s).await?;
     validate(&s, &w, &mut input).await?;
@@ -369,7 +370,7 @@ pub async fn preview(State(s): State<AppState>, p: Principal, ApiJson(input): Ap
         Some(id) => {
             let e = fetch(&s, id).await?;
             if e.team_id != input.team_id {
-                return Err(invalid("entry_id must be an entry of the team"));
+                return Err(invalid("entry_id must be an entry of the team").because("entry_unknown"));
             }
             Some(e)
         }
@@ -464,12 +465,12 @@ pub struct Timeline {
     screens: Vec<ScreenTimeline>,
 }
 
-pub async fn timeline(State(s): State<AppState>, p: Principal, Query(q): Query<TimelineQuery>) -> ApiResult<Json<Timeline>> {
+pub async fn timeline(State(s): State<AppState>, p: Principal, ApiQuery(q): ApiQuery<TimelineQuery>) -> ApiResult<Json<Timeline>> {
     if let Some(t) = &q.team_id {
         s.require_team(&p, t, Role::Viewer).await?;
     }
     if q.to <= q.from || q.to - q.from > schedule::MAX_RANGE {
-        return Err(ApiError::bad_request("to must be after from and at most 14 days later"));
+        return Err(ApiError::bad_request("to must be after from and at most 14 days later").because("timeline_range_invalid"));
     }
     let tz = s.org_tz();
     let w = World::load(&s).await?;

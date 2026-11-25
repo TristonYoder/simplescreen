@@ -203,7 +203,7 @@ pub async fn check_tags(s: &AppState, ids: &[String]) -> ApiResult<Vec<String>> 
         }
         let found: Option<(String,)> = sqlx::query_as("SELECT id FROM tags WHERE id = ?").bind(id).fetch_optional(&s.db).await?;
         if found.is_none() {
-            return Err(ApiError::unprocessable("invalid_tag", format!("tag {id} does not exist")));
+            return Err(ApiError::unprocessable("invalid_tag", format!("tag {id} does not exist")).because("tag_unknown").with("tag", id));
         }
         out.push(id.clone());
     }
