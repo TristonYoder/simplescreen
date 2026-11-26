@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
     Json,
 };
@@ -8,7 +8,7 @@ use serde_json::json;
 use sqlx::FromRow;
 
 use crate::{
-    auth::{Principal, Role},
+    auth::Principal,
     error::{ApiError, ApiJson, ApiResult},
     state::AppState,
     util::{is_sha256, new_id, now},
@@ -17,7 +17,6 @@ use crate::{
 #[derive(Serialize, FromRow)]
 pub struct FloorPlan {
     id: String,
-    team_id: String,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_sha256: Option<String>,
@@ -29,11 +28,10 @@ pub struct FloorPlan {
     created_at: String,
 }
 
-const COLUMNS: &str = "id, team_id, name, image_sha256, image_width, image_height, position, created_at";
+const COLUMNS: &str = "id, name, image_sha256, image_width, image_height, position, created_at";
 
 #[derive(Deserialize)]
 pub struct FloorPlanInput {
-    team_id: String,
     name: String,
     #[serde(default)]
     image_sha256: Option<String>,
@@ -45,21 +43,16 @@ pub struct FloorPlanInput {
     position: Option<i64>,
 }
 
-#[derive(Deserialize)]
-pub struct TeamQuery {
-    team_id: String,
-}
-
 fn validate(input: &mut FloorPlanInput) -> ApiResult<()> {
     input.name = input.name.trim().to_string();
     if input.name.is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
+        return Err(ApiError::bad_request("name must not be empty").because("name_empty"));
     }
     if input.image_sha256.as_deref().is_some_and(|h| !is_sha256(h)) {
-        return Err(ApiError::bad_request("image_sha256 must be 64 lowercase hex characters"));
+        return Err(ApiError::bad_request("image_sha256 must be 64 lowercase hex characters").because("sha256_invalid"));
     }
     if input.image_width.is_some_and(|w| w < 1) || input.image_height.is_some_and(|h| h < 1) {
-        return Err(ApiError::bad_request("image size must be positive"));
+        return Err(ApiError::bad_request("image size must be positive").because("image_size_invalid"));
     }
     Ok(())
 }
@@ -67,7 +60,7 @@ fn validate(input: &mut FloorPlanInput) -> ApiResult<()> {
 async fn check_blob(s: &AppState, input: &FloorPlanInput) -> ApiResult<()> {
     if let Some(sha) = &input.image_sha256 {
         if tokio::fs::metadata(s.blob_path(sha)).await.is_err() {
-            return Err(ApiError::unprocessable("missing_blob", "upload the image blob first"));
+            return Err(ApiError::unprocessable("blob_missing", "upload the image blob first").because("image"));
         }
     }
     Ok(())
@@ -81,14 +74,13 @@ async fn fetch(s: &AppState, id: &str) -> ApiResult<FloorPlan> {
         .ok_or_else(ApiError::not_found)
 }
 
-fn broadcast(s: &AppState, team_id: &str) {
-    s.hub.broadcast_team(team_id, &json!({ "type": "floor_plans_changed", "team_id": team_id }));
+fn broadcast(s: &AppState) {
+    s.hub.broadcast_all(&json!({ "type": "floor_plans_changed" }));
 }
 
-pub async fn list(State(s): State<AppState>, p: Principal, Query(q): Query<TeamQuery>) -> ApiResult<Json<Vec<FloorPlan>>> {
-    s.require_team(&p, &q.team_id, Role::Viewer).await?;
-    let rows = sqlx::query_as(&format!("SELECT {COLUMNS} FROM floor_plans WHERE team_id = ? ORDER BY position, created_at"))
-        .bind(&q.team_id)
+pub async fn list(State(s): State<AppState>, p: Principal) -> ApiResult<Json<Vec<FloorPlan>>> {
+    super::assignments::require_user(&p)?;
+    let rows = sqlx::query_as(&format!("SELECT {COLUMNS} FROM floor_plans ORDER BY position, created_at"))
         .fetch_all(&s.db)
         .await?;
     Ok(Json(rows))
@@ -99,26 +91,22 @@ pub async fn create(
     p: Principal,
     ApiJson(mut input): ApiJson<FloorPlanInput>,
 ) -> ApiResult<(StatusCode, Json<FloorPlan>)> {
-    s.require_team(&p, &input.team_id, Role::Editor).await?;
+    p.require_admin()?;
     validate(&mut input)?;
     check_blob(&s, &input).await?;
     let position = match input.position {
         Some(n) => n,
         None => {
-            let (max,): (Option<i64>,) = sqlx::query_as("SELECT MAX(position) FROM floor_plans WHERE team_id = ?")
-                .bind(&input.team_id)
-                .fetch_one(&s.db)
-                .await?;
+            let (max,): (Option<i64>,) = sqlx::query_as("SELECT MAX(position) FROM floor_plans").fetch_one(&s.db).await?;
             max.map_or(0, |m| m + 1)
         }
     };
     let id = new_id();
     sqlx::query(
-        "INSERT INTO floor_plans (id, team_id, name, image_sha256, image_width, image_height, position, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO floor_plans (id, name, image_sha256, image_width, image_height, position, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(&input.team_id)
     .bind(&input.name)
     .bind(&input.image_sha256)
     .bind(input.image_width)
@@ -127,7 +115,7 @@ pub async fn create(
     .bind(now())
     .execute(&s.db)
     .await?;
-    broadcast(&s, &input.team_id);
+    broadcast(&s);
     Ok((StatusCode::CREATED, Json(fetch(&s, &id).await?)))
 }
 
@@ -138,10 +126,7 @@ pub async fn update(
     ApiJson(mut input): ApiJson<FloorPlanInput>,
 ) -> ApiResult<Json<FloorPlan>> {
     let existing = fetch(&s, &id).await?;
-    p.require(&existing.team_id, Role::Editor)?;
-    if input.team_id != existing.team_id {
-        return Err(ApiError::unprocessable("team_mismatch", "a floor plan can't move between teams"));
-    }
+    p.require_admin()?;
     validate(&mut input)?;
     check_blob(&s, &input).await?;
     sqlx::query("UPDATE floor_plans SET name = ?, image_sha256 = ?, image_width = ?, image_height = ?, position = ? WHERE id = ?")
@@ -153,13 +138,13 @@ pub async fn update(
         .bind(&id)
         .execute(&s.db)
         .await?;
-    broadcast(&s, &existing.team_id);
+    broadcast(&s);
     Ok(Json(fetch(&s, &id).await?))
 }
 
 pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<String>) -> ApiResult<StatusCode> {
-    let existing = fetch(&s, &id).await?;
-    p.require(&existing.team_id, Role::Editor)?;
+    p.require_admin()?;
+    fetch(&s, &id).await?;
     let mut tx = s.db.begin().await?;
     sqlx::query("UPDATE screens SET placement_plan_id = NULL, placement_x = NULL, placement_y = NULL WHERE placement_plan_id = ?")
         .bind(&id)
@@ -167,6 +152,6 @@ pub async fn delete(State(s): State<AppState>, p: Principal, Path(id): Path<Stri
         .await?;
     sqlx::query("DELETE FROM floor_plans WHERE id = ?").bind(&id).execute(&mut *tx).await?;
     tx.commit().await?;
-    broadcast(&s, &existing.team_id);
+    broadcast(&s);
     Ok(StatusCode::NO_CONTENT)
 }

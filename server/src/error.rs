@@ -13,11 +13,18 @@ pub struct ApiError {
     pub code: &'static str,
     pub message: String,
     pub current: Option<Value>,
+    pub conflicts: Option<Value>,
+    /// Extra top-level fields for the body.
+    pub extra: Option<Value>,
+    /// Finer-grained machine reason within `code`, for clients that word their own messages.
+    pub reason: Option<&'static str>,
+    /// Values the message mentions (item index, tag id, output key...).
+    pub params: serde_json::Map<String, Value>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), current: None }
+        Self { status, code, message: message.into(), current: None, conflicts: None, extra: None, reason: None, params: Default::default() }
     }
     pub fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid token")
@@ -43,6 +50,14 @@ impl ApiError {
     pub fn conflict(code: &'static str, msg: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, code, msg)
     }
+    pub fn because(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+    pub fn with(mut self, key: &str, value: impl serde::Serialize) -> Self {
+        self.params.insert(key.to_string(), serde_json::to_value(value).unwrap_or(Value::Null));
+        self
+    }
     pub fn internal(err: impl std::fmt::Display) -> Self {
         tracing::error!("internal error: {err}");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error")
@@ -52,8 +67,22 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = json!({ "code": self.code, "message": self.message });
+        if let Some(reason) = self.reason {
+            body["reason"] = json!(reason);
+        }
+        if !self.params.is_empty() {
+            body["params"] = Value::Object(self.params);
+        }
         if let Some(cur) = self.current {
             body["current"] = cur;
+        }
+        if let Some(c) = self.conflicts {
+            body["conflicts"] = c;
+        }
+        if let Some(Value::Object(extra)) = self.extra {
+            for (k, v) in extra {
+                body[k] = v;
+            }
         }
         (self.status, Json(body)).into_response()
     }
@@ -84,7 +113,20 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for ApiJson<T> {
     async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(Self(v)),
-            Err(e) => Err(ApiError::bad_request(e.body_text())),
+            Err(e) => Err(ApiError::bad_request(e.body_text()).because("invalid_body")),
+        }
+    }
+}
+
+/// `Query` with JSON error bodies.
+pub struct ApiQuery<T>(pub T);
+
+impl<S: Send + Sync, T: DeserializeOwned> axum::extract::FromRequestParts<S> for ApiQuery<T> {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, state: &S) -> Result<Self, ApiError> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(v)) => Ok(Self(v)),
+            Err(e) => Err(ApiError::bad_request(e.body_text()).because("invalid_query")),
         }
     }
 }

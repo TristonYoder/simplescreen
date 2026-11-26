@@ -4,10 +4,14 @@ pub mod bonjour;
 pub mod config;
 pub mod error;
 pub mod hub;
+pub mod library;
 pub mod models;
+pub mod notices;
+pub mod reach;
 pub mod routes;
 pub mod schedule;
 pub mod state;
+pub mod storage;
 pub mod util;
 
 pub const BRAND_NAME: &str = env!("BRAND_NAME");

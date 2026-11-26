@@ -16,6 +16,8 @@ use tokio_util::io::ReaderStream;
 use crate::{
     auth::Principal,
     error::{ApiError, ApiResult},
+    library,
+    storage::Backend,
     state::AppState,
     util::{is_sha256, new_id},
 };
@@ -27,19 +29,26 @@ pub async fn put(
     State(s): State<AppState>,
     p: Principal,
     Path(sha): Path<String>,
+    headers: HeaderMap,
     body: Body,
 ) -> ApiResult<Response> {
     if !p.is_editor_anywhere() {
         return Err(ApiError::forbidden());
     }
     if !is_sha256(&sha) {
-        return Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters"));
+        return Err(ApiError::bad_request("sha256 must be 64 lowercase hex characters").because("sha256_invalid"));
     }
     let dest = s.blob_path(&sha);
     if let Ok(meta) = tokio::fs::metadata(&dest).await {
         return Ok((StatusCode::OK, Json(json!({ "sha256": sha, "size": meta.len() }))).into_response());
     }
 
+    let len: Option<i64> = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+    if let (Some(len), Some(free)) = (len, crate::storage::disk_free(&s.cfg.data_dir)) {
+        if free < len {
+            return Err(library::insufficient(free));
+        }
+    }
     let tmp = s.tmp_dir().join(new_id());
     let result = write_stream(&tmp, body).await;
     let (hash, size) = match result {
@@ -51,7 +60,7 @@ pub async fn put(
     };
     if hash != sha {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(ApiError::unprocessable("hash_mismatch", "uploaded bytes do not match the sha256 in the path"));
+        return Err(ApiError::unprocessable("hash_mismatch", "uploaded bytes do not match the sha256 in the path").because("upload"));
     }
     if let Some(dir) = dest.parent() {
         tokio::fs::create_dir_all(dir).await?;
@@ -70,7 +79,7 @@ async fn write_stream(tmp: &std::path::Path, body: Body) -> ApiResult<(String, u
     let mut size = 0u64;
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload interrupted: {e}")))?;
+        let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload interrupted: {e}")).because("upload_interrupted"))?;
         hasher.update(&chunk);
         size += chunk.len() as u64;
         out.write_all(&chunk).await?;
@@ -78,6 +87,35 @@ async fn write_stream(tmp: &std::path::Path, body: Body) -> ApiResult<(String, u
     out.flush().await?;
     out.get_ref().sync_all().await?;
     Ok((hex::encode(hasher.finalize()), size))
+}
+
+enum Located {
+    File(tokio::fs::File),
+    Redirect(String),
+}
+
+/// A file outside the managed store: one in a local library, else a redirect into S3.
+async fn locate(s: &AppState, sha: &str) -> ApiResult<Located> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT m.library_id, m.path FROM media m JOIN libraries l ON l.id = m.library_id
+         WHERE m.sha256 = ? AND m.missing_at IS NULL ORDER BY CASE l.kind WHEN 'local' THEN 0 ELSE 1 END",
+    )
+    .bind(sha)
+    .fetch_all(&s.db)
+    .await?;
+    for (lib_id, path) in rows {
+        let lib = library::library(s, &lib_id).await?;
+        match lib.backend()? {
+            Backend::Local(root) => {
+                if let Ok(f) = tokio::fs::File::open(root.join(&path)).await {
+                    return Ok(Located::File(f));
+                }
+            }
+            Backend::S3(b) => return Ok(Located::Redirect(b.get_url(&path))),
+            Backend::Managed => {}
+        }
+    }
+    Err(ApiError::not_found())
 }
 
 enum RangeSpec {
@@ -127,7 +165,20 @@ pub async fn get(
     if !is_sha256(&sha) {
         return Err(ApiError::not_found());
     }
-    let mut file = tokio::fs::File::open(s.blob_path(&sha)).await.map_err(|_| ApiError::not_found())?;
+    let mut file = match tokio::fs::File::open(s.blob_path(&sha)).await {
+        Ok(f) => f,
+        Err(_) => match locate(&s, &sha).await? {
+            Located::File(f) => f,
+            Located::Redirect(url) => {
+                return Ok(Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(header::LOCATION, url)
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(Body::empty())
+                    .unwrap());
+            }
+        },
+    };
     let len = file.metadata().await?.len();
     let etag = format!("\"{sha}\"");
 

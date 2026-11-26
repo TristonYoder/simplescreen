@@ -38,7 +38,7 @@ pub async fn mine(State(s): State<AppState>, Unscoped(p): Unscoped) -> ApiResult
 }
 
 pub async fn create(Unscoped(_): Unscoped) -> ApiError {
-    ApiError::not_supported("this server hosts a single organization")
+    ApiError::not_supported("this server hosts a single organization").because("single_organization")
 }
 
 pub async fn accept_invite(Unscoped(_): Unscoped, Path(_id): Path<String>) -> ApiError {
@@ -87,14 +87,14 @@ pub async fn patch_settings(
     let name = input.org_name.map(|n| n.trim().to_string());
     let timezone = input.timezone.map(|t| t.trim().to_string());
     if name.as_deref() == Some("") {
-        return Err(ApiError::bad_request("org_name must not be empty"));
+        return Err(ApiError::bad_request("org_name must not be empty").because("org_name_empty"));
     }
     if name.is_some() && s.cfg.org_name.is_some() {
-        return Err(ApiError::conflict("setting_locked", "org_name is set by an environment variable"));
+        return Err(ApiError::conflict("setting_locked", "org_name is set by an environment variable").because("org_name"));
     }
     if let Some(t) = &timezone {
         if s.cfg.org_timezone.is_some() {
-            return Err(ApiError::conflict("setting_locked", "timezone is set by an environment variable"));
+            return Err(ApiError::conflict("setting_locked", "timezone is set by an environment variable").because("timezone"));
         }
         if schedule::parse_tz(t).is_none() {
             return Err(ApiError::unprocessable("invalid_timezone", "timezone must be an IANA zone name"));

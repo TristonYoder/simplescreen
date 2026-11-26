@@ -13,6 +13,7 @@ async fn main() -> anyhow::Result<()> {
     let state = build_state(cfg.clone()).await?;
     tracing::info!("data dir {}", cfg.data_dir.display());
     tokio::spawn(screen_server::schedule::run(state.clone()));
+    tokio::spawn(screen_server::routes::sweep_uploads(state.clone()));
 
     let shutdown_tx = state.shutdown.clone();
     let shutdown = async move {

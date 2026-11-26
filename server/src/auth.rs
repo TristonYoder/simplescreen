@@ -49,7 +49,6 @@ pub struct Principal {
     pub server_admin: bool,
     pub memberships: Vec<Membership>,
     pub node_id: Option<String>,
-    pub device_team: Option<String>,
 }
 
 impl Principal {
@@ -84,7 +83,6 @@ impl Principal {
 #[derive(Clone)]
 pub struct DeviceInfo {
     pub node_id: String,
-    pub team_id: String,
 }
 
 impl<S> FromRequestParts<S> for Principal
@@ -165,7 +163,6 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
                 server_admin: true,
                 memberships: vec![],
                 node_id: None,
-                device_team: None,
             });
         }
     }
@@ -175,13 +172,13 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
     let device = match cached {
         Some(d) => Some(d),
         None => {
-            let row: Option<(String, String)> =
-                sqlx::query_as("SELECT id, team_id FROM nodes WHERE token_hash = ?")
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM nodes WHERE token_hash = ?")
                     .bind(&hash)
                     .fetch_optional(&state.db)
                     .await?;
-            row.map(|(node_id, team_id)| {
-                let d = DeviceInfo { node_id, team_id };
+            row.map(|(node_id,)| {
+                let d = DeviceInfo { node_id };
                 state.devices.lock().insert(hash.clone(), d.clone());
                 d
             })
@@ -196,7 +193,6 @@ pub async fn authenticate(state: &AppState, token: &str) -> Result<Principal, Ap
             server_admin: false,
             memberships: vec![],
             node_id: Some(d.node_id),
-            device_team: Some(d.team_id),
         });
     }
 
@@ -266,7 +262,6 @@ async fn user_principal(state: &AppState, oidc: &Oidc, claims: &Value) -> Result
         server_admin,
         memberships,
         node_id: None,
-        device_team: None,
     })
 }
 

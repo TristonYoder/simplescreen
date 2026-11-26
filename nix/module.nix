@@ -21,6 +21,9 @@ let
   // lib.optionalAttrs (cfg.oidc.adminGroups != [ ]) {
     "${prefix}_OIDC_ADMIN_GROUPS" = lib.concatStringsSep "," cfg.oidc.adminGroups;
   }
+  // lib.optionalAttrs (cfg.libraryRoots != [ ]) {
+    "${prefix}_LIBRARY_ROOTS" = lib.concatStringsSep "," cfg.libraryRoots;
+  }
   // lib.optionalAttrs (cfg.bootstrapTokenFile != null) {
     "${prefix}_BOOTSTRAP_TOKEN_FILE" = "%d/bootstrap-token";
   }
@@ -67,6 +70,12 @@ in
       example = "https://screens.example.org";
       description = "Externally reachable base URL when behind a reverse proxy.";
     };
+    libraryRoots = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "/srv/signage" ];
+      description = "Directories that local media libraries may live under. They are made writable for the service; the service user must be able to write to them.";
+    };
     bootstrapTokenFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -105,7 +114,7 @@ in
         DynamicUser = true;
         StateDirectory = lib.mkIf (cfg.dataDir == "/var/lib/${slug}") slug;
         RuntimeDirectory = slug;
-        ReadWritePaths = lib.mkIf (cfg.dataDir != "/var/lib/${slug}") [ cfg.dataDir ];
+        ReadWritePaths = lib.optional (cfg.dataDir != "/var/lib/${slug}") cfg.dataDir ++ cfg.libraryRoots;
         LoadCredential = lib.mkIf (cfg.bootstrapTokenFile != null)
           [ "bootstrap-token:${toString cfg.bootstrapTokenFile}" ];
         Restart = "on-failure";

@@ -18,7 +18,6 @@ type Tx = mpsc::UnboundedSender<Out>;
 
 struct Device {
     conn: u64,
-    team_id: String,
     tx: Tx,
     /// Screens this node watches through control/confidence assignments (it does not play them).
     subs: HashSet<String>,
@@ -38,13 +37,13 @@ pub struct Hub {
 
 impl Hub {
     /// One socket per node; it serves every screen of that node.
-    pub fn register_node(&self, node_id: &str, team_id: &str) -> (u64, mpsc::UnboundedReceiver<Out>) {
+    pub fn register_node(&self, node_id: &str) -> (u64, mpsc::UnboundedReceiver<Out>) {
         let conn = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
         let old = self
             .devices
             .lock()
-            .insert(node_id.to_string(), Device { conn, team_id: team_id.to_string(), tx, subs: HashSet::new() });
+            .insert(node_id.to_string(), Device { conn, tx, subs: HashSet::new() });
         if let Some(old) = old {
             let _ = old.tx.send(Out::Close);
         }
@@ -65,8 +64,8 @@ impl Hub {
         self.devices.lock().contains_key(node_id)
     }
 
-    pub fn online_nodes(&self) -> Vec<(String, String)> {
-        self.devices.lock().iter().map(|(k, d)| (k.clone(), d.team_id.clone())).collect()
+    pub fn online_nodes(&self) -> Vec<String> {
+        self.devices.lock().keys().cloned().collect()
     }
 
     pub fn send_node(&self, node_id: &str, msg: &Value) -> bool {
@@ -108,12 +107,33 @@ impl Hub {
         self.users.lock().remove(&conn);
     }
 
-    pub fn broadcast_team(&self, team_id: &str, msg: &Value) {
+    fn broadcast_where(&self, msg: &Value, to: impl Fn(&Principal) -> bool) {
         let text = msg.to_string();
         for u in self.users.lock().values() {
-            if u.principal.can_view(team_id) {
+            if to(&u.principal) {
                 let _ = u.tx.send(Out::Msg(text.clone()));
             }
+        }
+    }
+
+    pub fn broadcast_team(&self, team_id: &str, msg: &Value) {
+        self.broadcast_where(msg, |p| p.can_view(team_id));
+    }
+
+    /// Admins and members of any of `teams` (the teams that reach a screen).
+    pub fn broadcast_teams(&self, teams: &[String], msg: &Value) {
+        self.broadcast_where(msg, |p| p.server_admin || p.memberships.iter().any(|m| teams.contains(&m.team_id)));
+    }
+
+    pub fn broadcast_all(&self, msg: &Value) {
+        self.broadcast_where(msg, |_| true);
+    }
+
+    /// One user's sockets; `None` = every admin.
+    pub fn send_user(&self, subject: Option<&str>, msg: &Value) {
+        match subject {
+            Some(sub) => self.broadcast_where(msg, |p| p.subject == sub),
+            None => self.broadcast_where(msg, |p| p.server_admin),
         }
     }
 }

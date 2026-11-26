@@ -99,15 +99,26 @@ impl AppState {
         self.devices.lock().retain(|_, d| d.node_id != node_id);
     }
 
-    /// Notifies every screen in the team; devices refetch with If-None-Match.
-    pub async fn notify_screens_for_playlist(&self, team_id: &str, version: i64) {
-        let ids: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id, node_id FROM screens WHERE team_id = ?")
-            .bind(team_id)
-            .fetch_all(&self.db)
-            .await
-            .unwrap_or_default();
+    /// Notifies every screen the playlist is available on; devices refetch with If-None-Match.
+    pub async fn notify_screens_for_playlist(&self, playlist_id: &str, version: i64) {
+        let ids: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT DISTINCT s.id, s.node_id FROM screens s JOIN screen_tags st ON st.screen_id = s.id \
+             JOIN playlist_tags pt ON pt.tag_id = st.tag_id WHERE pt.playlist_id = ?",
+        )
+        .bind(playlist_id)
+        .fetch_all(&self.db)
+        .await
+        .unwrap_or_default();
         for (id, node_id) in ids {
             self.notify_manifest(node_id.as_deref(), &id, version);
+        }
+    }
+
+    /// Sends to admins and every team that reaches the screen.
+    pub async fn broadcast_screen(&self, screen_id: &str, msg: &serde_json::Value) {
+        match crate::reach::screen_team_ids(self, screen_id).await {
+            Ok(teams) => self.hub.broadcast_teams(&teams, msg),
+            Err(_) => self.hub.broadcast_teams(&[], msg),
         }
     }
 
@@ -222,6 +233,10 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0004_floor_plans.sql"),
     include_str!("../migrations/0005_teams.sql"),
     include_str!("../migrations/0006_nodes.sql"),
+    include_str!("../migrations/0007_screen_tags.sql"),
+    include_str!("../migrations/0008_libraries.sql"),
+    include_str!("../migrations/0009_media_uploads.sql"),
+    include_str!("../migrations/0010_source_sha256.sql"),
 ];
 
 async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
